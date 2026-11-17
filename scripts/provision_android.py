@@ -15,7 +15,9 @@ from common import (
     DEFAULT_TOOLS_DIR,
     PROFILE_ALLOWED_OPENWRT_STAGE_OPS,
     REPO_ROOT,
+    AuthContext,
     read_json,
+    resolve_auth_context,
     resolve_tool,
     sha256_bytes,
     win_no_window_kwargs,
@@ -87,6 +89,8 @@ def apply_slot_a_from_openwrt(
     *,
     openwrt_host: str = "192.168.77.1",
     root_password: str | None = None,
+    auth_context: AuthContext | None = None,
+    credentials_file: Path | None = None,
     isolate_host: bool = True,
 ) -> dict[str, Any]:
     """For Profile 3: safely write trustos_a + init_boot_a from running OpenWrt _b and boot Android _a."""
@@ -94,8 +98,12 @@ def apply_slot_a_from_openwrt(
     if not stage or not stage.get("apply_from_openwrt"):
         raise ValueError("flash_plan.json does not specify android_a_stage apply_from_openwrt")
 
-    pws = (root_password, "", "root") if root_password else ("", "root")
-    ssh = wait_for_openwrt_ssh(openwrt_host, passwords=pws, isolate_host=isolate_host)
+    ctx = auth_context or resolve_auth_context(
+        explicit_password=root_password,
+        credentials_file=credentials_file,
+        host=openwrt_host,
+    )
+    ssh = wait_for_openwrt_ssh(ctx.host, passwords=ctx.candidate_passwords(), isolate_host=isolate_host)
     try:
         sftp = ssh.open_sftp()
         results: dict[str, Any] = {}
@@ -138,6 +146,8 @@ def provision_android(
     tools_dir: Path = DEFAULT_TOOLS_DIR,
     openwrt_host: str = "192.168.77.1",
     root_password: str | None = None,
+    auth_context: AuthContext | None = None,
+    credentials_file: Path | None = None,
     isolate_host: bool = True,
     return_to_openwrt: bool = True,
     serial: str | None = None,
@@ -148,13 +158,22 @@ def provision_android(
     out_dir = Path(plan["out_dir"])
     adb_exe = resolve_tool("adb", tools_dir)
 
+    cred_path = credentials_file
+    if cred_path is None and (out_dir / "openwrt-credentials.json").is_file():
+        cred_path = out_dir / "openwrt-credentials.json"
+    ctx = auth_context or resolve_auth_context(
+        explicit_password=root_password,
+        credentials_file=cred_path,
+        host=openwrt_host,
+    )
+
     from_owrt_res = None
     dual_boot = profile_id == "3-dual-full"
     if dual_boot:
         from_owrt_res = apply_slot_a_from_openwrt(
             plan,
-            openwrt_host=openwrt_host,
-            root_password=root_password,
+            openwrt_host=ctx.host,
+            auth_context=ctx,
             isolate_host=isolate_host,
         )
         time.sleep(8)
@@ -268,8 +287,7 @@ def provision_android(
         if dual_boot and return_to_openwrt:
             _su(adb_exe, "/system/bin/sh /data/adb/switch-to-openwrt.sh", serial=serial, check=False)
             time.sleep(10)
-            pws = (root_password, "", "root") if root_password else ("", "root")
-            ssh_b = wait_for_openwrt_ssh(openwrt_host, passwords=pws, isolate_host=isolate_host)
+            ssh_b = wait_for_openwrt_ssh(ctx.host, passwords=ctx.candidate_passwords(), isolate_host=isolate_host)
             ssh_b.close()
             if isolate_host:
                 isolate_usb_rndis_adapter()
@@ -279,6 +297,7 @@ def provision_android(
             "status": "ANDROID_PROVISIONED",
             "profile": profile_id,
             "ufi_uid": ufi_uid,
+            "auth_context": ctx.to_public_metadata(),
             "from_openwrt_flash": from_owrt_res,
             "cold_reboot_ports_verified": ports_ok,
             "usb_config": usb_cfg,
@@ -297,6 +316,7 @@ def main() -> int:
     parser.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--openwrt-host", default="192.168.77.1")
     parser.add_argument("--root-password")
+    parser.add_argument("--credentials-file", type=Path)
     parser.add_argument("--no-host-isolate", action="store_true")
     parser.add_argument("--stay-android", action="store_true")
     parser.add_argument("--serial")
@@ -308,6 +328,7 @@ def main() -> int:
         tools_dir=args.tools_dir,
         openwrt_host=args.openwrt_host,
         root_password=args.root_password,
+        credentials_file=args.credentials_file,
         isolate_host=not args.no_host_isolate,
         return_to_openwrt=not args.stay_android,
         serial=args.serial,

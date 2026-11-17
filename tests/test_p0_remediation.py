@@ -549,3 +549,177 @@ def test_p0_4_no_forced_permanent_rndis_and_safe_usb_mode_transition(
                 out_dir=out_swap,
                 reboot_after=False,
             )
+
+
+def test_p0_5_auth_context_verify_verdicts_and_preflight_gate(
+    synthetic_env: dict[str, Path], tmp_path: Path
+) -> None:
+    """P0-5: AuthContext generation/redaction, slot parsing without wifi_device spoofing, profile-aware PASS/FAIL/NOT_TESTED/NOT_APPLICABLE, non-zero exit codes, and strict preflight gate."""
+    from common import build_trial_bcab, resolve_auth_context
+    from kit import assert_preflight_ready
+    from kit import main as kit_main
+    from provision_openwrt import provision_openwrt
+    from verify_e2e import _parse_openwrt_boot_evidence, evaluate_e2e_checks, verify_environment
+
+    tools = synthetic_env["tools_dir"]
+    bcab_b = build_trial_bcab((synthetic_env["backup_dir"] / "misc").read_bytes()[2048:2080], "b", tries=6)
+
+    # 1. Generated password flows via AuthContext & openwrt-credentials.json into verify without leaking raw password
+    out_cred = tmp_path / "cred_flow"
+    ssh_ok = MagicMock()
+    ssh_ok.close = MagicMock()
+    seen_passwords: list[tuple[str, ...]] = []
+
+    def _run_ow(client, cmd, *, check=True, timeout=60.0):
+        if "cat /proc/driver/board_id" in cmd and "model=" not in cmd:
+            return 0, "6", ""
+        if "model=" in cmd:
+            return (
+                0,
+                "model=f50pro\nboard_id=6\nwifi_device=phy0-ap0\nopenwrt_id=OpenWrt\ncmdline=console=ttyS0 androidboot.slot_suffix=_b\nbootargs=\nbutton_long=system-switch\n/dev/root 100 50 50 50% /\n",
+                "",
+            )
+        if "uci -q get u30pro.usb.mode" in cmd or "device-usb" in cmd:
+            return 0, "ncm", ""
+        if "dd if=/dev/block/by-name/misc" in cmd:
+            return 0, "", ""
+        if "/etc/mu300/model" in cmd and "sha256sum" not in cmd:
+            return 0, "f50pro", ""
+        if "sha256sum /etc/dropbear" in cmd:
+            return 0, "unit_hash_a  /etc/dropbear/dropbear_ed25519_host_key", ""
+        if "f50pro-rootfs-grow.py" in cmd:
+            return 0, '{"grown": true}', ""
+        return 0, "", ""
+
+    def _fake_connect(host, *, username="root", passwords=("", "root"), timeout=5.0):
+        seen_passwords.append(tuple(passwords))
+        return ssh_ok
+
+    class _FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    with (
+        patch("provision_openwrt.detect_host_platform", return_value="win64"),
+        patch("provision_openwrt.wait_for_openwrt_ssh", return_value=ssh_ok),
+        patch("provision_openwrt.ssh_run", side_effect=_run_ow),
+        patch("provision_openwrt.time.sleep"),
+        patch("provision_openwrt._ensure_board6_card_patch", return_value="card_sha"),
+        patch("provision_openwrt._ensure_capacity_ui", return_value={"ui": "ok"}),
+        patch("provision_openwrt._ensure_5s_buttons", return_value={"long_action": "system-switch"}),
+        patch("provision_openwrt.sftp_get_bytes", return_value=bcab_b),
+    ):
+        prov = provision_openwrt(
+            profile_id="3-dual-full",
+            generate_password=True,
+            tools_dir=tools,
+            out_dir=out_cred,
+            isolate_host=False,
+            reboot_after=False,
+        )
+
+    cred_path = Path(prov["credentials_file"])
+    generated_pw = json.loads(cred_path.read_text(encoding="utf-8"))["password"]
+    assert generated_pw
+    # AuthContext repr and public metadata never expose raw secret
+    ctx = resolve_auth_context(credentials_file=cred_path, host="192.168.77.1")
+    assert generated_pw not in repr(ctx)
+    assert generated_pw not in json.dumps(ctx.to_public_metadata())
+    assert generated_pw not in json.dumps(prov)
+
+    with (
+        patch("verify_e2e.connect_ssh", side_effect=_fake_connect),
+        patch("verify_e2e.ssh_run", side_effect=_run_ow),
+        patch("verify_e2e.urllib.request.urlopen", return_value=_FakeResp()),
+        patch("verify_e2e.audit_default_routes", return_value={"usb_default_route_leak": False}),
+        patch("verify_e2e._probe_android", return_value={"reachable": False, "slot_suffix": "UNKNOWN", "active_os": "UNKNOWN"}),
+        patch("kit.assert_preflight_ready", return_value={"ready": True}),
+    ):
+        rc = kit_main([
+            "verify",
+            "--profile",
+            "3-dual-full",
+            "--credentials-file",
+            str(cred_path),
+            "--out",
+            str(tmp_path / "verify_out.json"),
+        ])
+    assert rc == 0
+    assert seen_passwords == [(generated_pw,)]
+    vrep = json.loads((tmp_path / "verify_out.json").read_text(encoding="utf-8"))
+    assert generated_pw not in json.dumps(vrep)
+    assert vrep["overall_status"] == "PASS"
+    assert vrep["openwrt"]["slot_suffix"] == "_b"
+    assert vrep["openwrt"]["slot_evidence_source"] == "/proc/cmdline|bootargs"
+    # Active OpenWrt in Profile 3 leaves inactive Android strictly NOT_TESTED (never fake PASS or FAIL)
+    assert vrep["checks"]["android_adb"]["status"] == "NOT_TESTED"
+    assert vrep["checks"]["android_ufi_services"]["status"] == "NOT_TESTED"
+
+    # 2. Missing cmdline/bootargs must return slot_suffix == "UNKNOWN" and never report wifi_device ('phy0-ap0') as slot
+    parsed_no_cmd = _parse_openwrt_boot_evidence(
+        "model=f50pro\nboard_id=6\nwifi_device=phy0-ap0\nopenwrt_id=OpenWrt\ncmdline=\nbootargs=\n"
+    )
+    assert parsed_no_cmd["wifi_device"] == "phy0-ap0"
+    assert parsed_no_cmd["slot_suffix"] == "UNKNOWN"
+    assert parsed_no_cmd["slot_evidence_source"] == "UNAVAILABLE"
+
+    # 3. Profile 2 marks Android checks NOT_APPLICABLE
+    p2_eval = evaluate_e2e_checks(
+        profile_id="2-dual-stock-openwrt",
+        host_routes={"usb_default_route_leak": False},
+        openwrt={"reachable": True, "active_os": "openwrt", "slot_suffix": "_b", "luci_http_status": 200},
+        android={"reachable": False},
+    )
+    assert p2_eval["overall_status"] == "PASS"
+    assert p2_eval["checks"]["android_adb"]["status"] == "NOT_APPLICABLE"
+
+    # 4. SSH auth failure -> FAIL and kit verify exits non-zero (1) with redacted secret
+    with (
+        patch("verify_e2e.connect_ssh", side_effect=RuntimeError(f"Authentication failed for password={generated_pw}")),
+        patch("verify_e2e.audit_default_routes", return_value={"usb_default_route_leak": False}),
+        patch("verify_e2e._probe_android", return_value={"reachable": False}),
+        patch("kit.assert_preflight_ready", return_value={"ready": True}),
+    ):
+        rc_auth = kit_main([
+            "verify",
+            "--profile",
+            "2-dual-stock-openwrt",
+            "--root-password",
+            generated_pw,
+            "--out",
+            str(tmp_path / "verify_auth_fail.json"),
+        ])
+    assert rc_auth == 1
+    auth_rep = json.loads((tmp_path / "verify_auth_fail.json").read_text(encoding="utf-8"))
+    assert auth_rep["overall_status"] == "FAIL"
+    assert auth_rep["checks"]["openwrt_ssh"]["status"] == "FAIL"
+    assert generated_pw not in json.dumps(auth_rep)
+
+    # 5. Android missing su root or missing UFI-TOOLS (:2333/:1146) -> FAIL + non-zero exit
+    for bad_android, fail_key in (
+        ({"reachable": True, "slot_suffix": "_a", "su_id": "2000", "ports": ":2333 :1146"}, "android_su_root"),
+        ({"reachable": True, "slot_suffix": "_a", "su_id": "0", "ports": ":2333"}, "android_ufi_services"),
+    ):
+        ev_bad = evaluate_e2e_checks(
+            profile_id="1-android-ufi",
+            host_routes={"usb_default_route_leak": False},
+            openwrt={"reachable": False},
+            android=bad_android,
+        )
+        assert ev_bad["overall_status"] == "FAIL"
+        assert ev_bad["checks"][fail_key]["status"] == "FAIL"
+        assert ev_bad["checks"]["openwrt_ssh"]["status"] == "NOT_APPLICABLE"
+
+    # 6. preflight --strict and assert_preflight_ready fail BEFORE dangerous actions when tools/modules missing
+    with patch("kit.resolve_tool", side_effect=FileNotFoundError("no spd_dump")):
+        assert kit_main(["preflight", "--strict", "--operation", "flash"]) == 1
+        with pytest.raises(RuntimeError, match="Preflight check failed before flash"):
+            assert_preflight_ready(operation="flash", tools_dir=tools)
+    with patch("kit.importlib.import_module", side_effect=ImportError("no paramiko")):
+        assert kit_main(["preflight", "--strict", "--operation", "provision-openwrt"]) == 1
+

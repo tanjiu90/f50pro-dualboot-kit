@@ -213,6 +213,76 @@ def build_backup_identity_record(
     }
 
 
+class AuthContext:
+    """In-memory SSH/WebUI authentication context that never exposes raw secrets in repr or public logs."""
+
+    def __init__(
+        self,
+        *,
+        host: str = "192.168.77.1",
+        username: str = "root",
+        password: str | None = None,
+        source: str = "default_probe",
+        credentials_file: Path | None = None,
+    ) -> None:
+        self.host = host
+        self.username = username
+        self._password = password
+        self.source = source
+        self.credentials_file = str(credentials_file) if credentials_file else None
+
+    @property
+    def password(self) -> str | None:
+        return self._password
+
+    def candidate_passwords(self) -> tuple[str, ...]:
+        if self._password:
+            return (self._password,)
+        return ("", "root")
+
+    def to_public_metadata(self) -> dict[str, Any]:
+        return {
+            "host": self.host,
+            "username": self.username,
+            "password_configured": bool(self._password),
+            "source": self.source,
+            "credentials_file": self.credentials_file,
+        }
+
+    def __repr__(self) -> str:
+        return f"AuthContext(host={self.host!r}, source={self.source!r}, password_configured={bool(self._password)})"
+
+
+def resolve_auth_context(
+    *,
+    explicit_password: str | None = None,
+    credentials_file: Path | None = None,
+    host: str = "192.168.77.1",
+    username: str = "root",
+) -> AuthContext:
+    """Build unified AuthContext preferring explicit password, then generated credentials file."""
+    if explicit_password:
+        return AuthContext(
+            host=host,
+            username=username,
+            password=explicit_password,
+            source="explicit_password",
+            credentials_file=credentials_file,
+        )
+    if credentials_file is not None and credentials_file.is_file():
+        data = read_json(credentials_file)
+        pw = data.get("password")
+        if pw:
+            return AuthContext(
+                host=data.get("host", host),
+                username=data.get("username", username),
+                password=pw,
+                source="credentials_file",
+                credentials_file=credentials_file,
+            )
+    return AuthContext(host=host, username=username, password=None, source="default_probe", credentials_file=credentials_file)
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
