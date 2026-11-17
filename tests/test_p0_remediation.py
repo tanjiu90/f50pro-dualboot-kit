@@ -1004,5 +1004,271 @@ def test_brom_backup_retries_only_pre_handshake_connection_race(
     assert calls2["n"] == 1
 
 
+def test_single_session_auto_execute_no_mid_reboot_and_fail_close(
+    synthetic_env: dict[str, Path], tmp_path: Path
+) -> None:
+    """Single-session BROM executes backup -> inspect -> build -> flash -> single reset with zero mid-flow reboot."""
+    import shutil
+
+    from kit import main as kit_main
+
+    tools = synthetic_env["tools_dir"]
+    fake_exe = tools / "spd_dump_fake.exe"
+    fake_exe.write_bytes(b"MZ")
+    stock_bak = synthetic_env["backup_dir"]
+    good_tbl = list(parse_partition_xml(stock_bak / "partition_list.xml").items())
+    work_dir = tmp_path / "single_sess_work"
+
+    class _SingleSessDouble:
+        def __init__(self, backup_dir: Path, run_dir: Path):
+            self.work_dir = backup_dir
+            self.backup_dir = backup_dir
+            self.run_dir = run_dir
+            self.launch_meta = {"mode": "direct"}
+            self.commands: list[list[str]] = []
+            self.closed_calls: list[bool] = []
+            self.stored: dict[str, bytes] = {}
+            for p in stock_bak.iterdir():
+                if p.is_file() and p.name not in ("SHA256SUMS.txt", "verification_report.json", "partition_list.xml"):
+                    self.stored[p.name] = p.read_bytes()
+
+        def send_line(self, args: list[object]) -> None:
+            toks = [str(a) for a in args]
+            self.commands.append(toks)
+            if len(toks) >= 2 and toks[0] == "r" and toks[1] == "all":
+                self.backup_dir.mkdir(parents=True, exist_ok=True)
+                for p in stock_bak.iterdir():
+                    if p.is_file() and p.name not in ("SHA256SUMS.txt", "verification_report.json", "partition_list.xml"):
+                        shutil.copy2(p, self.backup_dir / p.name)
+            elif len(toks) >= 2 and toks[0] == "partition_list":
+                shutil.copy2(stock_bak / "partition_list.xml", Path(toks[1]))
+
+        def cmd(self, args: list[object], ok: str, errs: tuple[str, ...] = (), timeout: int = 240) -> str:
+            toks = [str(a) for a in args]
+            self.commands.append(toks)
+            if toks[0] == "path":
+                Path(toks[1]).mkdir(parents=True, exist_ok=True)
+                self.work_dir = Path(toks[1])
+            elif toks[0] in ("w", "w_force"):
+                self.stored[toks[1]] = Path(toks[2]).read_bytes()
+            elif toks[0] == "wof":
+                part, off, fpath = toks[1], int(toks[2]), Path(toks[3])
+                blob = fpath.read_bytes()
+                cur = bytearray(self.stored[part])
+                cur[off : off + len(blob)] = blob
+                self.stored[part] = bytes(cur)
+            return ok
+
+        def switch_dir(self, new_dir: Path) -> None:
+            self.cmd(["path", str(new_dir)], "save dir is")
+
+        def table(self, fname: str) -> list[tuple[str, int]]:
+            self.commands.append(["partition_list", str(self.work_dir / fname)])
+            return good_tbl
+
+        def read_part(self, part: str, size: int, fname: str) -> bytes:
+            self.commands.append(["read_part", part, str(size), fname])
+            return self.stored[part][:size]
+
+        def safe_unlink(self, fname: str) -> None:
+            pass
+
+        def close(self, reboot: bool = True) -> None:
+            self.closed_calls.append(reboot)
+            if reboot:
+                self.commands.append(["reset"])
+
+    sess = _SingleSessDouble(work_dir / "backup", work_dir / "build" / "flash-run")
+    open_calls = {"n": 0}
+
+    def _open_once(*a, **k):
+        open_calls["n"] += 1
+        return sess, {"method": "webui_reboot_device"}
+
+    with (
+        patch("kit.assert_preflight_ready", return_value={"ready": True}),
+        patch("kit.fetch_and_extract", return_value={"status": "ok", "network_downloads": []}),
+        patch("brom_backup.resolve_tool", return_value=fake_exe),
+        patch("flash_images.resolve_tool", return_value=fake_exe),
+        patch("brom_backup.open_sprd4_session", side_effect=_open_once),
+        patch("kit.provision_openwrt", return_value={"status": "OPENWRT_PROVISIONED", "board_id": "6", "host_network": {"usb_default_route_leak": False}}),
+        patch(
+            "kit.verify_environment",
+            return_value={"overall_status": "PASS", "checks": {"host_route_isolation": {"status": "PASS"}}},
+        ),
+    ):
+        rc = kit_main([
+            "auto",
+            "--profile",
+            "2-dual-stock-openwrt",
+            "--work-dir",
+            str(work_dir),
+            "--tools-dir",
+            str(tools),
+            "--webui-password",
+            "testpw",
+            "--generate-password",
+            "--execute",
+        ])
+
+    assert rc == 0
+    assert open_calls["n"] == 1  # single BROM session across backup + build + flash!
+    assert sess.closed_calls == [True]
+    cmd_names = [c[0] for c in sess.commands]
+    # Zero resets between r all and wof; single reset at the very end!
+    assert cmd_names.count("reset") == 1
+    assert cmd_names[-1] == "reset"
+    assert cmd_names.index("r") < cmd_names.index("wof") < cmd_names.index("reset")
+    report = json.loads((work_dir / "auto_execution_report.json").read_text(encoding="utf-8"))
+    assert report["brom_session_mode"] == "single_session_no_mid_reboot"
+    assert report["flash"]["reused_brom_session"] is True
+
+    # Failure during build mid-session must close without reset
+    work_fail = tmp_path / "single_sess_fail"
+    sess_fail = _SingleSessDouble(work_fail / "backup", work_fail / "build" / "flash-run")
+    with (
+        patch("kit.assert_preflight_ready", return_value={"ready": True}),
+        patch("kit.fetch_and_extract", return_value={"status": "ok", "network_downloads": []}),
+        patch("brom_backup.resolve_tool", return_value=fake_exe),
+        patch("brom_backup.open_sprd4_session", return_value=(sess_fail, None)),
+        patch("kit.build_profile", side_effect=RuntimeError("simulated mid-session build error")),
+    ):
+        with pytest.raises(RuntimeError, match="simulated mid-session build error"):
+            kit_main([
+                "auto",
+                "--profile",
+                "2-dual-stock-openwrt",
+                "--work-dir",
+                str(work_fail),
+                "--tools-dir",
+                str(tools),
+                "--execute",
+            ])
+    assert sess_fail.closed_calls == [False]
+    assert ["reset"] not in sess_fail.commands
 
 
+def test_multi_transport_reboot_and_delayed_webui_retry(
+    synthetic_env: dict[str, Path], tmp_path: Path
+) -> None:
+    """Wait loop polls WebUI across slow Android boot without dropping retries, falls back to OpenWrt SSH / ADB, and fails fast on WebUI auth rejection."""
+    import brom_backup
+    import queue as qmod
+
+    tools = synthetic_env["tools_dir"]
+    fake_exe = tools / "spd_dump_fake.exe"
+    fake_exe.write_bytes(b"MZ")
+
+    class _DelayedBootProc:
+        def __init__(self, lines_queue: qmod.Queue[str | None], rc: int = 0):
+            self.stdin = io.StringIO()
+            self._q = lines_queue
+            self.stdout = self._iter_q()
+            self._rc = None
+            self._final_rc = rc
+            self.terminated = False
+
+        def _iter_q(self):
+            while True:
+                item = self._q.get()
+                if item is None:
+                    break
+                yield item
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            self.terminated = True
+            self._rc = -15
+            self._q.put(None)
+
+        def wait(self, timeout=None):
+            if self._rc is None:
+                self._rc = self._final_rc
+            return self._rc
+
+    # 1. Delayed WebUI boot (2 unreachable probes, succeeds on 3rd) + attempt 1 pre-handshake race -> attempt 2 skips re-triggering WebUI
+    q1: qmod.Queue[str | None] = qmod.Queue()
+    q1.put("Waiting for boot_diag/cali_diag/dl_diag connection (120s)\n")
+    q2: qmod.Queue[str | None] = qmod.Queue()
+    q2.put("Waiting for dl_diag connection (120s)\n")
+    q2.put('BSL_REP_VER: "SPRD4:AutoD\\0"\n')
+    q2.put("save dir is ok\n")
+    procs = [_DelayedBootProc(q1, rc=1), _DelayedBootProc(q2, rc=0)]
+    spawn_idx = {"i": 0}
+    webui_calls = {"n": 0}
+
+    def _spawn_delayed(*a, **k):
+        p = procs[spawn_idx["i"]]
+        spawn_idx["i"] += 1
+        return p
+
+    def _delayed_webui(pw: str, host: str = ""):
+        webui_calls["n"] += 1
+        if webui_calls["n"] < 3:
+            return None
+        q1.put("Connection failed\n")
+        q1.put(None)
+        return {"method": "webui_reboot_device", "cr_version": "B15"}
+
+    clock = {"t": 0.0}
+
+    def _fake_mono() -> float:
+        clock["t"] += 1.6
+        return clock["t"]
+
+    with (
+        patch("brom_backup.build_spd_invocation", return_value=([str(fake_exe)], {"mode": "direct"})),
+        patch("brom_backup.subprocess.Popen", side_effect=_spawn_delayed),
+        patch("brom_backup._attempt_zte_webui_reboot_once", side_effect=_delayed_webui),
+        patch("brom_backup._try_openwrt_ssh_reboot_once", return_value=None),
+        patch("brom_backup._try_adb_reboot_once", return_value=None),
+        patch("brom_backup.time.monotonic", side_effect=_fake_mono),
+        patch("brom_backup.time.sleep"),
+    ):
+        sess, rb = brom_backup.open_sprd4_session(
+            fake_exe,
+            tmp_path / "delayed_sess",
+            webui_password="pw",
+            webui_timeout_sec=60.0,
+        )
+        sess.close(reboot=False)
+
+    assert spawn_idx["i"] == 2
+    assert webui_calls["n"] == 3  # attempt 2 must NOT re-trigger REBOOT_DEVICE
+    assert rb == {"method": "webui_reboot_device", "cr_version": "B15"}
+
+    # 2. Wrong WebUI password aborts immediately without retry masking
+    q_auth: qmod.Queue[str | None] = qmod.Queue()
+    q_auth.put("Waiting for boot_diag/cali_diag/dl_diag connection (120s)\n")
+    auth_proc = _DelayedBootProc(q_auth, rc=1)
+    with (
+        patch("brom_backup.build_spd_invocation", return_value=([str(fake_exe)], {"mode": "direct"})),
+        patch("brom_backup.subprocess.Popen", return_value=auth_proc),
+        patch("brom_backup._attempt_zte_webui_reboot_once", side_effect=brom_backup.WebUIAuthError("WebUI login failed")),
+        patch("brom_backup.time.sleep"),
+    ):
+        with pytest.raises(brom_backup.WebUIAuthError, match="WebUI login failed"):
+            brom_backup.open_sprd4_session(
+                fake_exe,
+                tmp_path / "auth_fail_sess",
+                webui_password="badpw",
+            )
+
+    # 3. Fallback priority: WebUI unreachable -> OpenWrt SSH reboot -> ADB reboot
+    with (
+        patch("brom_backup._attempt_zte_webui_reboot_once", return_value=None),
+        patch("brom_backup._try_openwrt_ssh_reboot_once", return_value={"method": "openwrt_ssh_reboot", "host": "192.168.77.1"}),
+        patch("brom_backup._try_adb_reboot_once", side_effect=AssertionError("ADB not needed when OpenWrt SSH succeeds")),
+    ):
+        r_ow = brom_backup.trigger_online_reboot_once(webui_password="pw")
+    assert r_ow["method"] == "openwrt_ssh_reboot"
+
+    with (
+        patch("brom_backup._attempt_zte_webui_reboot_once", return_value=None),
+        patch("brom_backup._try_openwrt_ssh_reboot_once", return_value=None),
+        patch("brom_backup._try_adb_reboot_once", return_value={"method": "adb_reboot", "serial": None}),
+    ):
+        r_adb = brom_backup.trigger_online_reboot_once(tools_dir=tools)
+    assert r_adb["method"] == "adb_reboot"

@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from brom_backup import run_brom_backup, verify_backup_dir
+from brom_backup import run_brom_backup, run_brom_backup_session, verify_backup_dir
 from build_images import build_profile
 from common import (
     DEFAULT_CACHE_DIR,
@@ -324,52 +324,98 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
         "host_network_mutated": False,
     }
 
+    cred_file = out_dir / "openwrt-credentials.json"
+    pre_auth_ctx = resolve_auth_context(
+        explicit_password=args.root_password,
+        credentials_file=cred_file if cred_file.is_file() else None,
+        host=args.openwrt_host,
+    )
+
     if args.reuse_backup and (backup_dir / "verification_report.json").is_file():
+        steps["brom_session_mode"] = "reused_backup"
         steps["backup"] = verify_backup_dir(backup_dir, require_complete_table=True)
-    else:
-        steps["backup"] = run_brom_backup(
-            backup_dir,
+        steps["inspect"] = inspect_backup_dir(backup_dir, out_dir / "hardware_facts.json")
+        plan = build_profile(
+            backup_dir=backup_dir,
+            profile_id=args.profile,
+            out_dir=out_dir,
+            tools_dir=args.tools_dir,
+            adb_pubkey_path=args.adb_pubkey,
+            usb_mode=args.usb_mode,
+        )
+        steps["build"] = {
+            "profile": plan["profile"],
+            "total_brom_write_bytes": plan["total_brom_write_bytes"],
+            "flash_plan": str(out_dir / "flash_plan.json"),
+        }
+        steps["flash"] = execute_flash(
+            out_dir / "flash_plan.json",
             tools_dir=args.tools_dir,
             webui_password=args.webui_password,
             webui_host=args.webui_host,
+            openwrt_host=args.openwrt_host,
+            auth_context=pre_auth_ctx,
+            adb_serial=args.adb_serial,
+            execute=True,
             spd_mode=args.spd_mode,
             usb_dev=args.usb_dev,
-            authorize_device_reboot=getattr(args, "authorize_device_reboot", False),
         )
+    else:
+        steps["brom_session_mode"] = "single_session_no_mid_reboot"
+        backup_rep, brom_sess = run_brom_backup_session(
+            backup_dir,
+            out_dir / "flash-run",
+            tools_dir=args.tools_dir,
+            webui_password=args.webui_password,
+            webui_host=args.webui_host,
+            openwrt_host=args.openwrt_host,
+            auth_context=pre_auth_ctx,
+            adb_serial=args.adb_serial,
+            spd_mode=args.spd_mode,
+            usb_dev=args.usb_dev,
+            authorize_device_reboot=bool(args.execute or getattr(args, "authorize_device_reboot", False)),
+        )
+        steps["backup"] = backup_rep
         steps["device_read_ops"].append("brom_r_all")
-        steps["device_rebooted"] = True
-        steps["device_mutations"].extend(steps["backup"].get("device_mutations", []))
+        steps["device_rebooted"] = bool(backup_rep.get("device_rebooted", False))
+        steps["device_mutations"].extend(backup_rep.get("device_mutations", []))
+        try:
+            steps["inspect"] = inspect_backup_dir(backup_dir, out_dir / "hardware_facts.json")
+            plan = build_profile(
+                backup_dir=backup_dir,
+                profile_id=args.profile,
+                out_dir=out_dir,
+                tools_dir=args.tools_dir,
+                adb_pubkey_path=args.adb_pubkey,
+                usb_mode=args.usb_mode,
+            )
+            steps["build"] = {
+                "profile": plan["profile"],
+                "total_brom_write_bytes": plan["total_brom_write_bytes"],
+                "flash_plan": str(out_dir / "flash_plan.json"),
+            }
+            steps["flash"] = execute_flash(
+                out_dir / "flash_plan.json",
+                tools_dir=args.tools_dir,
+                webui_password=args.webui_password,
+                webui_host=args.webui_host,
+                openwrt_host=args.openwrt_host,
+                auth_context=pre_auth_ctx,
+                adb_serial=args.adb_serial,
+                execute=True,
+                spd_mode=args.spd_mode,
+                usb_dev=args.usb_dev,
+                active_session=brom_sess,
+            )
+        except Exception:
+            brom_sess.close(reboot=False)
+            raise
 
-    steps["inspect"] = inspect_backup_dir(backup_dir, out_dir / "hardware_facts.json")
-    plan = build_profile(
-        backup_dir=backup_dir,
-        profile_id=args.profile,
-        out_dir=out_dir,
-        tools_dir=args.tools_dir,
-        adb_pubkey_path=args.adb_pubkey,
-        usb_mode=args.usb_mode,
-    )
-    steps["build"] = {
-        "profile": plan["profile"],
-        "total_brom_write_bytes": plan["total_brom_write_bytes"],
-        "flash_plan": str(out_dir / "flash_plan.json"),
-    }
-
-    steps["flash"] = execute_flash(
-        out_dir / "flash_plan.json",
-        tools_dir=args.tools_dir,
-        webui_password=args.webui_password,
-        webui_host=args.webui_host,
-        execute=True,
-        spd_mode=args.spd_mode,
-        usb_dev=args.usb_dev,
-    )
     steps["device_mutated"] = bool(steps["flash"].get("device_mutated", True))
     steps["device_rebooted"] = True
     steps["device_mutations"].append("brom_flash_and_reset")
 
     profile = PROFILES[args.profile]
-    cred_file = out_dir / "openwrt-credentials.json"
     if profile["openwrt"]:
         steps["provision_openwrt"] = provision_openwrt(
             profile_id=args.profile,
@@ -455,6 +501,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     p_fetch.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_fetch.add_argument("--local-release-dir", type=Path)
+    p_fetch.add_argument("--offline-only", action="store_true")
 
     p_bak = sub.add_parser("backup", help="Perform read-only full BROM dump and verify SHA-256 + XML")
     p_bak.add_argument("--output-dir", type=Path, required=True)
@@ -463,6 +510,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_bak.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_bak.add_argument("--webui-password")
     p_bak.add_argument("--webui-host", default="http://192.168.0.1:8080")
+    p_bak.add_argument("--openwrt-host", default="192.168.77.1")
+    p_bak.add_argument("--adb-serial")
     p_bak.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     p_bak.add_argument("--usb-dev")
 
@@ -507,6 +556,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_fl.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_fl.add_argument("--webui-password")
     p_fl.add_argument("--webui-host", default="http://192.168.0.1:8080")
+    p_fl.add_argument("--openwrt-host", default="192.168.77.1")
+    p_fl.add_argument("--adb-serial")
     p_fl.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     p_fl.add_argument("--usb-dev")
     p_fl.add_argument("--execute", action="store_true")
@@ -617,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
                 cache_dir=args.cache_dir,
                 tools_dir=args.tools_dir,
                 local_release_dir=lrd,
+                offline_only=args.offline_only,
             )
     elif cmd == "backup":
         odir = _rel(args.output_dir)
@@ -629,6 +681,8 @@ def main(argv: list[str] | None = None) -> int:
                 tools_dir=args.tools_dir,
                 webui_password=args.webui_password,
                 webui_host=args.webui_host,
+                openwrt_host=args.openwrt_host,
+                adb_serial=args.adb_serial,
                 spd_mode=args.spd_mode,
                 usb_dev=args.usb_dev,
                 authorize_device_reboot=args.authorize_device_reboot,
@@ -659,6 +713,8 @@ def main(argv: list[str] | None = None) -> int:
             tools_dir=args.tools_dir,
             webui_password=args.webui_password,
             webui_host=args.webui_host,
+            openwrt_host=args.openwrt_host,
+            adb_serial=args.adb_serial,
             execute=args.execute,
             spd_mode=args.spd_mode,
             usb_dev=args.usb_dev,

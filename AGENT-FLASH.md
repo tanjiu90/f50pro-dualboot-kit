@@ -7,7 +7,7 @@ This document defines the strict deterministic execution protocol for any AI cod
 ## 0. Mandatory Agent Guardrails (Non-Negotiable)
 
 1. **NEVER touch `FORBIDDEN_PARTITIONS`**: Never read-modify-write or flash `splloader`, `prodnv`, `calinv`, `ztecfg`, `ztepersist`, `persist`, `miscdata`, `super`, `userdata`, or modem NV/calibration partitions.
-2. **Mandatory Full Verified BROM Backup First**: Never proceed to `flash` or `provision` without a verified local BROM backup (`verification_report.json` with `checks_passed: true`) dumped from **this exact physical device**. Live `kit.py backup` enters `SPRD4:AutoD` and resets the device, so it explicitly requires `--authorize-device-reboot`; offline `kit.py plan` / `kit.py auto` (without `--execute`) never triggers `REBOOT_DEVICE`, downloads, or device mutations.
+2. **Mandatory Full Verified BROM Backup First**: Never proceed to `flash` or `provision` without a verified local BROM backup (`verification_report.json` with `checks_passed: true`) dumped from **this exact physical device**. Live `kit.py backup` enters `SPRD4:AutoD` and resets the device, so it explicitly requires `--authorize-device-reboot`; offline `kit.py plan` / `kit.py auto` (without `--execute`) never triggers `REBOOT_DEVICE`, downloads, or device mutations. When running full `kit.py auto --execute` without `--reuse-backup`, `backup -> inspect -> build -> flash` executes inside **one single `SPRD4:AutoD` session** (zero mid-flow reboot/USB replug), automatically rebooting via WebUI / OpenWrt SSH / ADB whenever available.
 3. **Never Flash Foreign Images (Per-Unit Identity Bound)**: Always run `kit.py inspect` and `kit.py build` against the target device's own backup so `flash_plan.json` embeds the cryptographic `unit_identity_digest` (`ztecfg`/`persist` SHA-256 + GPT), `trustos_noavb.img` derives from its own `sml_a` + `trustos_a`, and `vendor_boot_b` retains its exact DTB. `flash_images.py` refuses mismatched targets unless explicitly acknowledged.
 4. **Dry-Run & Failure Recovery Gate**: Execute `kit.py plan` (or `kit.py auto` **without `--execute`**) and `kit.py flash --plan ...` (without `--execute`) first, present the partition allowlist/summary, `unit_identity_digest`, detected `board_id`, and selected profile to the user, and obtain explicit approval before `--execute`. If any write/readback/GPT check fails during `flash --execute`, the tool **stops immediately without calling `reset` or switching slots** and records state in `flash_state.json` — inspect `flash_failure_report.json` before touching hardware.
 5. **Host Network & USB Mode Preservation**: Only verified F50 Pro USB interfaces (`1D6B:0104`) are isolated by `host_network.py` (using snapshots and never modifying phone USB tethering, USB-C docks, or Wi-Fi `192.168.0.1`). `provision-openwrt` preserves working USB modes (`ncm`/`ecm`/`rndis`) unless `--usb-net-mode` explicitly changes it.
@@ -22,7 +22,7 @@ Pin an explicit Release tag (or verified commit SHA) — never pull mutable `mai
 
 - **Windows PC**:
   ```powershell
-  git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.1-rc.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   .\scripts\bootstrap.ps1 -Profile <PROFILE_ID>  # add -SkipOpenClash if unused
   .\.venv\Scripts\python.exe -m pytest -v
@@ -30,7 +30,7 @@ Pin an explicit Release tag (or verified commit SHA) — never pull mutable `mai
   ```
 - **Linux (`x86_64` / `arm64`) / macOS (`Universal`) / Android Termux (`arm64`)**:
   ```bash
-  git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.1-rc.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   bash scripts/bootstrap.sh --profile <PROFILE_ID>  # add --no-openclash if unused
   .venv/bin/python -m pytest -v

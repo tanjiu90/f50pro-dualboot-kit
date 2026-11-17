@@ -19,11 +19,11 @@ Designed for **one-click per-OS selective download & deployment** and **autonomo
 
 ## Verification & Release Readiness Status (Honest Scope: 4 Tiers Separated)
 
-> **Important integrity notice**: [assets/release-manifest.json](assets/release-manifest.json) verifies **SHA-256 file integrity** against this repository's manifest, **not** cryptographic publisher signatures (GPG / Cosign / GitHub Attestation). Clone/download using an **explicit Release tag or commit SHA** (not mutable `main`), and follow the immutable draft -> upload -> verify -> release flow. Note: `v1.1.0` tag/assets are frozen; P0 safety fixes target **`v1.1.1-rc.1`** on branch `fix/p0-safety-remediation`.
+> **Important integrity notice**: [assets/release-manifest.json](assets/release-manifest.json) verifies **SHA-256 file integrity** against this repository's manifest, **not** cryptographic publisher signatures (GPG / Cosign / GitHub Attestation). Clone/download using an **explicit Release tag or commit SHA** (not mutable `main`), and follow the immutable draft -> upload -> verify -> release flow. Note: `v1.1.0` tag/assets are frozen; P0 safety fixes + single-session zero-mid-reboot BROM & 3-way auto-reboot target **`v1.1.1-rc.2`** on branch `fix/p0-safety-remediation`.
 
 | Scope | Compilation / Packaging | Host CLI / Unit & Fault Tests | Live USB Comm | End-to-End Hardware | Notes / Explicit Limits |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Pure-Python builder & P0 safety guards (`fix/p0-safety-remediation`)** | `PASS` | `PASS` (`52` pytest fault + unit tests) | `N/A` *(offline)* | `N/A` *(offline)* | Offline `plan` / `auto` dry-run perform zero downloads, zero WebUI reboots, zero BROM/SSH/ADB calls; failure injects stop before `reset`/`wof` and persist `flash_state.json`. |
+| **Pure-Python builder & P0 safety guards (`fix/p0-safety-remediation`)** | `PASS` | `PASS` (`56` pytest fault + unit tests) | `N/A` *(offline)* | `N/A` *(offline)* | Offline `plan` / `auto` dry-run perform zero downloads, zero WebUI reboots, zero BROM/SSH/ADB calls; `auto --execute` uses single-session `SPRD4` (backup->build->flash with zero mid-flow reboot) + WebUI/OpenWrt-SSH/ADB auto-reboot; failure injects stop before `reset`/`wof` and persist `flash_state.json`. |
 | **Windows x64 host toolkit (`v1.1.0` + P0)** | `PASS` | `PASS` (`win32` + CI `windows-latest`) | `PASS` *(upstream WinUSB)* | **`B28` VERIFIED *(upstream)*** / `UNVERIFIED` *(this CLI)* | Upstream `B28` verified full `_a`+`_b`+`5G NR SA`+Wi-Fi 6+OpenClash+5s roundtrip; refactored `kit.py` CLI awaiting authorized pilot. |
 | **`B15` (`board_id=1`, Built-in Dual eSIM)** | `PASS` *(image build parity)* | `PASS` *(DTB & offset fixture)* | `PASS` *(upstream dump)* | `PARTIAL` *(dual-boot roundtrip verified upstream)* | Upstream installed & roundtrip-switched `_b <-> _a`; **paid eSIM cellular WAN intentionally NOT tested per user decision (non-blocker)**. |
 | **Linux `x86_64` host** | `PASS` | `PASS` (CI `ubuntu-latest`) | `UNVERIFIED` *(live USB)* | `UNVERIFIED` | CI verifies `bootstrap.sh`, `preflight --strict`, offline `plan`, `spd_dump -h`, and `adb version`; physical USB flash/NCM isolation awaits live run. |
@@ -83,15 +83,15 @@ List packs + direct URLs without downloading: `python3 scripts/kit.py fetch-asse
 ### 1. Pinned Clone, Python `.venv`, Dependencies & Selected Packs
 
 ```powershell
-# Windows: pin an explicit tag (e.g. v1.1.0) or verified commit SHA, never unpinned main in production
-git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+# Windows: pin an explicit tag (use v1.1.1-rc.2 for P0 + single-session zero-replug BROM; v1.1.0 is frozen)
+git clone --branch v1.1.1-rc.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 .\scripts\bootstrap.ps1
 ```
 
 ```bash
 # Linux / macOS / Android Termux: pin tag/SHA, then auto-detect OS/arch or pass --interactive / --profile
-git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+git clone --branch v1.1.1-rc.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 bash scripts/bootstrap.sh --interactive
 ```
@@ -114,11 +114,10 @@ This creates `.venv`, installs `paramiko`, `pyserial`, and `pytest`, downloads &
 .venv/bin/python scripts/kit.py plan --profile 3-dual-full --work-dir build/my-device --openclash
 # (Equivalent: running `kit.py auto --profile 3-dual-full --work-dir build/my-device` without `--execute`)
 
-# 5. Inspect flash_plan.json (bound to device cryptographic identity & allowlist), then execute with explicit authorization:
-.venv/bin/python scripts/kit.py auto \
+# 5. Single-session zero-replug execution: captures backup, derives images, flashes & readback-verifies inside ONE SPRD4 session (WebUI / OpenWrt SSH / ADB auto-reboot; pass --reuse-backup only to skip BROM backup):
+.\.venv\Scripts\python.exe scripts\kit.py auto \
   --profile 3-dual-full \
   --work-dir build/my-device \
-  --reuse-backup \
   --webui-password "<YOUR_WEBUI_PASSWORD>" \
   --generate-password \
   --openclash \

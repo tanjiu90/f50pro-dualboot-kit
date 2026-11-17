@@ -7,21 +7,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import queue
-import re
 import subprocess
-import threading
-import time
-import urllib.request
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
 from brom_backup import (
     FATAL_SPD_RE,
+    SpdSession,
     _explain_libusb_error,
-    build_spd_invocation,
+    open_sprd4_session,
     parse_partition_xml,
     trigger_zte_webui_reboot,
 )
@@ -32,13 +26,12 @@ from common import (
     PROFILE_ALLOWED_BROM_OPS,
     PROFILES,
     REPO_ROOT,
+    AuthContext,
     compute_unit_identity_digest,
-    detect_host_platform,
     read_json,
     resolve_tool,
     sha256_bytes,
     sha256_file,
-    win_no_window_kwargs,
     write_json,
 )
 
@@ -97,7 +90,9 @@ def validate_plan_safety(plan: dict[str, Any]) -> None:
         raise ValueError("Flash plan missing mandatory device_identity target binding")
 
 
-class _SpdSession:
+class _SpdSession(SpdSession):
+    """Subclass preserving flash_images.subprocess.Popen patchability while sharing SpdSession."""
+
     def __init__(
         self,
         spd_dump: Path,
@@ -107,130 +102,24 @@ class _SpdSession:
         tools_dir: Path = DEFAULT_TOOLS_DIR,
         spd_mode: str = "auto",
         usb_dev: str | None = None,
+        cwd: Path | None = None,
+        log_name: str = "spd_dump_flash.log",
+        log_path: Path | None = None,
+        log_mode: str = "w",
     ):
-        self.work_dir = work_dir
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.lines: queue.Queue[str | None] = queue.Queue()
-        spd_args = [
-            "--wait",
-            str(wait_sec),
-            "--kickto",
-            "2",
-            "--verbose",
-            "1",
-            "g_w_force",
-            "0",
-            "path",
-            str(work_dir),
-        ]
-        if spd_mode in ("auto", "direct"):
-            plat = detect_host_platform()
-            if plat == "android-arm64" and (not hasattr(os, "geteuid") or os.geteuid() != 0):
-                cmd, self.launch_meta = build_spd_invocation(tools_dir, spd_args, spd_mode=spd_mode, usb_dev=usb_dev)
-            else:
-                cmd = [str(spd_dump), *spd_args]
-                self.launch_meta = {"platform": plat, "mode": "direct", "binary": str(spd_dump)}
-        else:
-            cmd, self.launch_meta = build_spd_invocation(tools_dir, spd_args, spd_mode=spd_mode, usb_dev=usb_dev)
-
-        self.proc = subprocess.Popen(
-            cmd,
-            cwd=work_dir,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            **win_no_window_kwargs(),
+        super().__init__(
+            spd_dump,
+            work_dir,
+            wait_sec=wait_sec,
+            tools_dir=tools_dir,
+            spd_mode=spd_mode,
+            usb_dev=usb_dev,
+            cwd=cwd,
+            log_name=log_name,
+            log_path=log_path,
+            log_mode=log_mode,
+            popen_factory=subprocess.Popen,
         )
-        self.log = (work_dir / "spd_dump_flash.log").open("w", encoding="utf-8")
-        threading.Thread(target=self._reader, daemon=True).start()
-
-    def _reader(self) -> None:
-        assert self.proc.stdout
-        for line in self.proc.stdout:
-            self.log.write(line)
-            self.log.flush()
-            self.lines.put(line)
-        self.lines.put(None)
-
-    def expect_any(self, markers: tuple[str, ...], timeout: int = 240) -> tuple[str, list[str]]:
-        deadline = time.monotonic() + timeout
-        buf: list[str] = []
-        while time.monotonic() < deadline:
-            try:
-                line = self.lines.get(timeout=min(1.0, max(0.05, deadline - time.monotonic())))
-            except queue.Empty:
-                continue
-            if line is None:
-                raise RuntimeError(f"spd_dump exited early; tail={buf[-8:]}")
-            buf.append(line.strip())
-            if FATAL_SPD_RE.search(line) and "Waiting" not in line:
-                meta = getattr(self, "launch_meta", {})
-                raise RuntimeError(f"Fatal spd_dump output: {_explain_libusb_error(line.strip(), meta)}")
-            for m in markers:
-                if m in line:
-                    return m, buf
-        raise TimeoutError(f"Timed out waiting for {markers}; tail={buf[-8:]}")
-
-    def cmd(self, args: list[object], ok: str, errs: tuple[str, ...] = (), timeout: int = 240) -> str:
-        assert self.proc.stdin
-        self.proc.stdin.write(" ".join(_token(a) for a in args) + "\n")
-        self.proc.stdin.flush()
-        hit, _ = self.expect_any((ok, *errs), timeout=timeout)
-        if hit != ok:
-            raise RuntimeError(f"Command {args[0]} hit error marker: {hit}")
-        return hit
-
-    def read_part(self, part: str, size: int, fname: str) -> bytes:
-        p = self.work_dir / fname
-        p.unlink(missing_ok=True)
-        self.cmd(["read_part", part, "0", size, fname], f"Read Part Done: {part}+", timeout=300)
-        self.expect_any(("recv: type = 0x80",), timeout=30)
-        deadline = time.monotonic() + 10.0
-        while True:
-            try:
-                data = p.read_bytes()
-                if len(data) == size:
-                    return data
-            except PermissionError:
-                pass
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"Readback incomplete for {part} ({size} B)")
-            time.sleep(0.05)
-
-    def safe_unlink(self, fname: str) -> None:
-        p = self.work_dir / fname
-        for _ in range(40):
-            try:
-                p.unlink(missing_ok=True)
-                return
-            except PermissionError:
-                time.sleep(0.05)
-
-    def table(self, fname: str) -> list[tuple[str, int]]:
-        p = self.work_dir / fname
-        self.cmd(["partition_list", str(p)], "userdata", timeout=60)
-        return list(parse_partition_xml(p).items())
-
-    def close(self, reboot: bool = True) -> None:
-        if self.proc.poll() is None:
-            if reboot and self.proc.stdin:
-                try:
-                    self.proc.stdin.write('"reset"\n')
-                    self.proc.stdin.flush()
-                except OSError:
-                    pass
-                try:
-                    self.proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    self.proc.terminate()
-            else:
-                self.proc.terminate()
-            self.proc.wait(timeout=15)
-        self.log.close()
 
 
 def _probe_failure_diag(sess: Any, exc: Exception) -> dict[str, Any]:
@@ -338,12 +227,16 @@ def execute_flash(
     tools_dir: Path = DEFAULT_TOOLS_DIR,
     webui_password: str | None = None,
     webui_host: str = "http://192.168.0.1:8080",
+    openwrt_host: str = "192.168.77.1",
+    auth_context: AuthContext | None = None,
+    adb_serial: str | None = None,
     execute: bool = False,
     spd_mode: str = "auto",
     usb_dev: str | None = None,
     confirm_weak_identity: bool = False,
     board_id: str | None = None,
     usb_topology: dict[str, Any] | None = None,
+    active_session: SpdSession | None = None,
 ) -> dict[str, Any]:
     """Execute or dry-run a verified flash_plan.json with full readback verification and safe failure handling."""
     plan = read_json(plan_path)
@@ -368,49 +261,47 @@ def execute_flash(
     spd_dump = resolve_tool("spd_dump", tools_dir, prefer_variant=prefer_var)
     expected_xml = parse_partition_xml(backup_dir / "partition_list.xml")
 
-    sess: _SpdSession | None = None
-    for attempt in range(1, 5):
-        cand = _SpdSession(
-            spd_dump,
-            run_dir,
-            wait_sec=90,
-            tools_dir=tools_dir,
-            spd_mode=spd_mode,
-            usb_dev=usb_dev,
-        )
+    sess: Any = active_session
+    reused_session = active_session is not None
+    if sess is not None:
+        if getattr(sess, "work_dir", None) != run_dir and hasattr(sess, "switch_dir"):
+            sess.switch_dir(run_dir)
+    else:
         try:
-            first_res = cand.expect_any(
-                ("Waiting for boot_diag", "Waiting for dl_diag", "Try to convert termux transfered usb port fd."),
-                timeout=20,
+            sess, _ = open_sprd4_session(
+                spd_dump,
+                run_dir,
+                wait_sec=90,
+                tools_dir=tools_dir,
+                spd_mode=spd_mode,
+                usb_dev=usb_dev,
+                webui_password=webui_password,
+                webui_host=webui_host,
+                openwrt_host=openwrt_host,
+                auth_context=auth_context,
+                adb_serial=adb_serial,
+                webui_timeout_sec=90.0,
+                session_cls=_SpdSession,
+                webui_trigger_fn=trigger_zte_webui_reboot,
             )
-            hit = first_res[0] if isinstance(first_res, tuple) and first_res else str(first_res)
-            if attempt == 1 and webui_password and "Waiting for boot_diag" in hit:
-                time.sleep(0.8)
-                trigger_zte_webui_reboot(webui_password, host=webui_host)
-            cand.expect_any(("save dir is",), timeout=100)
-            sess = cand
-            break
-        except Exception:
-            cand.close(reboot=False)
-            time.sleep(0.4)
-    if sess is None:
-        fail_state = {
-            "status": "FLASH_FAILED",
-            "profile": plan["profile"],
-            "failed_stage": "connect_sprd4",
-            "error": "Failed to connect to F50 Pro SPRD4/BROM port",
-            "reset_sent": False,
-            "slot_switched": False,
-            "auto_rollback_attempted": False,
-            "verified_partitions": [],
-            "pending_operations": [
-                {"op": o["op"], "partition": o["partition"], "offset": o.get("offset", 0), "size_bytes": o["size_bytes"]}
-                for o in plan["operations"]
-            ],
-            "log_path": str(run_dir / "spd_dump_flash.log"),
-        }
-        write_json(run_dir / "flash_state.json", fail_state)
-        raise RuntimeError(fail_state["error"])
+        except Exception as exc:
+            fail_state = {
+                "status": "FLASH_FAILED",
+                "profile": plan["profile"],
+                "failed_stage": "connect_sprd4",
+                "error": str(exc) or "Failed to connect to F50 Pro SPRD4/BROM port",
+                "reset_sent": False,
+                "slot_switched": False,
+                "auto_rollback_attempted": False,
+                "verified_partitions": [],
+                "pending_operations": [
+                    {"op": o["op"], "partition": o["partition"], "offset": o.get("offset", 0), "size_bytes": o["size_bytes"]}
+                    for o in plan["operations"]
+                ],
+                "log_path": str(run_dir / "spd_dump_flash.log"),
+            }
+            write_json(run_dir / "flash_state.json", fail_state)
+            raise RuntimeError(fail_state["error"]) from exc
 
     w_ops = [o for o in plan["operations"] if o["op"] in ("w", "w_force")]
     w_ops.sort(key=lambda o: (o["partition"] == "init_boot_b", o["partition"] == "fulldumpdb"))
@@ -505,6 +396,7 @@ def execute_flash(
         summary = {
             "status": "FLASH_AND_READBACK_VERIFIED",
             "profile": plan["profile"],
+            "reused_brom_session": reused_session,
             "device_identity_verified": identity_check,
             "reset_sent": True,
             "slot_switched": bool(wof_ops),
@@ -512,7 +404,7 @@ def execute_flash(
             "verified_partitions": verified_partitions,
             "pending_operations": [],
             "results": results,
-            "log_path": str(run_dir / "spd_dump_flash.log"),
+            "log_path": str(run_dir / ("spd_dump_session.log" if reused_session else "spd_dump_flash.log")),
         }
         write_json(run_dir / "flash_state.json", summary)
         write_json(run_dir / "flash_result.json", summary)
@@ -555,6 +447,8 @@ def main() -> int:
     parser.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--webui-password")
     parser.add_argument("--webui-host", default="http://192.168.0.1:8080")
+    parser.add_argument("--openwrt-host", default="192.168.77.1")
+    parser.add_argument("--adb-serial")
     parser.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     parser.add_argument("--usb-dev", help="Explicit Termux OTG /dev/bus/usb/XXX/YYY path for --spd-mode termux-usb")
     parser.add_argument("--confirm-weak-identity", action="store_true", help="Explicit manual override only if unit identity partitions are absent/all-zero")
@@ -567,6 +461,8 @@ def main() -> int:
         tools_dir=args.tools_dir,
         webui_password=args.webui_password,
         webui_host=args.webui_host,
+        openwrt_host=args.openwrt_host,
+        adb_serial=args.adb_serial,
         execute=args.execute,
         spd_mode=args.spd_mode,
         usb_dev=args.usb_dev,
