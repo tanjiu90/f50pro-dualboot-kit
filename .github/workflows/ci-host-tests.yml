@@ -28,18 +28,30 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install paramiko pyserial pytest
 
-      - name: Run offline unit, safety, and cross-platform tests
+      - name: Run offline unit, safety, and multi-platform tests
         run: python -m pytest -v
 
-      - name: Verify preflight and list-packs on Unix shells
+      - name: Live HTTPS fetch-assets & binary smoke test (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
           bash -n scripts/bootstrap.sh
           python scripts/kit.py fetch-assets --list-packs
+          bash scripts/bootstrap.sh --profile none --skip-venv
           python scripts/kit.py preflight
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            ./build/runtime-tools/host-tools-linux-x64/bin/spd_dump -h >/dev/null
+            ./build/runtime-tools/host-tools-linux-x64/platform-tools/adb version
+          else
+            file ./build/runtime-tools/host-tools-macos/bin/spd_dump
+            ./build/runtime-tools/host-tools-macos/bin/spd_dump -h >/dev/null
+            ./build/runtime-tools/host-tools-macos/platform-tools/adb version
+          fi
 
-      - name: Verify preflight and list-packs on Windows
+      - name: Live HTTPS fetch-assets & binary smoke test (Windows)
         if: runner.os == 'Windows'
         run: |
           python scripts\kit.py fetch-assets --list-packs
+          python scripts\kit.py fetch-assets --host-platform win64 --profile none
           python scripts\kit.py preflight
+          .\build\runtime-tools\host-tools-win64\spd_dump_251\spd_dump.exe -h | Out-Null
+          .\build\runtime-tools\host-tools-win64\platform-tools\adb.exe version
