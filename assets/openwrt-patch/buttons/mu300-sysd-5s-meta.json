@@ -1,0 +1,5 @@
+{
+  "orig_sha256": "1fcd7c51dbddf3b50b1b54b65dd0015cf3c7d84de7173031b918696374d1341e",
+  "target": "helper = fork_exec('/bin/sh', [ '-c', 'exec \"$0\" \"$@\" >&0 </dev/null', exe, '-l', '3000', '-u', UEVENTS ],",
+  "replacement": "let long_ms = env('MU300_KEYS_LONG_MS', F50PRO_KEYS ? '5000' : '3000');\n\thelper = fork_exec('/bin/sh', [ '-c', 'exec \"$0\" \"$@\" >&0 </dev/null', exe, '-l', long_ms, '-u', UEVENTS ],"
+}

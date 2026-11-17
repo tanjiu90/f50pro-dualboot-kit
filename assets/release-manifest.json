@@ -1,0 +1,41 @@
+{
+  "release_tag": "v1.0.0",
+  "github_repo": "tanjiu90/f50pro-dualboot-kit",
+  "base_url": "https://github.com/tanjiu90/f50pro-dualboot-kit/releases/download/v1.0.0",
+  "packs": {
+    "openwrt_base": {
+      "filename": "f50pro-base-openwrt-25.12.5-pack.tar.xz",
+      "bytes": 26065368,
+      "sha256": "ebd302a22b3542057913d499390990f1ca1aeb87bd85d0b37024a77c2ba522b1",
+      "contains": [
+        "openwrt-f50pro-25.12.5-base-rootfs.ext4",
+        "Image-6.12.94-u30pro-p1.wrapped",
+        "initramfs-f50pro-generic.cpio.lz4",
+        "mu300-keys"
+      ]
+    },
+    "android_pkgs": {
+      "filename": "f50pro-android-pkgs-pack.zip",
+      "bytes": 31766517,
+      "sha256": "242f09e3911f1a44790230401f7063a27a839919a0c9e532491c20efddf76f02",
+      "contains": {
+        "Magisk-canary-28103.apk": "fa7e64af14e57194e2463d959e809812e9bdd48f4cc996565706f658e78694de",
+        "UFI-TOOLS.apk": "9eaefbd345b24603b9a41b2941dbf3ac207d51367ae0d2e1f8f62b53637fba41"
+      }
+    },
+    "host_tools_win64": {
+      "filename": "f50pro-host-tools-win64.zip",
+      "bytes": 26851767,
+      "sha256": "f20d699b3ec8b20d1bf89d85c5168861e065b5d6c4e1c5311a6fac974985d0a7",
+      "platforms": [
+        "win32"
+      ]
+    },
+    "openclash_offline": {
+      "filename": "f50pro-openclash-offline-25.12.5-arm64.tar.gz",
+      "bytes": 37517425,
+      "sha256": "c1b0a739aafe9216df8fb08d2535cae5c4650bd8ce6f760c2692ff5fcb1d9f45",
+      "optional": true
+    }
+  }
+}

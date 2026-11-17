@@ -1,0 +1,42 @@
+#!/bin/sh
+# An input event only. Default is intentionally no action unless configured via UCI.
+set -eu
+export PATH="$PATH:/opt/mu300/bin:/usr/sbin:/sbin"
+BIN=${MU300_BIN:-/opt/mu300/bin}
+RUN=${MU300_RUN:-/run}
+REBOOT_BIN=${MU300_REBOOT:-/sbin/reboot}
+[ "$(cat "${MU300_SYSROOT:-}/etc/mu300/model" 2>/dev/null)" = f50pro ] || exit 2
+case ${1:-} in short|long) kind=$1;; *) exit 2;; esac
+action=$(uci -q get "unisoc_modem.main.f50pro_button_$kind" 2>/dev/null || true)
+case $action in
+    ''|none) exit 0;;
+    data-switch)
+        slot=$(cat "$RUN/mu300-data-sim-actual")
+        case $slot in 0) next=1;; 1) next=0;; *) exit 1;; esac
+        state=$("$BIN/mu300-physical-sim" status)
+        card=$(printf '%s' "$state" | jsonfilter -e "@.logical_cards[$next]")
+        case $card in 0|1|2|3|4) exec "$BIN/mu300-u30pro-sim" apply "$card";; *) exit 1;; esac
+        ;;
+    wifi-band) exec "$BIN/mu300-wifi-band" toggle;;
+    nfc-toggle) exec /usr/sbin/u30pro-nfc-control toggle;;
+    system-switch)
+        logger -t f50pro-buttons "f50pro-key-action ($kind): switching next boot to Android and rebooting" || true
+        if [ -z "${MU300_SYSROOT:-}" ]; then
+            /etc/init.d/f50pro-leds stop >/dev/null 2>&1 || true
+            for l in wifi_red wifi_green wifi_blue net_red net_green net_blue; do
+                echo none > "/sys/class/leds/$l/trigger" 2>/dev/null || true
+                echo 0 > "/sys/class/leds/$l/brightness" 2>/dev/null || true
+            done
+            echo 255 > /sys/class/leds/wifi_blue/brightness 2>/dev/null || true
+            echo 255 > /sys/class/leds/net_blue/brightness 2>/dev/null || true
+        fi
+        "$BIN/mu300-next-boot" android || exit 1
+        sync
+        if [ -n "${MU300_REBOOT:-}" ]; then
+            exec "$REBOOT_BIN"
+        fi
+        setsid /bin/sh -c "sleep 1; exec '$REBOOT_BIN'" </dev/null >/dev/null 2>&1 &
+        exit 0
+        ;;
+    *) echo invalid_button_action >&2; exit 2;;
+esac

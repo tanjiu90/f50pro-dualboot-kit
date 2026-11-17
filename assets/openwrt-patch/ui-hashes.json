@@ -1,0 +1,10 @@
+{
+  "usr/share/ucode/mu300/dash.uc": {
+    "before": "e402f789f0f40df9bc1052d7a4dab2a1bdbb1182a019ae21e82bb2302cefbbc9",
+    "after": "cb05e97c6f9dc0ba8d552dc8977ab4cdcbe454ff2d57cceb207af0cef5e0d2ac"
+  },
+  "www/luci-static/resources/view/mu300/home.js": {
+    "before": "554074ba0b324d8f78898cbf9a3b72fde55021dbe290e356a46105cb6127a4de",
+    "after": "c6f307902f88f3577bfa76c0724dbc1e51a9b007c7379404e05dfc73f0e11056"
+  }
+}

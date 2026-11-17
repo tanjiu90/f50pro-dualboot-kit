@@ -1,0 +1,20 @@
+# Put your custom commands here that should be executed once
+# the system init finished. By default this file does nothing.
+
+if [ "$(cat /etc/mu300/default-boot 2>/dev/null)" != "linux" ] && [ -b /dev/block/by-name/cache ]; then
+    mkdir -p /tmp/.f50cache
+    if mount -t ext4 /dev/block/by-name/cache /tmp/.f50cache 2>/dev/null; then
+        if [ -e /tmp/.f50cache/.f50pro-switch-linux ]; then
+            rm -f /tmp/.f50cache/.f50pro-switch-linux
+            sync
+            umount /tmp/.f50cache 2>/dev/null || true
+            rmdir /tmp/.f50cache 2>/dev/null || true
+            /opt/mu300/bin/mu300-next-boot linux >/dev/null 2>&1 || true
+        else
+            umount /tmp/.f50cache 2>/dev/null || true
+            rmdir /tmp/.f50cache 2>/dev/null || true
+        fi
+    fi
+fi
+
+exit 0

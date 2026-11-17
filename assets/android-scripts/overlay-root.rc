@@ -1,0 +1,22 @@
+# Loaded by Magisk 28103 after post-fs-data; runs at late-start and boot_completed.
+on late-start
+    start f50pro_magisk_bootstrap
+    start f50pro_android_test_return
+
+on property:sys.boot_completed=1
+    start f50pro_magisk_bootstrap
+    start f50pro_android_test_return
+
+service f50pro_magisk_bootstrap ${MAGISKTMP}/f50pro-root-onboot.sh
+    disabled
+    oneshot
+    user root
+    group root
+    seclabel u:r:magisk:s0
+
+service f50pro_android_test_return ${MAGISKTMP}/f50pro-test-return-b.sh
+    disabled
+    oneshot
+    user root
+    group root
+    seclabel u:r:magisk:s0
