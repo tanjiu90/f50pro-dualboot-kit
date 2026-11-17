@@ -1,12 +1,20 @@
 {
-  "release_tag": "v1.0.0",
+  "release_tag": "v1.1.0",
   "github_repo": "tanjiu90/f50pro-dualboot-kit",
-  "base_url": "https://github.com/tanjiu90/f50pro-dualboot-kit/releases/download/v1.0.0",
+  "base_url": "https://github.com/tanjiu90/f50pro-dualboot-kit/releases/download/v1.1.0",
   "packs": {
     "openwrt_base": {
       "filename": "f50pro-base-openwrt-25.12.5-pack.tar.xz",
       "bytes": 26065368,
       "sha256": "ebd302a22b3542057913d499390990f1ca1aeb87bd85d0b37024a77c2ba522b1",
+      "platforms": [
+        "all"
+      ],
+      "profiles": [
+        "2-dual-stock-openwrt",
+        "3-dual-full"
+      ],
+      "description": "OpenWrt 25.12.5 base ext4 rootfs, Linux 6.12.94 kernel, initramfs, and mu300-keys",
       "contains": [
         "openwrt-f50pro-25.12.5-base-rootfs.ext4",
         "Image-6.12.94-u30pro-p1.wrapped",
@@ -18,24 +26,77 @@
       "filename": "f50pro-android-pkgs-pack.zip",
       "bytes": 31766517,
       "sha256": "242f09e3911f1a44790230401f7063a27a839919a0c9e532491c20efddf76f02",
+      "platforms": [
+        "all"
+      ],
+      "profiles": [
+        "1-android-ufi",
+        "3-dual-full"
+      ],
+      "description": "Magisk canary 28103 APK + UFI-TOOLS 4.0.0 APK for Android slot _a",
       "contains": {
         "Magisk-canary-28103.apk": "fa7e64af14e57194e2463d959e809812e9bdd48f4cc996565706f658e78694de",
         "UFI-TOOLS.apk": "9eaefbd345b24603b9a41b2941dbf3ac207d51367ae0d2e1f8f62b53637fba41"
       }
     },
-    "host_tools_win64": {
-      "filename": "f50pro-host-tools-win64.zip",
-      "bytes": 26851767,
-      "sha256": "f20d699b3ec8b20d1bf89d85c5168861e065b5d6c4e1c5311a6fac974985d0a7",
-      "platforms": [
-        "win32"
-      ]
-    },
     "openclash_offline": {
       "filename": "f50pro-openclash-offline-25.12.5-arm64.tar.gz",
       "bytes": 37517425,
       "sha256": "c1b0a739aafe9216df8fb08d2535cae5c4650bd8ce6f760c2692ff5fcb1d9f45",
-      "optional": true
+      "platforms": [
+        "all"
+      ],
+      "profiles": [
+        "2-dual-stock-openwrt",
+        "3-dual-full"
+      ],
+      "optional": true,
+      "description": "Optional offline luci-app-openclash + mihomo arm64 core + GeoSite/Country.mmdb (zero nodes)"
+    },
+    "host_tools_win64": {
+      "filename": "f50pro-host-tools-win64.zip",
+      "bytes": 26852044,
+      "sha256": "ebcdb45807ebc285650ef20cf956bb977eec9f6766e376e07ba6e487fac07e98",
+      "platforms": [
+        "win64"
+      ],
+      "description": "Windows x64 spd_dump v251, platform-tools adb, and fixed qmk_driver_installer"
+    },
+    "host_tools_linux_x64": {
+      "filename": "f50pro-host-tools-linux-x64.tar.gz",
+      "bytes": 6635958,
+      "sha256": "125896e9b703bc19f20fafd2cf2318417dcd5f15b641ea72df3c6656e0f965a0",
+      "platforms": [
+        "linux-x64"
+      ],
+      "description": "Linux x86_64 static musl spd_dump v251, Google platform-tools 37.0.1 adb, and udev rules"
+    },
+    "host_tools_linux_arm64": {
+      "filename": "f50pro-host-tools-linux-arm64.tar.gz",
+      "bytes": 789910,
+      "sha256": "f7f81184d1af3834b6ecac7c1ec966dd79592afd3baeb897fad564367844bffb",
+      "platforms": [
+        "linux-arm64"
+      ],
+      "description": "Linux ARM64 static musl spd_dump v251 and udev rules (install system adb via distro package)"
+    },
+    "host_tools_macos": {
+      "filename": "f50pro-host-tools-macos-universal.tar.gz",
+      "bytes": 10725269,
+      "sha256": "659d0f307ef5d066a9e992fb9aa1042c009073fd4e33cb712638648fb68b126e",
+      "platforms": [
+        "macos"
+      ],
+      "description": "macOS Universal (Apple Silicon + Intel) spd_dump and Google platform-tools 37.0.1 adb"
+    },
+    "host_tools_android_arm64": {
+      "filename": "f50pro-host-tools-android-arm64.tar.gz",
+      "bytes": 1368075,
+      "sha256": "e5f4f16426ac19eee32fbebbb2850952606046a5b0516c3f8a91a6f408eddb83",
+      "platforms": [
+        "android-arm64"
+      ],
+      "description": "Android Termux OTG tools: Root spd_dump-su (full --kickto 2) + Non-Root NDK spd_dump-termux-usb (--usb-fd)"
     }
   }
 }

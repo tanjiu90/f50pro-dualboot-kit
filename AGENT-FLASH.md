@@ -16,20 +16,35 @@ This document defines the strict deterministic execution protocol for any AI cod
 
 ---
 
-## Step 1: Clone, Bootstrap & Run Automated Self-Tests
+## Step 1: Clone, Bootstrap (Per-Platform Selectable) & Run Automated Self-Tests
 
-```powershell
-git clone https://github.com/tanjiu90/f50pro-dualboot-kit.git
-cd f50pro-dualboot-kit
-.\scripts\bootstrap.ps1
-.\.venv\Scripts\python.exe -m pytest -v
-.\.venv\Scripts\python.exe scripts\kit.py preflight
-```
+Select **only** the packs needed by the current host OS and requested profile:
+
+- **Windows PC**:
+  ```powershell
+  git clone https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  cd f50pro-dualboot-kit
+  .\scripts\bootstrap.ps1 -Profile <PROFILE_ID>  # add -SkipOpenClash if unused
+  .\.venv\Scripts\python.exe -m pytest -v
+  .\.venv\Scripts\python.exe scripts\kit.py preflight
+  ```
+- **Linux (`x86_64` / `arm64`) / macOS (`Universal`) / Android Termux (`arm64`)**:
+  ```bash
+  git clone https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  cd f50pro-dualboot-kit
+  bash scripts/bootstrap.sh --profile <PROFILE_ID>  # add --no-openclash if unused
+  .venv/bin/python -m pytest -v
+  .venv/bin/python scripts/kit.py preflight
+  ```
 
 Expected assertions before proceeding:
 - All `pytest` unit/safety/sanitization tests pass (`0` failures).
-- `preflight` confirms `paramiko=true`, `serial=true`, `spd_dump` resolved, `adb` resolved, and `adb_pubkey_present=true`.
-- If `1782:4D00` lacks WinUSB when entering download mode, guide the user once to install WinUSB using `.\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force .\build\runtime-tools\host-tools-win64\qmk_driver_installer\unisoc_drivers.txt` (do NOT double-click `install_connected_drivers.bat`, which defaults to `drivers.txt` keyboards) or Zadig.
+- `preflight` confirms `paramiko=true`, `serial=true`, `spd_dump` resolved (`spd_dump_termux_usb` also checked on `android-arm64`), `adb` resolved, and `adb_pubkey_present=true`.
+- Host-specific USB access checks:
+  - **Windows**: `host-tools-win64\qmk_driver_installer\install_connected_drivers.bat` (or `install_unisoc_drivers.bat`) installs WinUSB for `1782:4D00` / `1782:4D03`.
+  - **Linux**: install `assets/udev/99-unisoc-f50pro.rules` into `/etc/udev/rules.d/` (or pass `--spd-mode sudo` in Steps 2 & 5). On `linux-arm64`, install distro `adb` (`android-tools-adb`).
+  - **macOS**: pass `--spd-mode sudo` (or run under `sudo`) during Steps 2 & 5 because macOS `libusb` requires root to claim `1782:4D00`.
+  - **Android Termux**: use `--spd-mode su` on rooted phones (full `--kickto 2` support); `--spd-mode termux-usb` on non-root phones is **EXPERIMENTAL** and requires target already enumerated in `1782:4D00` autodloader mode + `--adb-serial 192.168.0.1:5555` (or `termux-adb`).
 
 ---
 
@@ -40,7 +55,7 @@ Ask the user for:
 - Whether to include clean offline OpenClash (`--openclash`)
 - Stock ZTE WebUI password (if automated reboot-into-BROM is desired; otherwise instruct user to trigger BROM physically when `Waiting for boot_diag` appears)
 
-Run read-only BROM dump:
+Run read-only BROM dump (on macOS or Linux without udev rules add `--spd-mode sudo`; on rooted Android Termux add `--spd-mode su`; on non-root Termux add `--spd-mode termux-usb --usb-dev /dev/bus/usb/XXX/YYY` with target already in `1782:4d00` autodloader):
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\kit.py backup `
@@ -96,6 +111,8 @@ Wait for confirmation, then proceed to Step 5.
   --webui-password "<WEBUI_PASSWORD>" `
   --execute
 ```
+
+> Pass `--spd-mode sudo` (macOS/Linux without udev) or `--spd-mode su` / `--spd-mode termux-usb` (Android Termux) matching Step 2.
 
 Confirm output reports `"status": "FLASH_AND_READBACK_VERIFIED"`. Every written partition is automatically read back and SHA-256 verified before moving `misc+2048` (`BCAB`).
 

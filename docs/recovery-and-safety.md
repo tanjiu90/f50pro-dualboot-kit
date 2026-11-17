@@ -12,23 +12,25 @@
 | **本仓库支持现状** | **`VERIFIED`（上游 8/8 次实机成功连机路径）**；注意 `r all` 不主动备份 `eMMC boot1` (`splloader_bak`) | **`BLOCKED / NOT INCLUDED`（上游 0/18 次成功实证；本仓库不含官方 `.pac` 或 `UMS9632` 签名 `FDL1/FDL2`）** |
 
 ### Windows WinUSB 驱动安装要点
-- 当 `spd_dump` 提示 `Waiting for boot_diag` 或缺少 `1782:4D00` / `1782:4D03` 驱动时，以管理员运行：
+- 当 `spd_dump` 提示 `Waiting for boot_diag` 或缺少 `1782:4D00` / `1782:4D03` 驱动时，在 `v1.1.0` 中可直接运行 `qmk_driver_installer\install_connected_drivers.bat`（已修复指向 `unisoc_drivers.txt`）或 `install_unisoc_drivers.bat`（管理员运行）：
   ```powershell
   .\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force `
     .\build\runtime-tools\host-tools-win64\qmk_driver_installer\unisoc_drivers.txt
   ```
-- **注意**：`v1.0.0` 包内自带的 `install_connected_drivers.bat` 默认读取键盘设备表 `drivers.txt`（不含 `1782:4D00`），请勿直接双击该 `.bat`，必须显式指定 `unisoc_drivers.txt`（或使用 Zadig）。
+- **旧版 `v1.0.0` 注意**：若使用的是 `v1.0.0` 旧压缩包，其中的 `install_connected_drivers.bat` 默认读取 `drivers.txt`（不含 `1782:4D00`），请显式指定 `unisoc_drivers.txt` 或改用 Zadig。
+- **Linux / macOS / Android Termux 主控说明**：详见 [docs/multi-platform-host.md](multi-platform-host.md)（Linux `udev` 规则、macOS `sudo` 权限与 Android Termux `--spd-mode su` vs `--usb-fd` 边界）。
 
 ---
 
-## 2. Windows 宿主网卡防劫持 (`host_network.py`)
+## 2. 宿主机多平台网卡防劫持 (`host_network.py`)
 
-每次插上刷好 OpenWrt 的 F50 Pro（`VID_1D6B&PID_0104` RNDIS + ACM）或带 `rndis` 的 Android 时，Windows 默认可能尝试 DHCP 获取并将设备当成主互联网网关，导致本机电脑原本的宽带/Wi-Fi 网络断网。
+每次插上刷好 OpenWrt 的 F50 Pro（`VID_1D6B&PID_0104` RNDIS / CDC-NCM + ACM）或带 `rndis` 的 Android 时，宿主机默认可能尝试 DHCP 获取并将设备当成主互联网网关，导致本机电脑原本的宽带/Wi-Fi 网络断网。
 
-本工具包内置 [host_network.py](../scripts/host_network.py)，提供自动三层防御（在 `provision-openwrt` 时默认自动生效，也可手动随时单独调用）：
-1. **清理负向缓存**：清除 `HKLM:\SYSTEM\CurrentControlSet\Control\UsbFlags\1D6B01040612` 注册表项；
-2. **原生驱动自绑定**：调用 Windows `setupapi`/`newdev` API 为现存 RNDIS 设备绑定微软自带 `C:\Windows\INF\netrndis.inf` RNDIS6 驱动，无需人工手选 INF；
-3. **纯内网隔离**：将 RNDIS 网卡固定配置为 `192.168.77.12 / 255.255.255.0`，清空 `DefaultGateway`、DNS 服务器、关闭 IPv6 绑定，将接口跃点数设为 `5000`，并执行 `audit_default_routes()` 强制核验操作系统 `0.0.0.0/0` 默认路由表中绝不包含 `192.168.77.*` 或 `192.168.0.*`。
+本工具包内置跨平台 [host_network.py](../scripts/host_network.py)，提供自动隔离与路由审计（`provision-openwrt` 默认自动生效，也可手动单独执行 `audit` / `isolate`）：
+- **Windows (`win64`)**：清理负向 `UsbFlags` 缓存、调用 `setupapi`/`newdev` 绑定微软自带 `netrndis.inf` RNDIS6，并将 `UsbNcm` / `RNDIS` 固定为 `192.168.77.12/24` 无默认网关无 DNS、关闭 IPv6。
+- **Linux (`linux-x64` / `linux-arm64`)**：识别 `1d6b:0104` / `cdc_ncm` / `rndis_host` 网卡，优先调用 `nmcli`（`ipv4.never-default yes`, `ipv6.method disabled`）或 `ip route del default dev <iface>` 隔离为 `192.168.77.12/24`。
+- **macOS (`macos`)**：通过 `networksetup -setmanual <service> 192.168.77.12 255.255.255.0 ""` 清空路由与 DNS、关闭 IPv6，并用 `netstat -rn` 审计默认路由无泄露。
+- **Android Termux (`android-arm64`)**：只读审计路由表，提示关闭手机多余数据冲突或使用 Wi-Fi AP 连接管理口。
 
 手动运行网络修复与审计：
 
