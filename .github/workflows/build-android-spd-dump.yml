@@ -1,0 +1,100 @@
+name: Build Android Termux spd_dump (--usb-fd)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/multi-platform-host
+    paths:
+      - '.github/workflows/build-android-spd-dump.yml'
+
+jobs:
+  build-android-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config make git curl ca-certificates
+
+      - name: Locate Android NDK toolchain
+        run: |
+          NDK_DIR="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK_DIR" ] && [ -d "/usr/local/lib/android/sdk/ndk" ]; then
+            NDK_DIR=$(ls -d /usr/local/lib/android/sdk/ndk/* | sort -V | tail -n 1)
+          fi
+          echo "Using NDK: $NDK_DIR"
+          TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android28-clang" >> "$GITHUB_ENV"
+          echo "AR=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
+          echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> "$GITHUB_ENV"
+          echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> "$GITHUB_ENV"
+          echo "READELF=$TOOLCHAIN/bin/llvm-readelf" >> "$GITHUB_ENV"
+          echo "PREFIX=$GITHUB_WORKSPACE/android-prefix" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/android-prefix"
+
+      - name: Build static libusb for aarch64-linux-android28
+        run: |
+          curl -fL --retry 3 -o libusb.tar.gz "https://github.com/libusb/libusb/archive/refs/tags/v1.0.30.tar.gz"
+          tar -xzf libusb.tar.gz
+          cd libusb-1.0.30
+          NOCONFIGURE=1 ./autogen.sh
+          ./configure \
+            --host=aarch64-linux-android \
+            CC="$CC" AR="$AR" RANLIB="$RANLIB" \
+            --prefix="$PREFIX" \
+            --enable-static --disable-shared --disable-udev
+          make -j"$(nproc)"
+          make install
+
+      - name: Build static libxml2 for aarch64-linux-android28
+        run: |
+          curl -fL --retry 3 -o libxml2.tar.gz "https://github.com/GNOME/libxml2/archive/refs/tags/v2.13.8.tar.gz"
+          tar -xzf libxml2.tar.gz
+          cd libxml2-2.13.8
+          NOCONFIGURE=1 ./autogen.sh
+          ./configure \
+            --host=aarch64-linux-android \
+            CC="$CC" AR="$AR" RANLIB="$RANLIB" \
+            --prefix="$PREFIX" \
+            --enable-static --disable-shared \
+            --without-iconv --without-zlib --without-lzma --without-python --without-threads
+          make -j"$(nproc)"
+          make install
+
+      - name: Build spreadtrum_flash (spd_dump-termux-usb)
+        run: |
+          git clone https://github.com/TomKing062/spreadtrum_flash.git
+          cd spreadtrum_flash
+          git checkout 607f701
+          echo "#define GIT_VER \"$(git rev-list HEAD --count)\"" > GITVER.h
+          echo "#define GIT_SHA1 \"$(git rev-parse HEAD)\"" >> GITVER.h
+          LIBUSB_CFLAGS=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --static --cflags libusb-1.0)
+          LIBUSB_LIBS=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --static --libs libusb-1.0)
+          LIBXML_CFLAGS=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --static --cflags libxml-2.0)
+          LIBXML_LIBS=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --static --libs libxml-2.0)
+          $CC -O2 -Wall -Wextra -std=c99 -Wno-unused -fPIE -pie \
+            -DUSE_LIBUSB=1 -DLIBXML_STATIC \
+            $LIBUSB_CFLAGS $LIBXML_CFLAGS \
+            spd_dump.c common.c \
+            $LIBUSB_LIBS $LIBXML_LIBS -lm \
+            -o spd_dump-termux-usb
+          $STRIP spd_dump-termux-usb
+          file spd_dump-termux-usb
+          $READELF -d spd_dump-termux-usb
+
+      - name: Package and upload Android Termux artifact
+        run: |
+          mkdir -p out
+          cp spreadtrum_flash/spd_dump-termux-usb out/
+          cp spreadtrum_flash/README.md out/README_spreadtrum_flash.md
+          cp spreadtrum_flash/README_zh.md out/README_spreadtrum_flash_zh.md
+          sha256sum out/spd_dump-termux-usb > out/SHA256SUMS.txt
+          cat out/SHA256SUMS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spd_dump-android-arm64-termux-usb
+          path: out/
