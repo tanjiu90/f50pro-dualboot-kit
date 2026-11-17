@@ -273,3 +273,117 @@ def test_p0_2_swapped_identical_model_device_rejected(
     }
     with pytest.raises(ValueError, match="Offset 0 not permitted"):
         validate_plan_safety(tamper_offset)
+
+
+def test_p0_3_targeted_nic_selection_ignores_phone_tether_usb_dock_and_wifi_192_168_0_1(tmp_path: Path) -> None:
+    """P0-3: Correlate ONLY F50 Pro USB interface; ignore phone tethering, USB dock, and normal 192.168.0.1 Wi-Fi."""
+    from host_network import (
+        audit_default_routes,
+        correlate_macos_net_candidates,
+        isolate_usb_rndis_adapter,
+        parse_linux_ip_routes,
+        parse_macos_netstat_routes,
+        parse_macos_network_service_order,
+        parse_macos_spusb_net_devices,
+        restore_network_snapshot,
+        select_target_usb_adapters,
+    )
+
+    # 1. Mixed USB devices simultaneously connected: F50 Pro (1d6b:0104) + Phone Tether (18d1:4ee3) + USB Dock (0bda:8153)
+    cands = [
+        {"name": "usb0", "device": "usb0", "vid": "18d1", "pid": "4ee3", "desc": "Remote NDIS based Internet Sharing Device", "port_path": "1-1"},
+        {"name": "enx00e04c", "device": "enx00e04c", "vid": "0bda", "pid": "8153", "desc": "USB 10/100/1000 LAN", "port_path": "1-2"},
+        {"name": "usb1", "device": "usb1", "vid": "1d6b", "pid": "0104", "desc": "CDC NCM", "port_path": "1-4", "serial": "F50-SERIAL"},
+    ]
+    sel = select_target_usb_adapters(cands)
+    assert sel["ambiguous"] is False
+    assert [t["name"] for t in sel["targets"]] == ["usb1"]
+    assert len(sel["ignored"]) == 2
+
+    # 2. Ambiguous: two uncorrelated F50 Pro adapters -> must refuse bulk mutation without executing system commands
+    cands_two = [
+        {"name": "usb1", "device": "usb1", "vid": "1d6b", "pid": "0104", "port_path": "1-4"},
+        {"name": "usb2", "device": "usb2", "vid": "1d6b", "pid": "0104", "port_path": "1-5"},
+    ]
+    assert select_target_usb_adapters(cands_two)["ambiguous"] is True
+    with (
+        patch("host_network.detect_host_platform", return_value="linux-x64"),
+        patch("host_network._detect_linux_net_candidates", return_value=cands_two),
+        patch("host_network._run_priv_posix") as priv_spy,
+    ):
+        with pytest.raises(RuntimeError, match="Multiple correlated F50 Pro USB interfaces"):
+            isolate_usb_rndis_adapter()
+        priv_spy.assert_not_called()
+
+    # 3. Normal Wi-Fi via 192.168.0.1 must NEVER be falsely flagged as an F50 Pro leak on Windows/Linux/macOS
+    win_wifi_192_0_1 = json.dumps({
+        "ipv4_default": [{"ifIndex": 7, "InterfaceAlias": "Wi-Fi", "NextHop": "192.168.0.1", "RouteMetric": 25}],
+        "ipv6_default": [],
+        "rndis_adapters": [{"ifIndex": 42, "Name": "F50-USB", "PnpDeviceID": "USB\\VID_1D6B&PID_0104\\1", "Status": "Up"}],
+    })
+    with patch("host_network.sys.platform", "win32"), patch("host_network._ps", return_value=win_wifi_192_0_1):
+        assert audit_default_routes()["usb_default_route_leak"] is False
+
+    lin_wifi_192_0_1 = json.dumps([{"dst": "default", "gateway": "192.168.0.1", "dev": "wlan0", "metric": 600}])
+    assert parse_linux_ip_routes(lin_wifi_192_0_1, "[]", {"usb1"})["usb_default_route_leak"] is False
+
+    mac_wifi_192_0_1 = "default 192.168.0.1 UGScg en0\n"
+    assert parse_macos_netstat_routes(mac_wifi_192_0_1, "", {"en9"})["usb_default_route_leak"] is False
+
+    # 4. macOS custom-renamed Network Service vs Hardware Port vs BSD Device + SPUSB correlation
+    svc_order = """An asterisk (*) denotes that a network service is disabled.
+(1) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+
+(2) My Office Dock
+(Hardware Port: USB 10/100/1000 LAN, Device: en5)
+
+(3) Custom F50 Slot
+(Hardware Port: CDC NCM, Device: en9)
+"""
+    spusb = json.dumps({
+        "SPUSBDataType": [
+            {
+                "_items": [
+                    {"_name": "USB 10/100/1000 LAN", "vendor_id": "0x0bda", "product_id": "0x8153", "bsd_name": "en5", "location_id": "0x01100000"},
+                    {"_name": "CDC NCM", "vendor_id": "0x1d6b", "product_id": "0x0104", "bsd_name": "en9", "serial_num": "F50MAC1", "location_id": "0x01200000"},
+                ]
+            }
+        ]
+    })
+    mac_cands = correlate_macos_net_candidates(
+        parse_macos_network_service_order(svc_order),
+        parse_macos_spusb_net_devices(spusb),
+    )
+    mac_sel = select_target_usb_adapters(mac_cands)
+    assert len(mac_sel["targets"]) == 1
+    assert mac_sel["targets"][0]["network_service"] == "Custom F50 Slot"
+    assert mac_sel["targets"][0]["hardware_port"] == "CDC NCM"
+    assert mac_sel["targets"][0]["device"] == "en9"
+
+    # 5. Pre-change snapshot & non-clobber restore when user modified interface afterwards
+    snap_path = tmp_path / "net_snap.json"
+    snap_path.write_text(
+        json.dumps({
+            "applied_static_ip": "192.168.77.12",
+            "entries": [{"platform": "linux", "iface": "usb1", "nm_connection": "F50", "nm_state": {"ipv4.method": "auto"}}],
+        }),
+        encoding="utf-8",
+    )
+    user_edited_state = {
+        "platform": "linux",
+        "iface": "usb1",
+        "ip_addr_json": [{"ifname": "usb1", "addr_info": [{"local": "10.0.0.5"}]}],
+        "nm_connection": "F50",
+        "nm_state": {},
+    }
+    with patch("host_network._snapshot_linux_iface", return_value=user_edited_state), patch(
+        "host_network._run_priv_posix"
+    ) as priv_spy2:
+        rest = restore_network_snapshot(snap_path, force=False)
+    assert rest["results"][0]["status"] == "skipped_user_modified"
+    priv_spy2.assert_not_called()
+
+    # 6. Explicit internet-exit mode must not strip default gateway
+    res_inet = isolate_usb_rndis_adapter(mode="internet-exit")
+    assert res_inet["mode"] == "internet-exit" and res_inet["isolated"] == []
