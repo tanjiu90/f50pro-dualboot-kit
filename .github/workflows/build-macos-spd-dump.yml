@@ -1,0 +1,94 @@
+name: Build macOS Universal spd_dump (arm64 + x86_64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/multi-platform-host
+    paths:
+      - '.github/workflows/build-macos-spd-dump.yml'
+
+jobs:
+  build-macos-universal:
+    runs-on: macos-latest
+    steps:
+      - name: Install autotools and pkg-config via Homebrew
+        run: brew install autoconf automake libtool pkg-config
+
+      - name: Fetch upstream tarballs and spreadtrum_flash source
+        run: |
+          curl -fL --retry 3 -o libusb.tar.gz "https://github.com/libusb/libusb/archive/refs/tags/v1.0.30.tar.gz"
+          curl -fL --retry 3 -o libxml2.tar.gz "https://github.com/GNOME/libxml2/archive/refs/tags/v2.13.8.tar.gz"
+          git clone https://github.com/TomKing062/spreadtrum_flash.git
+          (cd spreadtrum_flash && git checkout 607f701)
+
+      - name: Build Universal (arm64 + x86_64) static spd_dump targeting macOS 11.0+
+        run: |
+          build_arch() {
+            ARCH="$1"
+            HOST_TRIPLE="$2"
+            PREFIX="$GITHUB_WORKSPACE/mac-prefix-$ARCH"
+            mkdir -p "$PREFIX" "work-$ARCH"
+            tar -xzf libusb.tar.gz -C "work-$ARCH"
+            tar -xzf libxml2.tar.gz -C "work-$ARCH"
+            CFLAGS="-O2 -arch $ARCH -mmacosx-version-min=11.0"
+            LDFLAGS="-arch $ARCH -mmacosx-version-min=11.0"
+
+            (
+              cd "work-$ARCH/libusb-1.0.30"
+              NOCONFIGURE=1 ./autogen.sh
+              ./configure --host="$HOST_TRIPLE" CC=clang CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" \
+                --prefix="$PREFIX" --enable-static --disable-shared --disable-dependency-tracking
+              make -j"$(sysctl -n hw.ncpu)"
+              make install
+            )
+
+            (
+              cd "work-$ARCH/libxml2-2.13.8"
+              NOCONFIGURE=1 ./autogen.sh
+              ./configure --host="$HOST_TRIPLE" CC=clang CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" \
+                --prefix="$PREFIX" --enable-static --disable-shared --disable-dependency-tracking \
+                --without-iconv --without-zlib --without-lzma --without-python --without-threads
+              make -j"$(sysctl -n hw.ncpu)"
+              make install
+            )
+
+            (
+              cd spreadtrum_flash
+              echo "#define GIT_VER \"$(git rev-list HEAD --count)\"" > GITVER.h
+              echo "#define GIT_SHA1 \"$(git rev-parse HEAD)\"" >> GITVER.h
+              USB_CFLAGS=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --static --cflags libusb-1.0)
+              USB_LIBS=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --static --libs libusb-1.0)
+              XML_CFLAGS=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --static --cflags libxml-2.0)
+              XML_LIBS=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --static --libs libxml-2.0)
+              clang -O2 -Wall -Wextra -std=c99 -Wno-unused -arch "$ARCH" -mmacosx-version-min=11.0 \
+                -DUSE_LIBUSB=1 -DLIBXML_STATIC \
+                -I"$PREFIX/include" $USB_CFLAGS $XML_CFLAGS \
+                spd_dump.c common.c \
+                -L"$PREFIX/lib" $USB_LIBS $XML_LIBS -lobjc -framework IOKit -framework CoreFoundation -framework Security -lm \
+                -o "$GITHUB_WORKSPACE/spd_dump-$ARCH"
+              strip -x "$GITHUB_WORKSPACE/spd_dump-$ARCH"
+            )
+          }
+
+          build_arch arm64 aarch64-apple-darwin
+          build_arch x86_64 x86_64-apple-darwin
+          lipo -create "$GITHUB_WORKSPACE/spd_dump-arm64" "$GITHUB_WORKSPACE/spd_dump-x86_64" -output "$GITHUB_WORKSPACE/spd_dump"
+
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/spd_dump" out/spd_dump
+          cp spreadtrum_flash/README.md out/README_spreadtrum_flash.md
+          cp spreadtrum_flash/README_zh.md out/README_spreadtrum_flash_zh.md
+          file out/spd_dump
+          lipo -info out/spd_dump
+          otool -L out/spd_dump
+          vtool -show-build out/spd_dump | head -n 30 || true
+          out/spd_dump -h >/dev/null
+          shasum -a 256 out/spd_dump > out/SHA256SUMS.txt
+          cat out/SHA256SUMS.txt
+
+      - name: Upload macOS Universal artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spd_dump-macos-universal
+          path: out/
