@@ -18,17 +18,25 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-from brom_backup import FATAL_SPD_RE, parse_partition_xml, trigger_zte_webui_reboot
+from brom_backup import (
+    FATAL_SPD_RE,
+    _explain_libusb_error,
+    build_spd_invocation,
+    parse_partition_xml,
+    trigger_zte_webui_reboot,
+)
 from common import (
     DEFAULT_TOOLS_DIR,
     FORBIDDEN_PARTITIONS,
     MISC_BC_OFFSET,
     PROFILES,
     REPO_ROOT,
+    detect_host_platform,
     read_json,
     resolve_tool,
     sha256_bytes,
     sha256_file,
+    win_no_window_kwargs,
     write_json,
 )
 
@@ -55,12 +63,20 @@ def validate_plan_safety(plan: dict[str, Any]) -> None:
 
 
 class _SpdSession:
-    def __init__(self, spd_dump: Path, work_dir: Path, wait_sec: int = 120):
+    def __init__(
+        self,
+        spd_dump: Path,
+        work_dir: Path,
+        wait_sec: int = 120,
+        *,
+        tools_dir: Path = DEFAULT_TOOLS_DIR,
+        spd_mode: str = "auto",
+        usb_dev: str | None = None,
+    ):
         self.work_dir = work_dir
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.lines: queue.Queue[str | None] = queue.Queue()
-        cmd = [
-            str(spd_dump),
+        spd_args = [
             "--wait",
             str(wait_sec),
             "--kickto",
@@ -72,6 +88,16 @@ class _SpdSession:
             "path",
             str(work_dir),
         ]
+        if spd_mode in ("auto", "direct"):
+            plat = detect_host_platform()
+            if plat == "android-arm64" and (not hasattr(os, "geteuid") or os.geteuid() != 0):
+                cmd, self.launch_meta = build_spd_invocation(tools_dir, spd_args, spd_mode=spd_mode, usb_dev=usb_dev)
+            else:
+                cmd = [str(spd_dump), *spd_args]
+                self.launch_meta = {"platform": plat, "mode": "direct", "binary": str(spd_dump)}
+        else:
+            cmd, self.launch_meta = build_spd_invocation(tools_dir, spd_args, spd_mode=spd_mode, usb_dev=usb_dev)
+
         self.proc = subprocess.Popen(
             cmd,
             cwd=work_dir,
@@ -82,7 +108,7 @@ class _SpdSession:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            **win_no_window_kwargs(),
         )
         self.log = (work_dir / "spd_dump_flash.log").open("w", encoding="utf-8")
         threading.Thread(target=self._reader, daemon=True).start()
@@ -107,7 +133,8 @@ class _SpdSession:
                 raise RuntimeError(f"spd_dump exited early; tail={buf[-8:]}")
             buf.append(line.strip())
             if FATAL_SPD_RE.search(line) and "Waiting" not in line:
-                raise RuntimeError(f"Fatal spd_dump output: {line.strip()}")
+                meta = getattr(self, "launch_meta", {})
+                raise RuntimeError(f"Fatal spd_dump output: {_explain_libusb_error(line.strip(), meta)}")
             for m in markers:
                 if m in line:
                     return m, buf
@@ -178,6 +205,8 @@ def execute_flash(
     webui_password: str | None = None,
     webui_host: str = "http://192.168.0.1:8080",
     execute: bool = False,
+    spd_mode: str = "auto",
+    usb_dev: str | None = None,
 ) -> dict[str, Any]:
     """Execute or dry-run a verified flash_plan.json with full readback verification."""
     plan = read_json(plan_path)
@@ -187,6 +216,7 @@ def execute_flash(
             "dry_run": True,
             "device_mutated": False,
             "profile": plan["profile"],
+            "spd_mode": spd_mode,
             "operations": [
                 {"op": o["op"], "partition": o["partition"], "size_bytes": o["size_bytes"]}
                 for o in plan["operations"]
@@ -195,15 +225,27 @@ def execute_flash(
 
     backup_dir = Path(plan["backup_dir"])
     run_dir = Path(plan["out_dir"]) / "flash-run"
-    spd_dump = resolve_tool("spd_dump", tools_dir)
+    prefer_var = "termux-usb" if spd_mode == "termux-usb" else ("su" if spd_mode == "su" else None)
+    spd_dump = resolve_tool("spd_dump", tools_dir, prefer_variant=prefer_var)
     expected_xml = parse_partition_xml(backup_dir / "partition_list.xml")
 
     sess: _SpdSession | None = None
     for attempt in range(1, 5):
-        cand = _SpdSession(spd_dump, run_dir, wait_sec=90)
+        cand = _SpdSession(
+            spd_dump,
+            run_dir,
+            wait_sec=90,
+            tools_dir=tools_dir,
+            spd_mode=spd_mode,
+            usb_dev=usb_dev,
+        )
         try:
-            cand.expect_any(("Waiting for boot_diag",), timeout=20)
-            if attempt == 1 and webui_password:
+            first_res = cand.expect_any(
+                ("Waiting for boot_diag", "Waiting for dl_diag", "Try to convert termux transfered usb port fd."),
+                timeout=20,
+            )
+            hit = first_res[0] if isinstance(first_res, tuple) and first_res else str(first_res)
+            if attempt == 1 and webui_password and "Waiting for boot_diag" in hit:
                 time.sleep(0.8)
                 trigger_zte_webui_reboot(webui_password, host=webui_host)
             cand.expect_any(("save dir is",), timeout=100)
@@ -284,6 +326,8 @@ def main() -> int:
     parser.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--webui-password")
     parser.add_argument("--webui-host", default="http://192.168.0.1:8080")
+    parser.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
+    parser.add_argument("--usb-dev", help="Explicit Termux OTG /dev/bus/usb/XXX/YYY path for --spd-mode termux-usb")
     parser.add_argument("--execute", action="store_true", help="Actually flash device (default is dry-run)")
     args = parser.parse_args()
     p = args.plan if args.plan.is_absolute() else (REPO_ROOT / args.plan)
@@ -293,6 +337,8 @@ def main() -> int:
         webui_password=args.webui_password,
         webui_host=args.webui_host,
         execute=args.execute,
+        spd_mode=args.spd_mode,
+        usb_dev=args.usb_dev,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0

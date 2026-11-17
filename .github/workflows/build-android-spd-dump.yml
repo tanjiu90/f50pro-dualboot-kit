@@ -76,9 +76,9 @@ jobs:
           LIBXML_LIBS=$(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --static --libs libxml-2.0)
           $CC -O2 -Wall -Wextra -std=c99 -Wno-unused -fPIE -pie \
             -DUSE_LIBUSB=1 -DLIBXML_STATIC \
-            $LIBUSB_CFLAGS $LIBXML_CFLAGS \
+            -I"$PREFIX/include" $LIBUSB_CFLAGS $LIBXML_CFLAGS \
             spd_dump.c common.c \
-            $LIBUSB_LIBS $LIBXML_LIBS -lm \
+            -L"$PREFIX/lib" $LIBUSB_LIBS $LIBXML_LIBS -lm \
             -o spd_dump-termux-usb
           $STRIP spd_dump-termux-usb
           file spd_dump-termux-usb

@@ -1,12 +1,17 @@
 <#
 .SYNOPSIS
-    One-click Windows host bootstrap for f50pro-dualboot-kit.
+    One-click Windows host bootstrap for f50pro-dualboot-kit with selectable release packs.
     Creates an isolated Python .venv, installs pyserial/paramiko/pytest,
-    fetches & SHA-256-verifies Release v1.0.0 tools, and generates an ADB RSA keypair if absent.
+    fetches & SHA-256-verifies selected Release packs, and generates an ADB RSA keypair if absent.
 #>
 [CmdletBinding()]
 param(
+    [string]$HostPlatform = "auto",
+    [string]$Profile = "all",
+    [string[]]$Packs,
     [switch]$SkipOpenClash,
+    [switch]$ListPacks,
+    [switch]$Interactive,
     [switch]$InstallWinUsbHint
 )
 
@@ -18,6 +23,11 @@ $Python = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $Python) { $Python = (Get-Command py -ErrorAction SilentlyContinue).Source }
 if (-not $Python) { throw "Python 3.11+ not found in PATH." }
 
+if ($ListPacks) {
+    & $Python "$Root\scripts\fetch_assets.py" --list-packs
+    exit $LASTEXITCODE
+}
+
 if (-not (Test-Path "$Root\.venv\Scripts\python.exe")) {
     & $Python -m venv "$Root\.venv"
 }
@@ -26,14 +36,27 @@ $VenvPy = "$Root\.venv\Scripts\python.exe"
 & $VenvPy -m pip install paramiko pyserial pytest
 
 $FetchArgs = @("$Root\scripts\fetch_assets.py")
-if ($SkipOpenClash) { $FetchArgs += '--no-openclash' }
+if ($Interactive) {
+    $FetchArgs += '--interactive'
+} else {
+    $FetchArgs += @('--host-platform', $HostPlatform, '--profile', $Profile)
+    if ($Packs -and $Packs.Count -gt 0) {
+        $FetchArgs += '--packs'
+        $FetchArgs += $Packs
+    }
+    if ($SkipOpenClash) { $FetchArgs += '--no-openclash' }
+}
 & $VenvPy @FetchArgs
 
 $AdbPub = Join-Path $env:USERPROFILE ".android\adbkey.pub"
 if (-not (Test-Path $AdbPub)) {
     New-Item -ItemType Directory -Force -Path (Split-Path $AdbPub) | Out-Null
     $AdbExe = "$Root\build\runtime-tools\host-tools-win64\platform-tools\adb.exe"
-    if (Test-Path $AdbExe) {
+    if (-not (Test-Path $AdbExe)) {
+        $Cmd = Get-Command adb -ErrorAction SilentlyContinue
+        if ($Cmd) { $AdbExe = $Cmd.Source }
+    }
+    if ($AdbExe -and (Test-Path $AdbExe)) {
         & $AdbExe keygen (Join-Path $env:USERPROFILE ".android\adbkey")
     }
 }

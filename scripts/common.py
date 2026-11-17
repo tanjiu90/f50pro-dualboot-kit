@@ -4,10 +4,13 @@ from __future__ import annotations
 import hashlib
 import json
 import lzma
+import os
+import platform
 import shutil
 import stat
 import struct
 import subprocess
+import sys
 import zlib
 from pathlib import Path
 from typing import Any
@@ -495,22 +498,134 @@ def repack_vendor_boot_v4(
     }
 
 
-def resolve_tool(name: str, tools_dir: Path = DEFAULT_TOOLS_DIR) -> Path:
-    """Resolve bundled or system PATH executable (spd_dump, adb, etc.)."""
-    candidates = {
-        "spd_dump": [
-            tools_dir / "host-tools-win64/spd_dump_251/spd_dump.exe",
-            tools_dir / "spd_dump_251/spd_dump.exe",
-        ],
-        "adb": [
-            tools_dir / "host-tools-win64/platform-tools/adb.exe",
-            tools_dir / "platform-tools/adb.exe",
-        ],
-    }
-    for cand in candidates.get(name, []):
+HOST_PLATFORMS: tuple[str, ...] = (
+    "win64",
+    "linux-x64",
+    "linux-arm64",
+    "macos",
+    "android-arm64",
+)
+
+
+def detect_host_platform() -> str:
+    """Detect canonical host platform ID for tool/driver resolution."""
+    plat = sys.platform.lower()
+    if plat == "win32":
+        return "win64"
+    if plat == "darwin":
+        return "macos"
+    is_android = bool(
+        os.environ.get("TERMUX_VERSION")
+        or Path("/data/data/com.termux/files/usr").is_dir()
+        or Path("/system/build.prop").is_file()
+    )
+    if is_android:
+        return "android-arm64"
+    arch = platform.machine().lower()
+    if arch in ("aarch64", "arm64", "armv8l", "armv8b"):
+        return "linux-arm64"
+    return "linux-x64"
+
+
+def win_no_window_kwargs() -> dict[str, Any]:
+    """Return CREATE_NO_WINDOW kwargs only on Windows hosts (empty dict on POSIX)."""
+    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def ensure_executable(path: Path) -> Path:
+    """Ensure executable mode bits are set on POSIX binaries extracted from archives."""
+    if os.name != "nt" and path.is_file():
+        mode = path.stat().st_mode
+        if not (mode & stat.S_IXUSR):
+            try:
+                path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            except OSError:
+                pass
+    return path
+
+
+def resolve_tool(
+    name: str,
+    tools_dir: Path = DEFAULT_TOOLS_DIR,
+    *,
+    platform_id: str | None = None,
+    prefer_variant: str | None = None,
+) -> Path:
+    """Resolve bundled per-platform or system PATH executable (spd_dump, adb, etc.)."""
+    plat = platform_id or detect_host_platform()
+    if name == "spd_dump":
+        android_cands = (
+            [
+                tools_dir / "host-tools-android-arm64/bin/spd_dump-termux-usb",
+                tools_dir / "host-tools-android-arm64/bin/spd_dump-su",
+            ]
+            if prefer_variant == "termux-usb"
+            else [
+                tools_dir / "host-tools-android-arm64/bin/spd_dump-su",
+                tools_dir / "host-tools-android-arm64/bin/spd_dump",
+                tools_dir / "host-tools-android-arm64/bin/spd_dump-termux-usb",
+            ]
+        )
+        per_plat = {
+            "win64": [
+                tools_dir / "host-tools-win64/spd_dump_251/spd_dump.exe",
+                tools_dir / "spd_dump_251/spd_dump.exe",
+            ],
+            "linux-x64": [
+                tools_dir / "host-tools-linux-x64/bin/spd_dump",
+                tools_dir / "host-tools-linux-x64/spd_dump",
+            ],
+            "linux-arm64": [
+                tools_dir / "host-tools-linux-arm64/bin/spd_dump",
+                tools_dir / "host-tools-linux-arm64/spd_dump",
+            ],
+            "macos": [
+                tools_dir / "host-tools-macos/bin/spd_dump",
+                tools_dir / "host-tools-macos/spd_dump",
+            ],
+            "android-arm64": android_cands,
+        }
+        cands = per_plat.get(plat, [])
+    elif name == "adb":
+        per_plat = {
+            "win64": [
+                tools_dir / "host-tools-win64/platform-tools/adb.exe",
+                tools_dir / "platform-tools/adb.exe",
+            ],
+            "linux-x64": [
+                tools_dir / "host-tools-linux-x64/platform-tools/adb",
+                tools_dir / "platform-tools/adb",
+            ],
+            "linux-arm64": [
+                tools_dir / "host-tools-linux-arm64/bin/adb",
+            ],
+            "macos": [
+                tools_dir / "host-tools-macos/platform-tools/adb",
+                tools_dir / "platform-tools/adb",
+            ],
+            "android-arm64": [
+                tools_dir / "host-tools-android-arm64/bin/adb",
+            ],
+        }
+        cands = per_plat.get(plat, [])
+    else:
+        cands = []
+
+    for cand in cands:
         if cand.is_file():
-            return cand
-    found = shutil.which(name)
-    if found:
-        return Path(found)
-    raise FileNotFoundError(f"Tool '{name}' not found in {tools_dir} or PATH. Run bootstrap/fetch-assets first.")
+            return ensure_executable(cand)
+
+    which_names = [name]
+    if name == "adb" and plat == "android-arm64":
+        which_names = ["termux-adb", "adb"] if prefer_variant == "termux-adb" else ["adb", "termux-adb"]
+    for wname in which_names:
+        found = shutil.which(wname)
+        if found:
+            return Path(found)
+
+    raise FileNotFoundError(
+        f"Tool '{name}' not found for platform '{plat}' in {tools_dir} or PATH. "
+        f"Run scripts/bootstrap.sh (POSIX/Android) or scripts/bootstrap.ps1 (Windows), or fetch_assets.py."
+    )

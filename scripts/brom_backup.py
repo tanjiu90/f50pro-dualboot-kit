@@ -12,6 +12,8 @@ import json
 import os
 import queue
 import re
+import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -24,14 +26,17 @@ from typing import Any
 from common import (
     DEFAULT_TOOLS_DIR,
     REPO_ROOT,
+    detect_host_platform,
     parse_boot_control,
     resolve_tool,
     sha256_file,
+    win_no_window_kwargs,
     write_json,
 )
 
 FATAL_SPD_RE = re.compile(
-    r"LIBUSB_ERROR_(?:PIPE|NO_DEVICE|IO)|find port failed|timeout reached", re.I
+    r"LIBUSB_ERROR_(?:PIPE|NO_DEVICE|IO|ACCESS)|find port failed|timeout reached|need provide --usb-fd|not a spd device",
+    re.I,
 )
 
 CORE_PARTITIONS = frozenset({
@@ -241,6 +246,110 @@ def verify_backup_dir(backup_dir: Path, *, require_complete_table: bool = True) 
     return report
 
 
+def discover_termux_usb_device() -> str:
+    """List OTG USB device paths exposed by Termux:API (`termux-usb -l`)."""
+    tusb = shutil.which("termux-usb")
+    if not tusb:
+        raise FileNotFoundError("termux-usb not found. Install Termux:API (`pkg install termux-api`) and Termux:API app.")
+    res = subprocess.run([tusb, "-l"], capture_output=True, text=True, timeout=15)
+    if res.returncode != 0:
+        raise RuntimeError(f"termux-usb -l failed ({res.returncode}): {res.stderr or res.stdout}")
+    devs = json.loads(res.stdout.strip() or "[]")
+    if not devs:
+        raise RuntimeError(
+            "No USB OTG device returned by `termux-usb -l`. Connect F50 Pro already in 1782:4d00 autodloader mode."
+        )
+    if len(devs) > 1:
+        raise RuntimeError(f"Multiple OTG USB devices found ({devs}); specify one explicitly with --usb-dev")
+    return str(devs[0])
+
+
+def _strip_kick_wait_args(args: list[str]) -> list[str]:
+    """Strip --wait <N> and --kickto <N> flags incompatible with Android --usb-fd non-root mode."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] in ("--wait", "--kickto"):
+            i += 2
+            continue
+        if args[i] == "--kick":
+            i += 1
+            continue
+        out.append(args[i])
+        i += 1
+    return out
+
+
+def build_spd_invocation(
+    tools_dir: Path,
+    spd_args: list[str],
+    *,
+    spd_mode: str = "auto",
+    usb_dev: str | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    """Construct cross-platform command list for spd_dump (direct, sudo, Android su, or termux-usb --usb-fd)."""
+    plat = detect_host_platform()
+    mode = spd_mode
+    if mode == "auto":
+        if plat == "android-arm64":
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                mode = "direct"
+            elif shutil.which("su"):
+                mode = "su"
+            elif shutil.which("termux-usb"):
+                mode = "termux-usb"
+            else:
+                mode = "direct"
+        else:
+            mode = "direct"
+
+    if mode == "direct":
+        spd = resolve_tool("spd_dump", tools_dir, platform_id=plat)
+        return [str(spd), *spd_args], {"platform": plat, "mode": "direct", "binary": str(spd)}
+
+    if mode == "sudo":
+        if plat == "win64":
+            spd = resolve_tool("spd_dump", tools_dir, platform_id=plat)
+            return [str(spd), *spd_args], {"platform": plat, "mode": "direct", "binary": str(spd)}
+        spd = resolve_tool("spd_dump", tools_dir, platform_id=plat)
+        return ["sudo", str(spd), *spd_args], {"platform": plat, "mode": "sudo", "binary": str(spd)}
+
+    if mode == "su":
+        spd = resolve_tool("spd_dump", tools_dir, platform_id="android-arm64", prefer_variant="su")
+        inner = shlex.join([str(spd), *spd_args])
+        return ["su", "-c", inner], {"platform": plat, "mode": "su", "binary": str(spd)}
+
+    if mode == "termux-usb":
+        tusb = shutil.which("termux-usb")
+        if not tusb:
+            raise FileNotFoundError("termux-usb not found in PATH")
+        spd = resolve_tool("spd_dump", tools_dir, platform_id="android-arm64", prefer_variant="termux-usb")
+        target_dev = usb_dev or discover_termux_usb_device()
+        fd_args = _strip_kick_wait_args(spd_args)
+        inner_cmd = shlex.join([str(spd), "--usb-fd", *fd_args])
+        return [tusb, "-e", inner_cmd, target_dev], {
+            "platform": plat,
+            "mode": "termux-usb",
+            "binary": str(spd),
+            "usb_dev": target_dev,
+            "requires_pre_autodloader": True,
+        }
+
+    raise ValueError(f"Unsupported --spd-mode '{spd_mode}'; choose auto, direct, sudo, su, or termux-usb")
+
+
+def _explain_libusb_error(line: str, launch_meta: dict[str, Any]) -> str:
+    if "LIBUSB_ERROR_ACCESS" in line:
+        plat = launch_meta.get("platform", "")
+        if plat == "macos":
+            return f"{line} (macOS requires root USB permission: re-run with sudo or `--spd-mode sudo`)"
+        if plat in ("linux-x64", "linux-arm64"):
+            return f"{line} (Linux USB permission denied: install assets/udev/99-unisoc-f50pro.rules or use `--spd-mode sudo`)"
+        if plat == "android-arm64":
+            return f"{line} (Android USB permission denied: use Root `--spd-mode su`, or enter 1782:4d00 first with `--spd-mode termux-usb`)"
+    return line
+
+
 def run_brom_backup(
     output_dir: Path,
     *,
@@ -248,14 +357,14 @@ def run_brom_backup(
     wait_sec: int = 120,
     webui_password: str | None = None,
     webui_host: str = "http://192.168.0.1:8080",
+    spd_mode: str = "auto",
+    usb_dev: str | None = None,
 ) -> dict[str, Any]:
     """Execute read-only SPRD4:AutoD dump ('r all reset') and verify every partition."""
-    spd_dump = resolve_tool("spd_dump", tools_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "spd_dump_backup.log"
 
-    cmd = [
-        str(spd_dump),
+    spd_args = [
         "--wait",
         str(wait_sec),
         "--kickto",
@@ -270,6 +379,7 @@ def run_brom_backup(
         "all",
         "reset",
     ]
+    cmd, launch_meta = build_spd_invocation(tools_dir, spd_args, spd_mode=spd_mode, usb_dev=usb_dev)
     proc = subprocess.Popen(
         cmd,
         cwd=output_dir,
@@ -279,7 +389,7 @@ def run_brom_backup(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        **win_no_window_kwargs(),
     )
 
     lines: queue.Queue[str | None] = queue.Queue()
@@ -316,12 +426,14 @@ def run_brom_backup(
                 trigger_zte_webui_reboot(webui_password, host=webui_host)
         if FATAL_SPD_RE.search(item) and "Waiting" not in item:
             proc.terminate()
-            raise RuntimeError(f"spd_dump fatal error: {item.strip()}")
+            raise RuntimeError(f"spd_dump fatal error: {_explain_libusb_error(item.strip(), launch_meta)}")
 
     rc = proc.wait(timeout=30)
     if rc != 0:
-        raise RuntimeError(f"spd_dump backup failed rc={rc}; tail={tail[-10:]}")
-    return verify_backup_dir(output_dir, require_complete_table=True)
+        raise RuntimeError(f"spd_dump backup failed rc={rc} mode={launch_meta['mode']}; tail={tail[-10:]}")
+    rep = verify_backup_dir(output_dir, require_complete_table=True)
+    rep["spd_launch"] = launch_meta
+    return rep
 
 
 def main() -> int:
@@ -332,6 +444,8 @@ def main() -> int:
     parser.add_argument("--wait-sec", type=int, default=120)
     parser.add_argument("--webui-password", help="Stock WebUI password for automatic REBOOT_DEVICE trigger")
     parser.add_argument("--webui-host", default="http://192.168.0.1:8080")
+    parser.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
+    parser.add_argument("--usb-dev", help="Explicit Termux OTG /dev/bus/usb/XXX/YYY path for --spd-mode termux-usb")
     args = parser.parse_args()
 
     out_dir = args.output_dir if args.output_dir.is_absolute() else (REPO_ROOT / args.output_dir)
@@ -344,6 +458,8 @@ def main() -> int:
             wait_sec=args.wait_sec,
             webui_password=args.webui_password,
             webui_host=args.webui_host,
+            spd_mode=args.spd_mode,
+            usb_dev=args.usb_dev,
         )
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0

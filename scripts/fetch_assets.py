@@ -1,8 +1,10 @@
-"""Download, SHA-256 verify, and extract Release v1.0.0 offline tool/package packs."""
+"""Download, SHA-256 verify, and extract selectable multi-platform Release packs."""
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 import tarfile
 import urllib.request
@@ -13,18 +15,160 @@ from typing import Any
 from common import (
     DEFAULT_CACHE_DIR,
     DEFAULT_TOOLS_DIR,
+    HOST_PLATFORMS,
     MANIFEST_PATH,
     REPO_ROOT,
+    detect_host_platform,
+    ensure_executable,
     read_json,
     sha256_file,
 )
+
+PLATFORM_PACK_MAP: dict[str, str] = {
+    "win64": "host_tools_win64",
+    "linux-x64": "host_tools_linux_x64",
+    "linux-arm64": "host_tools_linux_arm64",
+    "macos": "host_tools_macos",
+    "android-arm64": "host_tools_android_arm64",
+}
+
+PROFILE_PACK_MAP: dict[str, tuple[str, ...]] = {
+    "all": ("openwrt_base", "android_pkgs"),
+    "1-android-ufi": ("android_pkgs",),
+    "2-dual-stock-openwrt": ("openwrt_base",),
+    "3-dual-full": ("openwrt_base", "android_pkgs"),
+    "none": (),
+}
+
+
+def select_pack_keys(
+    manifest: dict[str, Any],
+    *,
+    host_platform: str = "auto",
+    profile: str = "all",
+    include_openclash: bool = True,
+    explicit_packs: list[str] | None = None,
+) -> list[str]:
+    """Resolve the ordered list of manifest pack keys to fetch based on OS and profile filters."""
+    packs = manifest["packs"]
+    if explicit_packs:
+        out: list[str] = []
+        for raw in explicit_packs:
+            for item in raw.split(","):
+                key = item.strip()
+                if not key:
+                    continue
+                if key not in packs:
+                    raise ValueError(f"Unknown release pack '{key}'; available: {sorted(packs)}")
+                if key not in out:
+                    out.append(key)
+        return out
+
+    if profile not in PROFILE_PACK_MAP:
+        raise ValueError(f"Unknown profile filter '{profile}'; choices: {sorted(PROFILE_PACK_MAP)}")
+
+    selected: list[str] = list(PROFILE_PACK_MAP[profile])
+    if include_openclash and profile in ("all", "2-dual-stock-openwrt", "3-dual-full"):
+        if "openclash_offline" in packs:
+            selected.append("openclash_offline")
+
+    if host_platform == "none":
+        pass
+    elif host_platform == "all":
+        for pkey in PLATFORM_PACK_MAP.values():
+            if pkey in packs and pkey not in selected:
+                selected.append(pkey)
+    elif host_platform == "auto":
+        detected = detect_host_platform()
+        pkey = PLATFORM_PACK_MAP.get(detected)
+        if pkey and pkey in packs and pkey not in selected:
+            selected.append(pkey)
+    else:
+        for raw in host_platform.split(","):
+            plat = raw.strip()
+            if not plat:
+                continue
+            if plat not in PLATFORM_PACK_MAP:
+                raise ValueError(
+                    f"Unsupported host platform '{plat}'; choices: auto, all, none, {', '.join(HOST_PLATFORMS)}"
+                )
+            pkey = PLATFORM_PACK_MAP[plat]
+            if pkey not in packs:
+                raise ValueError(f"Manifest missing host-tools pack '{pkey}' for platform '{plat}'")
+            if pkey not in selected:
+                selected.append(pkey)
+
+    # Filter non-optional firmware packs only when absent in stripped synthetic test manifests.
+    return [k for k in selected if k in packs]
+
+
+def list_available_packs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return human- and agent-readable catalog of downloadable Release assets."""
+    base_url = manifest["base_url"].rstrip("/")
+    rows: list[dict[str, Any]] = []
+    for key, meta in manifest["packs"].items():
+        rows.append(
+            {
+                "pack": key,
+                "filename": meta["filename"],
+                "bytes": meta.get("bytes"),
+                "mib": round(meta["bytes"] / (1024 * 1024), 2) if meta.get("bytes") else None,
+                "sha256": meta["sha256"],
+                "platforms": meta.get("platforms", ["all"]),
+                "profiles": meta.get("profiles", ["all"]),
+                "optional": bool(meta.get("optional", False)),
+                "description": meta.get("description", ""),
+                "url": f"{base_url}/{meta['filename']}",
+            }
+        )
+    return rows
+
+
+def interactive_select(manifest: dict[str, Any]) -> tuple[str, str, bool]:
+    """Prompt terminal user to choose host platform pack(s), profile filter, and OpenClash."""
+    detected = detect_host_platform()
+    print(f"Detected host platform: {detected}", file=sys.stderr)
+    print("\nSelect host tool bundle to download:", file=sys.stderr)
+    plat_opts = [
+        ("1", detected, f"Current host ({detected}) [default]"),
+        ("2", "win64", "Windows x64"),
+        ("3", "linux-x64", "Linux x86_64"),
+        ("4", "linux-arm64", "Linux ARM64 / aarch64"),
+        ("5", "macos", "macOS Universal (Apple Silicon + Intel)"),
+        ("6", "android-arm64", "Android ARM64 Termux (Root su + --usb-fd)"),
+        ("7", "all", "Download ALL host tool packs (mirror / multi-machine USB stick)"),
+        ("8", "none", "Skip host tools (firmware packs only)"),
+    ]
+    for idx, _, label in plat_opts:
+        print(f"  [{idx}] {label}", file=sys.stderr)
+    p_ans = input("Host tool choice [1]: ").strip() or "1"
+    host_platform = next((val for idx, val, _ in plat_opts if idx == p_ans), p_ans)
+
+    print("\nSelect deployment profile assets to download:", file=sys.stderr)
+    prof_opts = [
+        ("1", "3-dual-full", "Dual-boot full assets (OpenWrt + Android Root + APKs) [default]"),
+        ("2", "1-android-ufi", "Profile 1 only (Android Root + UFI-TOOLS APKs; skips OpenWrt)"),
+        ("3", "2-dual-stock-openwrt", "Profile 2 only (Stock Android untouched + OpenWrt; skips APKs)"),
+        ("4", "none", "Host tools only (skip firmware & APK packs)"),
+    ]
+    for idx, _, label in prof_opts:
+        print(f"  [{idx}] {label}", file=sys.stderr)
+    f_ans = input("Profile asset choice [1]: ").strip() or "1"
+    profile = next((val for idx, val, _ in prof_opts if idx == f_ans), f_ans)
+
+    include_openclash = False
+    if profile in ("all", "2-dual-stock-openwrt", "3-dual-full"):
+        oc_ans = input("Include optional offline OpenClash pack (~36 MiB)? [Y/n]: ").strip().lower()
+        include_openclash = oc_ans not in ("n", "no", "0", "false")
+    return host_platform, profile, include_openclash
 
 
 def _download_file(url: str, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
-    req = urllib.request.Request(url, headers={"User-Agent": "f50pro-dualboot-kit/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp, tmp.open("wb") as out:
+    req = urllib.request.Request(url, headers={"User-Agent": "f50pro-dualboot-kit/1.1"})
+    print(f"Downloading {url} ...", file=sys.stderr)
+    with urllib.request.urlopen(req, timeout=180) as resp, tmp.open("wb") as out:
         while chunk := resp.read(1 << 20):
             out.write(chunk)
     tmp.replace(dst)
@@ -66,6 +210,10 @@ def _safe_extract_zip(archive: Path, target_dir: Path) -> list[str]:
             dest = (root / info.filename).resolve()
             dest.relative_to(root)
             zf.extract(info, root)
+            if os.name != "nt" and not info.is_dir():
+                unix_mode = (info.external_attr >> 16) & 0o777
+                if unix_mode & stat.S_IXUSR:
+                    ensure_executable(dest)
             names.append(info.filename)
     return names
 
@@ -79,6 +227,8 @@ def _safe_extract_tar(archive: Path, target_dir: Path) -> list[str]:
             dest = (root / member.name).resolve()
             dest.relative_to(root)
             tf.extract(member, root)
+            if os.name != "nt" and member.isfile() and (member.mode & 0o111):
+                ensure_executable(dest)
             names.append(member.name)
     return names
 
@@ -86,19 +236,27 @@ def _safe_extract_tar(archive: Path, target_dir: Path) -> list[str]:
 def fetch_and_extract(
     *,
     include_openclash: bool = True,
+    host_platform: str = "auto",
+    profile: str = "all",
+    explicit_packs: list[str] | None = None,
     cache_dir: Path = DEFAULT_CACHE_DIR,
     tools_dir: Path = DEFAULT_TOOLS_DIR,
-    local_release_dir: Path | None = REPO_ROOT / "dist" / "release-v1.0.0",
+    local_release_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Ensure required Release v1.0.0 tool/package packs are present, verified, and extracted."""
+    """Download/locate, SHA-256 verify, and extract selected Release packs."""
     manifest = read_json(MANIFEST_PATH)
     base_url = manifest["base_url"]
     packs = manifest["packs"]
-    selected = ["openwrt_base", "android_pkgs"]
-    if sys.platform == "win32":
-        selected.append("host_tools_win64")
-    if include_openclash:
-        selected.append("openclash_offline")
+    if local_release_dir is None:
+        local_release_dir = REPO_ROOT / "dist" / f"release-{manifest['release_tag']}"
+
+    selected = select_pack_keys(
+        manifest,
+        host_platform=host_platform,
+        profile=profile,
+        include_openclash=include_openclash,
+        explicit_packs=explicit_packs,
+    )
 
     extracted: dict[str, Any] = {}
     for key in selected:
@@ -114,7 +272,7 @@ def fetch_and_extract(
             if arc.suffix == ".zip"
             else _safe_extract_tar(arc, sub_out)
         )
-        # Verify nested Magisk APK digest if present
+        # Verify nested Magisk / UFI APK digests if present
         if key == "android_pkgs":
             for apk_name, apk_sha in meta.get("contains", {}).items():
                 if apk_sha:
@@ -122,20 +280,78 @@ def fetch_and_extract(
                     if got != apk_sha:
                         raise ValueError(f"{apk_name} SHA-256 mismatch: {got} != {apk_sha}")
         marker.write_text(meta["sha256"] + "\n", encoding="utf-8")
-        extracted[key] = {"archive": str(arc), "dir": str(sub_out), "files": len(files), "status": "extracted"}
-    return {"manifest_tag": manifest["release_tag"], "tools_dir": str(tools_dir), "packs": extracted}
+        extracted[key] = {
+            "archive": str(arc),
+            "dir": str(sub_out),
+            "files": len(files),
+            "status": "extracted",
+        }
+    return {
+        "manifest_tag": manifest["release_tag"],
+        "detected_platform": detect_host_platform(),
+        "requested_platform": host_platform,
+        "profile_filter": profile,
+        "selected_packs": selected,
+        "tools_dir": str(tools_dir),
+        "packs": extracted,
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--no-openclash", action="store_true")
+    parser.add_argument("--no-openclash", action="store_true", help="Skip optional OpenClash offline bundle")
+    parser.add_argument(
+        "--host-platform",
+        default="auto",
+        help="Host tool pack selector: auto, win64, linux-x64, linux-arm64, macos, android-arm64, all, none, or comma-separated list",
+    )
+    parser.add_argument(
+        "--profile",
+        default="all",
+        choices=sorted(PROFILE_PACK_MAP),
+        help="Filter firmware/APK bundles needed by a specific flash profile",
+    )
+    parser.add_argument(
+        "--packs",
+        nargs="+",
+        help="Explicitly specify manifest pack keys (e.g. --packs host_tools_macos openwrt_base)",
+    )
+    parser.add_argument("--list-packs", action="store_true", help="List downloadable packs with sizes, SHA-256s, and URLs")
+    parser.add_argument("--interactive", action="store_true", help="Prompt interactively for platform, profile, and OpenClash")
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
+    parser.add_argument("--local-release-dir", type=Path)
     args = parser.parse_args()
+
+    manifest = read_json(MANIFEST_PATH)
+    if args.list_packs:
+        print(
+            json.dumps(
+                {
+                    "release_tag": manifest["release_tag"],
+                    "detected_platform": detect_host_platform(),
+                    "packs": list_available_packs(manifest),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    host_plat = args.host_platform
+    prof = args.profile
+    inc_oc = not args.no_openclash
+    if args.interactive:
+        host_plat, prof, inc_oc = interactive_select(manifest)
+
     res = fetch_and_extract(
-        include_openclash=not args.no_openclash,
+        include_openclash=inc_oc,
+        host_platform=host_plat,
+        profile=prof,
+        explicit_packs=args.packs,
         cache_dir=args.cache_dir,
         tools_dir=args.tools_dir,
+        local_release_dir=args.local_release_dir,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0

@@ -8,7 +8,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from common import DEFAULT_TOOLS_DIR, REPO_ROOT, resolve_tool, write_json
+from common import DEFAULT_TOOLS_DIR, REPO_ROOT, resolve_tool, win_no_window_kwargs, write_json
 from host_network import audit_default_routes
 from provision_openwrt import connect_ssh, ssh_run
 
@@ -48,15 +48,18 @@ def _probe_openwrt(host: str, passwords: tuple[str, ...], check_openclash: bool)
     return report
 
 
-def _probe_android(adb_exe: Path | None) -> dict[str, Any]:
+def _probe_android(adb_exe: Path | None, *, serial: str | None = None) -> dict[str, Any]:
     if adb_exe is None:
         return {"reachable": False, "reason": "adb not available"}
+    base = [str(adb_exe), "-s", serial] if serial else [str(adb_exe)]
+    if serial and ":" in serial:
+        subprocess.run([str(adb_exe), "connect", serial], capture_output=True, text=True, timeout=5, **win_no_window_kwargs())
     res = subprocess.run(
-        [str(adb_exe), "get-state"],
+        [*base, "get-state"],
         capture_output=True,
         text=True,
         timeout=5,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        **win_no_window_kwargs(),
     )
     if res.returncode != 0 or res.stdout.strip() != "device":
         return {"reachable": False}
@@ -68,11 +71,11 @@ def _probe_android(adb_exe: Path | None) -> dict[str, Any]:
         ("ports", ["shell", "su", "-c", "ss -tln | grep -E ':(2333|1146) ' || true"]),
     ):
         r = subprocess.run(
-            [str(adb_exe), *args],
+            [*base, *args],
             capture_output=True,
             text=True,
             timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **win_no_window_kwargs(),
         )
         info[key] = r.stdout.strip()
     return info
@@ -84,6 +87,7 @@ def verify_environment(
     root_password: str | None = None,
     tools_dir: Path = DEFAULT_TOOLS_DIR,
     check_openclash: bool = False,
+    serial: str | None = None,
     out_path: Path | None = None,
 ) -> dict[str, Any]:
     """Audit host gateway isolation plus active OpenWrt and/or Android runtime health."""
@@ -96,7 +100,7 @@ def verify_environment(
     report = {
         "host_routes": audit_default_routes(),
         "openwrt": _probe_openwrt(openwrt_host, pws, check_openclash),
-        "android": _probe_android(adb_exe),
+        "android": _probe_android(adb_exe, serial=serial),
     }
     if out_path is not None:
         write_json(out_path, report)
@@ -108,6 +112,7 @@ def main() -> int:
     parser.add_argument("--openwrt-host", default="192.168.77.1")
     parser.add_argument("--root-password")
     parser.add_argument("--openclash", action="store_true")
+    parser.add_argument("--adb-serial")
     parser.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
@@ -118,6 +123,7 @@ def main() -> int:
         root_password=args.root_password,
         tools_dir=args.tools_dir,
         check_openclash=args.openclash,
+        serial=args.adb_serial,
         out_path=out,
     )
     print(json.dumps(rep, indent=2, ensure_ascii=False))

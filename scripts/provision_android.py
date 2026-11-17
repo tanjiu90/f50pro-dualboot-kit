@@ -17,6 +17,7 @@ from common import (
     read_json,
     resolve_tool,
     sha256_bytes,
+    win_no_window_kwargs,
     write_json,
 )
 from host_network import isolate_usb_rndis_adapter
@@ -39,7 +40,7 @@ def _adb(adb_exe: Path, args: list[str], *, serial: str | None = None, check: bo
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        **win_no_window_kwargs(),
     )
     if check and res.returncode != 0:
         raise RuntimeError(f"adb {' '.join(args)} failed rc={res.returncode}: {res.stdout}{res.stderr}")
@@ -51,15 +52,23 @@ def _su(adb_exe: Path, script: str, *, serial: str | None = None, check: bool = 
 
 
 def wait_for_adb_slot_a(adb_exe: Path, *, timeout: int = 150, serial: str | None = None) -> str:
-    """Wait for USB ADB online on slot _a with sys.boot_completed=1."""
+    """Wait for USB or TCP ADB online on slot _a with sys.boot_completed=1."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if serial and ":" in serial:
+            subprocess.run(
+                [str(adb_exe), "connect", serial],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                **win_no_window_kwargs(),
+            )
         res = subprocess.run(
             [str(adb_exe), "get-state"] if not serial else [str(adb_exe), "-s", serial, "get-state"],
             capture_output=True,
             text=True,
             timeout=5,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **win_no_window_kwargs(),
         )
         if res.returncode == 0 and res.stdout.strip() == "device":
             slot = _adb(adb_exe, ["shell", "getprop", "ro.boot.slot_suffix"], serial=serial, check=False)

@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,13 +15,20 @@ from build_images import build_profile
 from common import (
     DEFAULT_CACHE_DIR,
     DEFAULT_TOOLS_DIR,
+    MANIFEST_PATH,
     PROFILES,
     REPO_ROOT,
+    detect_host_platform,
     read_json,
     resolve_tool,
     write_json,
 )
-from fetch_assets import fetch_and_extract
+from fetch_assets import (
+    PROFILE_PACK_MAP,
+    fetch_and_extract,
+    interactive_select,
+    list_available_packs,
+)
 from flash_images import execute_flash
 from host_network import audit_default_routes
 from inspect_backup import inspect_backup_dir
@@ -34,6 +43,7 @@ def _rel(p: Path) -> Path:
 
 def run_preflight(*, tools_dir: Path = DEFAULT_TOOLS_DIR, adb_pubkey: Path | None = None) -> dict[str, Any]:
     """Verify host Python modules, extracted tools, ADB RSA pubkey, and route hygiene without touching devices."""
+    plat = detect_host_platform()
     mods = {}
     for mod in ("paramiko", "serial", "pytest"):
         try:
@@ -42,17 +52,25 @@ def run_preflight(*, tools_dir: Path = DEFAULT_TOOLS_DIR, adb_pubkey: Path | Non
         except ImportError:
             mods[mod] = False
 
-    tools = {}
+    tools: dict[str, str | None] = {}
     for t in ("spd_dump", "adb"):
         try:
-            tools[t] = str(resolve_tool(t, tools_dir))
+            tools[t] = str(resolve_tool(t, tools_dir, platform_id=plat))
         except FileNotFoundError:
             tools[t] = None
+    if plat == "android-arm64":
+        try:
+            tools["spd_dump_termux_usb"] = str(
+                resolve_tool("spd_dump", tools_dir, platform_id=plat, prefer_variant="termux-usb")
+            )
+        except FileNotFoundError:
+            tools["spd_dump_termux_usb"] = None
 
     key_path = adb_pubkey or (Path.home() / ".android" / "adbkey.pub")
-    report = {
+    report: dict[str, Any] = {
         "python": sys.version.split()[0],
         "platform": sys.platform,
+        "host_platform": plat,
         "modules": mods,
         "tools": tools,
         "adb_pubkey_present": key_path.is_file(),
@@ -60,6 +78,18 @@ def run_preflight(*, tools_dir: Path = DEFAULT_TOOLS_DIR, adb_pubkey: Path | Non
         "host_routes": audit_default_routes(),
         "profiles": list(PROFILES.keys()),
     }
+    if plat in ("linux-x64", "linux-arm64"):
+        report["linux_udev_rules_installed"] = Path("/etc/udev/rules.d/99-unisoc-f50pro.rules").is_file()
+        report["is_root"] = hasattr(os, "geteuid") and os.geteuid() == 0
+    elif plat == "macos":
+        report["is_root"] = hasattr(os, "geteuid") and os.geteuid() == 0
+    elif plat == "android-arm64":
+        report["is_root"] = hasattr(os, "geteuid") and os.geteuid() == 0
+        report["termux_env"] = {
+            "su": shutil.which("su"),
+            "termux_usb": shutil.which("termux-usb"),
+            "termux_adb": shutil.which("termux-adb"),
+        }
     return report
 
 
@@ -72,6 +102,8 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
     steps: dict[str, Any] = {}
     steps["fetch_assets"] = fetch_and_extract(
         include_openclash=args.openclash,
+        host_platform=args.host_platform,
+        profile=args.profile,
         cache_dir=args.cache_dir,
         tools_dir=args.tools_dir,
     )
@@ -84,6 +116,8 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
             tools_dir=args.tools_dir,
             webui_password=args.webui_password,
             webui_host=args.webui_host,
+            spd_mode=args.spd_mode,
+            usb_dev=args.usb_dev,
         )
 
     steps["inspect"] = inspect_backup_dir(backup_dir, out_dir / "hardware_facts.json")
@@ -107,6 +141,8 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
         webui_password=args.webui_password,
         webui_host=args.webui_host,
         execute=args.execute,
+        spd_mode=args.spd_mode,
+        usb_dev=args.usb_dev,
     )
 
     if not args.execute:
@@ -141,6 +177,7 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
             root_password=pw,
             isolate_host=not args.no_host_isolate,
             return_to_openwrt=not args.stay_android,
+            serial=args.adb_serial,
         )
 
     steps["verify"] = verify_environment(
@@ -148,6 +185,7 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
         root_password=args.root_password,
         tools_dir=args.tools_dir,
         check_openclash=args.openclash,
+        serial=args.adb_serial,
         out_path=work_dir / "final_verify_report.json",
     )
     write_json(work_dir / "auto_execution_report.json", steps)
@@ -162,8 +200,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_pre.add_argument("--adb-pubkey", type=Path)
 
-    p_fetch = sub.add_parser("fetch-assets", help="Download and SHA-256 verify Release v1.0.0 packs")
+    p_fetch = sub.add_parser("fetch-assets", help="Download and SHA-256 verify selectable Release packs")
     p_fetch.add_argument("--no-openclash", action="store_true")
+    p_fetch.add_argument("--host-platform", default="auto", help="auto|win64|linux-x64|linux-arm64|macos|android-arm64|all|none")
+    p_fetch.add_argument("--profile", default="all", choices=sorted(PROFILE_PACK_MAP))
+    p_fetch.add_argument("--packs", nargs="+", help="Explicit pack keys to fetch")
+    p_fetch.add_argument("--list-packs", action="store_true")
+    p_fetch.add_argument("--interactive", action="store_true")
     p_fetch.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     p_fetch.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_fetch.add_argument("--local-release-dir", type=Path)
@@ -174,6 +217,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_bak.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_bak.add_argument("--webui-password")
     p_bak.add_argument("--webui-host", default="http://192.168.0.1:8080")
+    p_bak.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
+    p_bak.add_argument("--usb-dev")
 
     p_ins = sub.add_parser("inspect", help="Inspect verified BROM backup and detect board_id / trustos offset")
     p_ins.add_argument("--backup-dir", type=Path, required=True)
@@ -192,6 +237,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_fl.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_fl.add_argument("--webui-password")
     p_fl.add_argument("--webui-host", default="http://192.168.0.1:8080")
+    p_fl.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
+    p_fl.add_argument("--usb-dev")
     p_fl.add_argument("--execute", action="store_true")
 
     p_ow = sub.add_parser("provision-openwrt", help="Provision OpenWrt _b after flashing")
@@ -215,11 +262,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_an.add_argument("--root-password")
     p_an.add_argument("--no-host-isolate", action="store_true")
     p_an.add_argument("--stay-android", action="store_true")
+    p_an.add_argument("--adb-serial")
 
     p_vf = sub.add_parser("verify", help="Verify host route isolation and live device services")
     p_vf.add_argument("--openwrt-host", default="192.168.77.1")
     p_vf.add_argument("--root-password")
     p_vf.add_argument("--openclash", action="store_true")
+    p_vf.add_argument("--adb-serial")
     p_vf.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_vf.add_argument("--out", type=Path)
 
@@ -227,6 +276,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_au.add_argument("--profile", required=True, choices=list(PROFILES))
     p_au.add_argument("--work-dir", type=Path, default=Path("build/device-session"))
     p_au.add_argument("--reuse-backup", action="store_true")
+    p_au.add_argument("--host-platform", default="auto")
+    p_au.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
+    p_au.add_argument("--usb-dev")
+    p_au.add_argument("--adb-serial")
     p_au.add_argument("--webui-password")
     p_au.add_argument("--webui-host", default="http://192.168.0.1:8080")
     p_au.add_argument("--openwrt-host", default="192.168.77.1")
@@ -252,17 +305,42 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "preflight":
         out = run_preflight(tools_dir=args.tools_dir, adb_pubkey=args.adb_pubkey)
     elif cmd == "fetch-assets":
-        lrd = _rel(args.local_release_dir) if args.local_release_dir else (REPO_ROOT / "dist" / "release-v1.0.0")
-        out = fetch_and_extract(
-            include_openclash=not args.no_openclash,
-            cache_dir=args.cache_dir,
-            tools_dir=args.tools_dir,
-            local_release_dir=lrd,
-        )
+        manifest = read_json(MANIFEST_PATH)
+        if args.list_packs:
+            out = {
+                "release_tag": manifest["release_tag"],
+                "detected_platform": detect_host_platform(),
+                "packs": list_available_packs(manifest),
+            }
+        else:
+            host_plat = args.host_platform
+            prof = args.profile
+            inc_oc = not args.no_openclash
+            if args.interactive:
+                host_plat, prof, inc_oc = interactive_select(manifest)
+            lrd = _rel(args.local_release_dir) if args.local_release_dir else None
+            out = fetch_and_extract(
+                include_openclash=inc_oc,
+                host_platform=host_plat,
+                profile=prof,
+                explicit_packs=args.packs,
+                cache_dir=args.cache_dir,
+                tools_dir=args.tools_dir,
+                local_release_dir=lrd,
+            )
     elif cmd == "backup":
         odir = _rel(args.output_dir)
-        out = verify_backup_dir(odir) if args.verify_only else run_brom_backup(
-            odir, tools_dir=args.tools_dir, webui_password=args.webui_password, webui_host=args.webui_host
+        out = (
+            verify_backup_dir(odir)
+            if args.verify_only
+            else run_brom_backup(
+                odir,
+                tools_dir=args.tools_dir,
+                webui_password=args.webui_password,
+                webui_host=args.webui_host,
+                spd_mode=args.spd_mode,
+                usb_dev=args.usb_dev,
+            )
         )
     elif cmd == "inspect":
         out = inspect_backup_dir(_rel(args.backup_dir), _rel(args.out) if args.out else None)
@@ -282,6 +360,8 @@ def main(argv: list[str] | None = None) -> int:
             webui_password=args.webui_password,
             webui_host=args.webui_host,
             execute=args.execute,
+            spd_mode=args.spd_mode,
+            usb_dev=args.usb_dev,
         )
     elif cmd == "provision-openwrt":
         out = provision_openwrt(
@@ -306,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
             root_password=args.root_password,
             isolate_host=not args.no_host_isolate,
             return_to_openwrt=not args.stay_android,
+            serial=args.adb_serial,
         )
     elif cmd == "verify":
         out = verify_environment(
@@ -313,6 +394,7 @@ def main(argv: list[str] | None = None) -> int:
             root_password=args.root_password,
             tools_dir=args.tools_dir,
             check_openclash=args.openclash,
+            serial=args.adb_serial,
             out_path=_rel(args.out) if args.out else None,
         )
     elif cmd == "auto":
