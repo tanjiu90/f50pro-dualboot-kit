@@ -237,6 +237,10 @@ def verify_backup_dir(backup_dir: Path, *, require_complete_table: bool = True) 
         "splloader_bak_present": spl_bak_present,
         "misc": misc_info,
         "empty_b_slots": empty_b_slots,
+        "network_downloads": [],
+        "device_read_ops": [],
+        "device_mutations": [],
+        "device_rebooted": False,
         "errors": errors,
         "warnings": warnings,
     }
@@ -359,8 +363,14 @@ def run_brom_backup(
     webui_host: str = "http://192.168.0.1:8080",
     spd_mode: str = "auto",
     usb_dev: str | None = None,
+    authorize_device_reboot: bool = False,
 ) -> dict[str, Any]:
     """Execute read-only SPRD4:AutoD dump ('r all reset') and verify every partition."""
+    if not authorize_device_reboot:
+        raise PermissionError(
+            "Live BROM backup enters SPRD4:AutoD (optional WebUI REBOOT_DEVICE) and issues 'reset'; "
+            "pass authorize_device_reboot=True / --authorize-device-reboot (or --verify-only for offline check)."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "spd_dump_backup.log"
 
@@ -433,6 +443,14 @@ def run_brom_backup(
         raise RuntimeError(f"spd_dump backup failed rc={rc} mode={launch_meta['mode']}; tail={tail[-10:]}")
     rep = verify_backup_dir(output_dir, require_complete_table=True)
     rep["spd_launch"] = launch_meta
+    rep["device_rebooted"] = True
+    rep["device_read_ops"] = ["brom_r_all"]
+    rep["device_mutations"] = [
+        *(["webui_reboot_device"] if webui_password else []),
+        "enter_sprd4_autod",
+        "spd_reset_device",
+    ]
+    rep["network_downloads"] = []
     return rep
 
 
@@ -440,6 +458,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--authorize-device-reboot", action="store_true", help="Explicitly authorize entering SPRD4:AutoD and rebooting the device for full BROM dump")
     parser.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--wait-sec", type=int, default=120)
     parser.add_argument("--webui-password", help="Stock WebUI password for automatic REBOOT_DEVICE trigger")
@@ -460,6 +479,7 @@ def main() -> int:
             webui_host=args.webui_host,
             spd_mode=args.spd_mode,
             usb_dev=args.usb_dev,
+            authorize_device_reboot=args.authorize_device_reboot,
         )
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0

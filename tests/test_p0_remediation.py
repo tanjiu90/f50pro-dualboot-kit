@@ -723,3 +723,154 @@ def test_p0_5_auth_context_verify_verdicts_and_preflight_gate(
     with patch("kit.importlib.import_module", side_effect=ImportError("no paramiko")):
         assert kit_main(["preflight", "--strict", "--operation", "provision-openwrt"]) == 1
 
+
+def test_p0_6_offline_plan_dry_run_and_probe_boundaries(
+    synthetic_env: dict[str, Path], tmp_path: Path
+) -> None:
+    """P0-6: Offline plan/auto dry-run NEVER triggers HTTP downloads, REBOOT_DEVICE, BROM spd_dump, SSH/ADB, or NIC mutation."""
+    import shutil
+
+    from brom_backup import run_brom_backup
+    from fetch_assets import fetch_and_extract
+    from kit import main as kit_main
+
+    tools = synthetic_env["tools_dir"]
+    backup_src = synthetic_env["backup_dir"]
+    adb_pub = synthetic_env["adb_pubkey"]
+
+    with (
+        patch("urllib.request.urlopen", side_effect=AssertionError("Forbidden HTTP call in offline mode")),
+        patch("brom_backup.trigger_zte_webui_reboot", side_effect=AssertionError("Forbidden WebUI reboot in offline mode")),
+        patch("brom_backup.subprocess.Popen", side_effect=AssertionError("Forbidden spd_dump Popen in offline mode")),
+        patch("flash_images.subprocess.Popen", side_effect=AssertionError("Forbidden flash Popen in offline mode")),
+        patch("provision_openwrt.connect_ssh", side_effect=AssertionError("Forbidden SSH connect in offline mode")),
+        patch("provision_android._adb", side_effect=AssertionError("Forbidden ADB call in offline mode")),
+        patch("host_network.isolate_usb_rndis_adapter", side_effect=AssertionError("Forbidden NIC mutation in offline mode")),
+    ):
+        # 1. Default auto without --execute and without backup cleanly reports BACKUP_REQUIRED without touching hardware/network
+        work_empty = tmp_path / "auto_no_backup"
+        rc_empty = kit_main([
+            "auto",
+            "--profile",
+            "3-dual-full",
+            "--work-dir",
+            str(work_empty),
+            "--tools-dir",
+            str(tools),
+            "--cache-dir",
+            str(tmp_path / "empty_cache"),
+        ])
+        assert rc_empty == 0
+        rep_empty = json.loads((work_empty / "auto_dry_run_report.json").read_text(encoding="utf-8"))
+        assert rep_empty["status"] == "BACKUP_REQUIRED"
+        assert rep_empty["mode"] == "offline_plan_dry_run"
+        assert rep_empty["network_downloads"] == []
+        assert rep_empty["device_read_ops"] == []
+        assert rep_empty["device_mutations"] == []
+        assert rep_empty["device_mutated"] is False
+        assert rep_empty["device_rebooted"] is False
+        assert rep_empty["host_network_mutated"] is False
+
+        # 2. Offline auto (no --execute) AND kit plan with local backup build complete flash_plan dry-run with zero live/network calls
+        work_ready = tmp_path / "auto_with_backup"
+        shutil.copytree(backup_src, work_ready / "backup")
+        rc_dry = kit_main([
+            "auto",
+            "--profile",
+            "3-dual-full",
+            "--work-dir",
+            str(work_ready),
+            "--tools-dir",
+            str(tools),
+            "--cache-dir",
+            str(tmp_path / "empty_cache"),
+            "--adb-pubkey",
+            str(adb_pub),
+        ])
+        assert rc_dry == 0
+        rep_dry = json.loads((work_ready / "auto_dry_run_report.json").read_text(encoding="utf-8"))
+        assert rep_dry["status"] == "DRY_RUN_READY"
+        assert rep_dry["flash"]["dry_run"] is True
+        assert rep_dry["flash"]["device_mutated"] is False
+        assert rep_dry["network_downloads"] == []
+        assert rep_dry["device_read_ops"] == []
+        assert rep_dry["device_mutations"] == []
+        assert rep_dry["device_rebooted"] is False
+        assert rep_dry["host_network_mutated"] is False
+
+        work_plan = tmp_path / "plan_cmd"
+        rc_plan = kit_main([
+            "plan",
+            "--profile",
+            "2-dual-stock-openwrt",
+            "--work-dir",
+            str(work_plan),
+            "--backup-dir",
+            str(backup_src),
+            "--tools-dir",
+            str(tools),
+        ])
+        assert rc_plan == 0
+        rep_plan = json.loads((work_plan / "auto_dry_run_report.json").read_text(encoding="utf-8"))
+        assert rep_plan["status"] == "DRY_RUN_READY"
+        assert rep_plan["device_rebooted"] is False
+
+        # 3. fetch_and_extract(..., offline_only=True) rejects missing archives before HTTP urlopen
+        with pytest.raises(FileNotFoundError, match="Offline mode forbids network download"):
+            fetch_and_extract(
+                host_platform="win64",
+                profile="1-android-ufi",
+                cache_dir=tmp_path / "no_cache",
+                tools_dir=tmp_path / "no_tools",
+                local_release_dir=tmp_path / "no_dist",
+                offline_only=True,
+            )
+
+        # 4. Live BROM backup refuses to enter AutoD / reset device unless authorize_device_reboot=True
+        with pytest.raises(PermissionError, match="authorize_device_reboot"):
+            run_brom_backup(tmp_path / "blocked_bak", tools_dir=tools)
+
+    # 5. kit.py probe executes read-only online inspection without triggering reboot, flash, or NIC mutation
+    ssh_ok = MagicMock()
+    ssh_ok.close = MagicMock()
+
+    class _FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    with (
+        patch("brom_backup.trigger_zte_webui_reboot", side_effect=AssertionError("Forbidden WebUI reboot in probe")),
+        patch("brom_backup.subprocess.Popen", side_effect=AssertionError("Forbidden spd_dump in probe")),
+        patch("host_network.isolate_usb_rndis_adapter", side_effect=AssertionError("Forbidden NIC mutation in probe")),
+        patch("verify_e2e.connect_ssh", return_value=ssh_ok),
+        patch(
+            "verify_e2e.ssh_run",
+            return_value=(
+                0,
+                "model=f50pro\nboard_id=6\nwifi_device=phy0-ap0\nopenwrt_id=OpenWrt\ncmdline=androidboot.slot_suffix=_b\nbootargs=\nbutton_long=system-switch\n/dev/root 1 1 1 50% /\n",
+                "",
+            ),
+        ),
+        patch("verify_e2e.urllib.request.urlopen", return_value=_FakeResp()),
+        patch("verify_e2e.audit_default_routes", return_value={"usb_default_route_leak": False}),
+        patch("verify_e2e._probe_android", return_value={"reachable": False, "slot_suffix": "UNKNOWN", "active_os": "UNKNOWN"}),
+        patch("kit.assert_preflight_ready", return_value={"ready": True}),
+    ):
+        probe_out_file = tmp_path / "probe_verify.json"
+        rc_probe = kit_main([
+            "probe",
+            "--profile",
+            "2-dual-stock-openwrt",
+            "--out",
+            str(probe_out_file),
+        ])
+        assert rc_probe == 0
+        probe_json = json.loads(probe_out_file.read_text(encoding="utf-8"))
+        assert probe_json["overall_status"] == "PASS"
+
+

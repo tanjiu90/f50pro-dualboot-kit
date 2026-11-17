@@ -179,7 +179,9 @@ def _locate_or_fetch_archive(
     base_url: str,
     cache_dir: Path,
     local_release_dir: Path | None,
-) -> Path:
+    *,
+    offline_only: bool = False,
+) -> tuple[Path, str | None]:
     fname = meta["filename"]
     expected = meta["sha256"]
     candidates = [cache_dir / fname]
@@ -189,7 +191,12 @@ def _locate_or_fetch_archive(
         if cand.is_file():
             if sha256_file(cand) != expected:
                 raise ValueError(f"SHA-256 mismatch on local archive {cand}")
-            return cand
+            return cand, None
+
+    if offline_only:
+        raise FileNotFoundError(
+            f"Offline mode forbids network download and archive {fname} is missing from cache/local dir"
+        )
 
     dst = cache_dir / fname
     url = f"{base_url.rstrip('/')}/{fname}"
@@ -198,7 +205,7 @@ def _locate_or_fetch_archive(
     if actual != expected:
         dst.unlink(missing_ok=True)
         raise ValueError(f"Downloaded archive {fname} SHA-256 mismatch: {actual} != {expected}")
-    return dst
+    return dst, url
 
 
 def _safe_extract_zip(archive: Path, target_dir: Path) -> list[str]:
@@ -242,6 +249,7 @@ def fetch_and_extract(
     cache_dir: Path = DEFAULT_CACHE_DIR,
     tools_dir: Path = DEFAULT_TOOLS_DIR,
     local_release_dir: Path | None = None,
+    offline_only: bool = False,
 ) -> dict[str, Any]:
     """Download/locate, SHA-256 verify, and extract selected Release packs."""
     manifest = read_json(MANIFEST_PATH)
@@ -259,9 +267,18 @@ def fetch_and_extract(
     )
 
     extracted: dict[str, Any] = {}
+    network_downloads: list[str] = []
     for key in selected:
         meta = packs[key]
-        arc = _locate_or_fetch_archive(meta, base_url, cache_dir, local_release_dir)
+        arc, downloaded_url = _locate_or_fetch_archive(
+            meta,
+            base_url,
+            cache_dir,
+            local_release_dir,
+            offline_only=offline_only,
+        )
+        if downloaded_url:
+            network_downloads.append(downloaded_url)
         sub_out = tools_dir / key.replace("_", "-")
         marker = sub_out / ".verified.sha256"
         if marker.is_file() and marker.read_text(encoding="utf-8").strip() == meta["sha256"]:
@@ -292,6 +309,8 @@ def fetch_and_extract(
         "requested_platform": host_platform,
         "profile_filter": profile,
         "selected_packs": selected,
+        "offline_only": offline_only,
+        "network_downloads": network_downloads,
         "tools_dir": str(tools_dir),
         "packs": extracted,
     }
@@ -321,6 +340,7 @@ def main() -> int:
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--local-release-dir", type=Path)
+    parser.add_argument("--offline-only", action="store_true", help="Fail instead of downloading missing packs")
     args = parser.parse_args()
 
     manifest = read_json(MANIFEST_PATH)
@@ -352,6 +372,7 @@ def main() -> int:
         cache_dir=args.cache_dir,
         tools_dir=args.tools_dir,
         local_release_dir=args.local_release_dir,
+        offline_only=args.offline_only,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0

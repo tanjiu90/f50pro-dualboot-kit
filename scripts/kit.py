@@ -145,20 +145,184 @@ def assert_preflight_ready(
     return rep
 
 
+def _has_local_build_assets(tools_dir: Path, profile_id: str) -> bool:
+    """Return True when build_profile's required asset files are already present locally."""
+    need_ow = PROFILES[profile_id]["openwrt"]
+    need_and = PROFILES[profile_id]["android_root"]
+    if need_ow:
+        ow = tools_dir / "openwrt-base"
+        for fname in (
+            "Image-6.12.94-u30pro-p1.wrapped",
+            "initramfs-f50pro-generic.cpio.lz4",
+            "openwrt-f50pro-25.12.5-base-rootfs.ext4",
+        ):
+            if not (ow / fname).is_file():
+                return False
+    if need_and and not (tools_dir / "android-pkgs" / "Magisk-canary-28103.apk").is_file():
+        return False
+    return True
+
+
+def run_offline_plan(args: argparse.Namespace) -> dict[str, Any]:
+    """Generate an inspect/build/flash dry-run plan 100% offline with zero device or network mutations."""
+    work_dir = _rel(args.work_dir)
+    backup_dir = _rel(args.backup_dir) if getattr(args, "backup_dir", None) else (work_dir / "backup")
+    out_dir = work_dir / "build"
+
+    report: dict[str, Any] = {
+        "mode": "offline_plan_dry_run",
+        "profile": args.profile,
+        "network_downloads": [],
+        "device_read_ops": [],
+        "device_mutations": [],
+        "device_mutated": False,
+        "device_rebooted": False,
+        "host_network_mutated": False,
+    }
+
+    if not (backup_dir / "partition_list.xml").is_file():
+        report["status"] = "BACKUP_REQUIRED"
+        report["backup"] = {
+            "checks_passed": False,
+            "backup_dir": str(backup_dir),
+            "reason": "No verified local BROM backup found; offline planning never triggers WebUI REBOOT_DEVICE or spd_dump.",
+        }
+        report["next_action"] = (
+            f"Run `kit.py backup --output-dir {backup_dir} --authorize-device-reboot` first, "
+            "or pass `--backup-dir <verified_backup_dir>`."
+        )
+        write_json(work_dir / "auto_dry_run_report.json", report)
+        return report
+
+    tools_dir = _rel(args.tools_dir)
+    cache_dir = _rel(args.cache_dir)
+    local_rel = _rel(args.local_release_dir) if getattr(args, "local_release_dir", None) else None
+    if _has_local_build_assets(tools_dir, args.profile) and local_rel is None:
+        report["fetch_assets"] = {
+            "status": "local_tools_present",
+            "offline_only": True,
+            "network_downloads": [],
+            "tools_dir": str(tools_dir),
+        }
+    else:
+        try:
+            report["fetch_assets"] = fetch_and_extract(
+                include_openclash=getattr(args, "openclash", False),
+                host_platform=getattr(args, "host_platform", "auto"),
+                profile=args.profile,
+                cache_dir=cache_dir,
+                tools_dir=tools_dir,
+                local_release_dir=local_rel,
+                offline_only=True,
+            )
+        except FileNotFoundError as exc:
+            report["status"] = "OFFLINE_ASSETS_REQUIRED"
+            report["fetch_assets"] = {
+                "status": "missing_offline_assets",
+                "offline_only": True,
+                "network_downloads": [],
+                "error": str(exc),
+            }
+            report["next_action"] = (
+                f"Download/extract release assets first (`kit.py fetch-assets --profile {args.profile}`) "
+                "or provide cached archives via `--local-release-dir`."
+            )
+            write_json(work_dir / "auto_dry_run_report.json", report)
+            return report
+
+    report["backup"] = verify_backup_dir(backup_dir, require_complete_table=True)
+    report["inspect"] = inspect_backup_dir(backup_dir, out_dir / "hardware_facts.json")
+    plan = build_profile(
+        backup_dir=backup_dir,
+        profile_id=args.profile,
+        out_dir=out_dir,
+        tools_dir=tools_dir,
+        adb_pubkey_path=getattr(args, "adb_pubkey", None),
+        usb_mode=getattr(args, "usb_mode", None),
+    )
+    report["build"] = {
+        "profile": plan["profile"],
+        "total_brom_write_bytes": plan["total_brom_write_bytes"],
+        "flash_plan": str(out_dir / "flash_plan.json"),
+    }
+    report["flash"] = execute_flash(
+        out_dir / "flash_plan.json",
+        tools_dir=tools_dir,
+        execute=False,
+    )
+    report["status"] = "DRY_RUN_READY"
+    report["next_action"] = "Review flash_plan.json, then run explicit --execute with authorization to write device flash."
+    write_json(work_dir / "auto_dry_run_report.json", report)
+    return report
+
+
+def run_online_probe(args: argparse.Namespace) -> dict[str, Any]:
+    """Read-only non-reboot online device/host inspection (SSH, ADB, HTTP LuCI, host route audit)."""
+    cred_p = _rel(args.credentials_file) if args.credentials_file else None
+    auth_ctx = resolve_auth_context(
+        explicit_password=args.root_password,
+        credentials_file=cred_p,
+        host=args.openwrt_host,
+    )
+    read_ops = ["host_route_audit", "openwrt_ssh_readonly", "openwrt_luci_http_get"]
+    if args.profile is None or PROFILES[args.profile]["android_root"]:
+        read_ops.append("android_adb_readonly")
+    backup_check = None
+    if args.backup_dir:
+        backup_check = verify_backup_dir(_rel(args.backup_dir), require_complete_table=True)
+        read_ops.append("local_backup_sha256_verify")
+
+    verify_rep = verify_environment(
+        openwrt_host=args.openwrt_host,
+        auth_context=auth_ctx,
+        credentials_file=cred_p,
+        profile_id=args.profile,
+        expected_active_os=args.expected_active_os,
+        tools_dir=args.tools_dir,
+        check_openclash=args.openclash,
+        serial=args.adb_serial,
+        out_path=_rel(args.out) if args.out else None,
+    )
+    return {
+        "mode": "online_readonly_probe",
+        "network_downloads": [],
+        "device_read_ops": read_ops,
+        "device_mutations": [],
+        "device_mutated": False,
+        "device_rebooted": False,
+        "host_network_mutated": False,
+        "backup_verify": backup_check,
+        "verify": verify_rep,
+    }
+
+
 def run_auto(args: argparse.Namespace) -> dict[str, Any]:
-    """Execute end-to-end flow: fetch -> BROM backup -> inspect -> build -> (dry-run or flash) -> provision -> verify."""
+    """Execute offline dry-run plan by default, or authorized live end-to-end provisioning when --execute is set."""
+    if not args.execute:
+        return run_offline_plan(args)
+
     work_dir = _rel(args.work_dir)
     backup_dir = work_dir / "backup"
     out_dir = work_dir / "build"
 
-    steps: dict[str, Any] = {}
-    steps["fetch_assets"] = fetch_and_extract(
+    fetch_res = fetch_and_extract(
         include_openclash=args.openclash,
         host_platform=args.host_platform,
         profile=args.profile,
         cache_dir=args.cache_dir,
         tools_dir=args.tools_dir,
+        local_release_dir=_rel(args.local_release_dir) if getattr(args, "local_release_dir", None) else None,
     )
+    steps: dict[str, Any] = {
+        "mode": "live_execute",
+        "fetch_assets": fetch_res,
+        "network_downloads": list(fetch_res.get("network_downloads", [])),
+        "device_read_ops": [],
+        "device_mutations": [],
+        "device_mutated": False,
+        "device_rebooted": False,
+        "host_network_mutated": False,
+    }
 
     if args.reuse_backup and (backup_dir / "verification_report.json").is_file():
         steps["backup"] = verify_backup_dir(backup_dir, require_complete_table=True)
@@ -170,7 +334,11 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
             webui_host=args.webui_host,
             spd_mode=args.spd_mode,
             usb_dev=args.usb_dev,
+            authorize_device_reboot=getattr(args, "authorize_device_reboot", False),
         )
+        steps["device_read_ops"].append("brom_r_all")
+        steps["device_rebooted"] = True
+        steps["device_mutations"].extend(steps["backup"].get("device_mutations", []))
 
     steps["inspect"] = inspect_backup_dir(backup_dir, out_dir / "hardware_facts.json")
     plan = build_profile(
@@ -192,15 +360,13 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
         tools_dir=args.tools_dir,
         webui_password=args.webui_password,
         webui_host=args.webui_host,
-        execute=args.execute,
+        execute=True,
         spd_mode=args.spd_mode,
         usb_dev=args.usb_dev,
     )
-
-    if not args.execute:
-        steps["next_action"] = "Review flash_plan.json, then re-run with --execute to write device flash and provision OS."
-        write_json(work_dir / "auto_dry_run_report.json", steps)
-        return steps
+    steps["device_mutated"] = bool(steps["flash"].get("device_mutated", True))
+    steps["device_rebooted"] = True
+    steps["device_mutations"].append("brom_flash_and_reset")
 
     profile = PROFILES[args.profile]
     cred_file = out_dir / "openwrt-credentials.json"
@@ -221,6 +387,9 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
             usb_net_persist=getattr(args, "usb_net_persist", False),
             target_iface=getattr(args, "target_iface", None),
         )
+        steps["device_mutations"].append("provision_openwrt_ssh")
+        if not args.no_host_isolate:
+            steps["host_network_mutated"] = True
     auth_ctx: AuthContext = resolve_auth_context(
         explicit_password=args.root_password,
         credentials_file=cred_file,
@@ -239,6 +408,9 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
             return_to_openwrt=not args.stay_android,
             serial=args.adb_serial,
         )
+        steps["device_mutations"].append("provision_android_adb")
+        if not args.no_host_isolate:
+            steps["host_network_mutated"] = True
 
     expected_os = "auto"
     if profile["openwrt"] and (not profile["android_root"] or not args.stay_android):
@@ -246,6 +418,7 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
     elif profile["android_root"]:
         expected_os = "android"
 
+    steps["device_read_ops"].append("verify_e2e_readonly")
     steps["verify"] = verify_environment(
         openwrt_host=args.openwrt_host,
         auth_context=auth_ctx,
@@ -286,11 +459,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_bak = sub.add_parser("backup", help="Perform read-only full BROM dump and verify SHA-256 + XML")
     p_bak.add_argument("--output-dir", type=Path, required=True)
     p_bak.add_argument("--verify-only", action="store_true")
+    p_bak.add_argument("--authorize-device-reboot", action="store_true", help="Explicitly authorize entering SPRD4:AutoD and rebooting the target device")
     p_bak.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_bak.add_argument("--webui-password")
     p_bak.add_argument("--webui-host", default="http://192.168.0.1:8080")
     p_bak.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     p_bak.add_argument("--usb-dev")
+
+    p_pl = sub.add_parser("plan", help="Offline build and dry-run plan (zero device/network mutations)")
+    p_pl.add_argument("--profile", required=True, choices=list(PROFILES))
+    p_pl.add_argument("--work-dir", type=Path, default=Path("build/device-session"))
+    p_pl.add_argument("--backup-dir", type=Path)
+    p_pl.add_argument("--host-platform", default="auto")
+    p_pl.add_argument("--openclash", action="store_true")
+    p_pl.add_argument("--adb-pubkey", type=Path)
+    p_pl.add_argument("--usb-mode")
+    p_pl.add_argument("--local-release-dir", type=Path)
+    p_pl.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
+    p_pl.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+
+    p_pr = sub.add_parser("probe", help="Read-only non-reboot live probe of OpenWrt/Android and host routes")
+    p_pr.add_argument("--openwrt-host", default="192.168.77.1")
+    p_pr.add_argument("--root-password")
+    p_pr.add_argument("--credentials-file", type=Path)
+    p_pr.add_argument("--profile", choices=list(PROFILES))
+    p_pr.add_argument("--expected-active-os", default="auto", choices=["auto", "openwrt", "android"])
+    p_pr.add_argument("--openclash", action="store_true")
+    p_pr.add_argument("--adb-serial")
+    p_pr.add_argument("--backup-dir", type=Path)
+    p_pr.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
+    p_pr.add_argument("--out", type=Path)
 
     p_ins = sub.add_parser("inspect", help="Inspect verified BROM backup and detect board_id / trustos offset")
     p_ins.add_argument("--backup-dir", type=Path, required=True)
@@ -374,6 +572,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_au.add_argument("--usb-net-mode", default="auto", choices=["auto", *sorted(VALID_USB_NET_MODES)])
     p_au.add_argument("--usb-net-persist", action="store_true")
     p_au.add_argument("--target-iface")
+    p_au.add_argument("--authorize-device-reboot", action="store_true")
+    p_au.add_argument("--local-release-dir", type=Path)
     p_au.add_argument("--execute", action="store_true")
     p_au.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_au.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
@@ -431,7 +631,15 @@ def main(argv: list[str] | None = None) -> int:
                 webui_host=args.webui_host,
                 spd_mode=args.spd_mode,
                 usb_dev=args.usb_dev,
+                authorize_device_reboot=args.authorize_device_reboot,
             )
+    elif cmd == "plan":
+        out = run_offline_plan(args)
+    elif cmd == "probe":
+        assert_preflight_ready(operation="probe", tools_dir=args.tools_dir, profile=args.profile)
+        out = run_online_probe(args)
+        if out.get("verify", {}).get("overall_status") != "PASS":
+            exit_code = 1
     elif cmd == "inspect":
         out = inspect_backup_dir(_rel(args.backup_dir), _rel(args.out) if args.out else None)
     elif cmd == "build":
