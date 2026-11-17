@@ -1,4 +1,8 @@
-"""Guarded SPRD4:AutoD flasher executing ONLY a SHA-256 verified flash_plan.json."""
+"""Guarded SPRD4:AutoD (U-Boot autodloader) flasher executing ONLY a SHA-256 verified flash_plan.json.
+
+SPRD4:AutoD operates through functional SPL + U-Boot. All partition writes—especially uboot_b
+and BSP sync targets—must pass full SHA-256 readback before misc+2048 slot switching.
+"""
 from __future__ import annotations
 
 import argparse

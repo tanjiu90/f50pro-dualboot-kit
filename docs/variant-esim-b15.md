@@ -8,7 +8,11 @@
 | 出厂系统 | Android 15 (`SDK 35`, `vendor_boot` hardware `ums9632_1h10_mbb`) |
 | Board ID (`/proc/driver/board_id`) | `1` |
 | SIM 拓扑 | **纯内置双 eSIM**（出厂多为移动 + 电信内置 eSIM，`is_support_psim=0`，无物理插卡座） |
-| `trustos_a` AVB 校验指令典型偏移 | `0x981ec`（由 `inspect_backup.py` 经 64B 指纹动态定位） |
+| `trustos_a` AVB 校验指令典型偏移 | `0x981ec`（由 `inspect_backup.py` 经 ARM64 `ADRP+ADD` 与函数尾扫描动态定位） |
+
+> **B15 实机验证边界与已发现限制（`PARTIAL`）**：
+> - 上游工程已在一台 `B15`（`board_id=1`）实机上实际安装过双系统并完成：全分区读回校验写入 `_b`、Android `_a` (`Magisk 28103` + `UFI-TOOLS v4.0.0` `:2333`/`ttyd :1146` + `charging,adb`)、以及 `_b <-> _a <-> _b` 双向切槽与物理 5 秒按键守护验证（`final-roundtrip-verify.json`）；
+> - 但请注意：**在 `B15` OpenWrt 终检快照中，`wan.up=0`、`ip4/ip6=null`、`net_red=1`、`imeis=[null, null]`**——该台机器在 OpenWrt 下两张内置 eSIM 虽报告 `ready`，但 **5G eSIM 数据拨号在审计当时并未上线，尚未获得 OpenWrt eSIM 实网连通实证**，且当时底包 `aic8800` / modem XML 复用自 `B28` 提取物；同时本仓库新重构的 `kit.py` CLI 尚未实机运行。
 
 ## 2. 常见硬件特性与灯效判定（重要排查参考）
 

@@ -1,4 +1,8 @@
-"""Read-only Spreadtrum/Unisoc SPRD4:AutoD BROM full partition dumper and verifier."""
+"""Read-only Spreadtrum/Unisoc SPRD4:AutoD (U-Boot autodloader) partition dumper and verifier.
+
+Note: SPRD4:AutoD requires functional on-device SPL + U-Boot. Bare-metal SPRD3 BootROM
+recovery when U-Boot fails to load requires external signed UMS9632 FDL1/FDL2 not bundled here.
+"""
 from __future__ import annotations
 
 import argparse
@@ -205,6 +209,13 @@ def verify_backup_dir(backup_dir: Path, *, require_complete_table: bool = True) 
         elif require_complete_table:
             errors.append("Missing dumped splloader (eMMC boot0)")
 
+    spl_bak_path = backup_dir / "splloader_bak"
+    spl_bak_present = spl_bak_path.is_file() and spl_bak_path.stat().st_size > 0
+    if not spl_bak_present:
+        warnings.append(
+            "splloader_bak (eMMC boot1) not captured by 'r all'; bare-metal SPRD3 recovery is NOT bundled (requires external signed UMS9632 FDL1/FDL2)"
+        )
+
     misc_info = None
     misc_path = backup_dir / "misc"
     if misc_path.is_file():
@@ -216,6 +227,9 @@ def verify_backup_dir(backup_dir: Path, *, require_complete_table: bool = True) 
         "backup_dir": str(backup_dir),
         "checked_files": checked_files,
         "checked_bytes": checked_bytes,
+        "recovery_channel": "SPRD4:AutoD (U-Boot autodloader; requires functional SPL + U-Boot)",
+        "bare_metal_sprd3_ready": False,
+        "splloader_bak_present": spl_bak_present,
         "misc": misc_info,
         "empty_b_slots": empty_b_slots,
         "errors": errors,

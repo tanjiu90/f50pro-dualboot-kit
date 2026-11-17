@@ -11,3 +11,11 @@ This repository provides original orchestration scripts, offline patch builders,
 7. **`spd_dump` (`spd_dump_251` / `spreadtrum_flash`)** — GPL-2.0 (`https://github.com/ilyakurdyukov/spreadtrum_flash`).
 8. **Android SDK Platform Tools (`adb`, `fastboot`, `sqlite3`, `mke2fs`)** — Apache-2.0 / Android SDK License (`https://developer.android.com/tools/releases/platform-tools`).
 9. **GeoSite / Country MMDB** — upstream GeoIP/GeoSite data bundles (clean database files only, zero proxy nodes or subscriptions).
+
+## Release v1.0.0 Binary Bundle Disclosure & Sanitization Notes
+
+- **Git source tree (`54` tracked files on `main`)**: Contains only pure-Python orchestration scripts, OpenWrt `ucode`/JS/shell patches, clean OpenClash `proxies: []` templates, documentation, and tests. Contains zero OEM partition dumps, zero IMEIs/SNs/ICCIDs, zero NV calibration files, zero personal passwords/keys, and zero device backups.
+- **GitHub Release `v1.0.0` binary bundles (external assets referenced by SHA-256)**:
+  - `f50pro-base-openwrt-25.12.5-pack.tar.xz` (`openwrt-f50pro-25.12.5-base-rootfs.ext4`) includes `opt/mu300/vendor/u30pro/firmware/aic8800/*` Wi-Fi chipset firmware blobs and `modem_*.xml` hardware descriptors derived from reference `B28` `odm_a`/`vendor_a` images (no NV calibration, IMEIs, host SSH keys, or personal accounts).
+  - `f50pro-android-pkgs-pack.zip` includes prebuilt `UFI-TOOLS.apk` from upstream `zte-f50pro-macos-toolkit` alongside official `Magisk-canary-28103.apk`.
+  - A future `v1.0.1` clean-room enhancement can extract `aic8800`/modem blobs locally at runtime from each user's own BROM `super` backup if redistributable base rootfs builds must strip all OEM firmware binaries.

@@ -39,6 +39,7 @@ if (-not (Test-Path $AdbPub)) {
 }
 
 if ($InstallWinUsbHint) {
-    Write-Host "If Unisoc BROM (1782:4D00) lacks a WinUSB driver, run Zadig or build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe."
+    Write-Host "If Unisoc autodloader/BROM (1782:4D00) lacks a WinUSB driver, run Zadig or:"
+    Write-Host "  .\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force .\build\runtime-tools\host-tools-win64\qmk_driver_installer\unisoc_drivers.txt"
 }
 Write-Host "Bootstrap completed. Next: .\.venv\Scripts\python.exe scripts\kit.py preflight"

@@ -17,6 +17,21 @@ Designed for **one-click Windows deployment** and **autonomous AI Agent flashing
 
 ---
 
+## Verification & Release Readiness Status (Honest Scope)
+
+| Scope | Status | Evidence / Limits |
+| :--- | :---: | :--- |
+| **Offline Python builder, safety guards & clean-room HTTPS `bootstrap.ps1`** | `VERIFIED` | Tested in fresh clean-room Windows `.venv` clone (`31+` `pytest` cases) and read-only binary parity verified against `B15` stock backup (`trustos_noavb`, `boot_b`, `vendor_boot_b`). |
+| **`B28` (`board_id=6`, Physical SIM) dual-boot architecture** | `VERIFIED` *(upstream)* / `UNVERIFIED` *(this CLI)* | Upstream predecessor project verified full `_a` + `_b` + `5G NR SA` + Wi-Fi 6 + OpenClash + physical `5s` button roundtrip on hardware. Refactored `kit.py` CLI has **not** yet been run end-to-end on physical hardware. |
+| **`B15` (`board_id=1`, Built-in Dual eSIM) dual-boot architecture** | `PARTIAL` *(upstream)* / `UNVERIFIED` *(this CLI)* | Upstream predecessor project flashed `_b` + Android `_a` Magisk + `UFI-TOOLS` + bidirectional roundtrip on `B15` (`final-roundtrip-verify.json`); however, OpenWrt cellular WAN remained disconnected during that snapshot (`wan.up=0`, `net_red=1`) and used a `B28`-built stage3 rootfs. |
+| **Profile `1-android-ufi` & `2-dual-stock-openwrt` isolated runs** | `UNVERIFIED` *(live)* | Plan builders, safety guardrails, and offline output verified via synthetic fixtures; not yet separately flashed end-to-end via `kit.py`. |
+| **`SPRD4:AutoD` backup & partition write/readback** | `VERIFIED` *(upstream)* | Requires healthy on-device **`SPL + U-Boot` (`autodloader`)**. Does **not** capture `splloader_bak` (`eMMC boot1`). |
+| **Bare-metal `SPRD3` BootROM unbrick when `SPL` / `U-Boot` fails** | `BLOCKED` / `NOT INCLUDED` | If active `uboot` or `splloader` fails verification (`SPL 0x4e` halt without auto-fallback), `SPRD4:AutoD` disappears; this kit bundles **no** signed `UMS9632` `FDL1`/`FDL2` (`0x65008000`/`0xbdfffe00`) and **no** factory `.pac`. |
+
+See the full [Release Quality Audit Report](docs/RELEASE_QUALITY_AUDIT_v1.0.0.md).
+
+---
+
 ## Three Flash Profiles
 
 | Profile ID | Android Slot `_a` | OpenWrt Slot `_b` (`25.12.5`) | Switching & Highlights |
@@ -86,8 +101,8 @@ Run preflight + bootstrap + full BROM backup + inspect first, then build Profile
 1. **Zero WSL Dependency**: Both Magisk `init_boot_a` packing (`CRC32` XZ + LZ4 legacy + AVB footer relocation) and own-device `trustos` derivation run in pure Python on Windows.
 2. **Per-Device Cryptographic Derivation**: Never flashes foreign bootloader binaries or generic `trustos` dumps; `trustos_noavb.img` is derived dynamically from the target device's own `sml_a` + `trustos_a` backup, and `vendor_boot_b` keeps the target device's exact stock DTB SHA-256.
 3. **Immutable Factory Calibration Guards**: `FORBIDDEN_PARTITIONS` blocks writes to `splloader`, `prodnv`, `calinv`, `ztecfg`, `ztepersist`, `persist`, `miscdata`, `super`, `userdata`, and modem NV/calibration partitions.
-4. **Windows Host Cellular Hijack Prevention**: `host_network.py` binds Microsoft's inbox `netrndis.inf` driver, assigns static `192.168.77.12/24`, strips default gateways/DNS/IPv6 from the USB RNDIS interface, and audits the Windows routing table so your host PC stays connected via its primary internet adapter.
-5. **Clean OpenClash Pack**: Optional offline bundle provides only signed OpenWrt IPKs/APKs, `mihomo` binary, GeoIP databases, and a neutral fake-ip [template.yaml](assets/openwrt-patch/openclash-clean/template.yaml) with **zero personal subscriptions or proxy nodes**.
+4. **Windows Host Cellular Hijack Prevention**: `host_network.py` isolates both `UsbNcm` (initial boot default of base ext4 rootfs) and `RNDIS` (`1D6B:0104`) interfaces to static `192.168.77.12/24`, strips default gateways/DNS/IPv6, and audits the Windows routing table so your host PC stays connected via its primary internet adapter.
+5. **Clean Configs & Prebuilt Binary Scope**: Optional OpenClash pack contains only signed `.apk`s, `mihomo`, GeoIP databases, and a neutral `proxies: []` [template.yaml](assets/openwrt-patch/openclash-clean/template.yaml) with **zero personal subscriptions or proxy nodes**. Release `v1.0.0` `openwrt-base` rootfs bundles prebuilt `aic8800` Wi-Fi firmware / modem XMLs from reference `B28` extracts and `android-pkgs` bundles upstream `UFI-TOOLS.apk` (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)); Git commits contain zero binary images, IMEIs, NV data, passwords, or device backups.
 
 ---
 

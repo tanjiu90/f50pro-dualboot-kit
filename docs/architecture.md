@@ -9,7 +9,7 @@ ZTE F50 Pro (`MU3356`) 采用 Unisoc `UMS9632` 芯片与标准 Android 15 动态
   - 将原厂 12 组 BSP 分区（`uboot`, `sml`, `teecfg`, `dtbo`, `vbmeta*`, `logo*`, `fbootlogo*`）同步到 `_b`，保证与目标设备硬件指纹 100% 一致；
   - `trustos_b` 使用本机衍生无 AVB 拦截镜像；
   - `boot_b` 封装 OpenWrt 通用 Linux 6.12.94 内核镜像与统一 initramfs（Boot v4 + 保留 AVB 页脚）；
-  - `vendor_boot_b` 严密校验并复用本机 `vendor_boot_a` 的 DTB SHA-256，附加 `mu3356` SIM mux 与无电池外部供电参数到 `bootconfig`；
+  - `vendor_boot_b` 严密校验并复用本机 `vendor_boot_a` 的 DTB SHA-256，附加 `mu3356` SIM mux 与无电池外部供电参数到内核 `cmdline`（保留原 `bootconfig` 与 `vendor_ramdisk_table` 元信息）；
   - `init_boot_b` 使用合规最小空 ramdisk 重新打包并保留原尺寸及 AVB 结构（以 `w_force` 配合写入后 GPT 完整性核验写入）；
   - `fulldumpdb`（`2 GiB` / `2,147,483,648` B）：承载 OpenWrt ext4 根文件系统。
 
@@ -19,10 +19,10 @@ ZTE F50 Pro (`MU3356`) 采用 Unisoc `UMS9632` 芯片与标准 Android 15 动态
 
 F50 Pro 出厂 `sml_a` 与 `trustos_a` 均包裹 Unisoc `DHTB` 头（`0x200` 字节）与 `SIMGHDR\x00` 签名尾：
 - 工具包**绝不分发也不刷入任何来自他机的 `trustos` 文件**；
-- `inspect_backup.py` 使用 64 字节唯一上下文指纹 (`TRUSTOS_AVB_SIG_ORIG`) 在目标设备自身 `trustos_a` 代码载荷中准确定位 4 字节 TEE AVB 判决指令 (`e0031a2a` -> `00008052`)：
-  - `board_id=1`（内置双 eSIM 版）典型偏移：`0x981ec`
-  - `board_id=6`（插卡版）典型偏移：`0x9856c`
-- `build_images.py` 将修改后的本机载荷套入本机 `sml_a` 的合法 `DHTB` + `SIMGHDR` 外壳结构，按增量同步更新 `0x30` payload size 及 `SIMGHDR` 内 `0x18`/`0x28` 偏移值，最后补齐至目标分区精确字节数。
+- `inspect_backup.py` 主用 Pure-Python 移植的 ARM64 `dis_avb` AST 扫描器（定位 `### enter avb_slot_verify. ###` 字符串 `ADRP+ADD` 交叉引用与 5 条 `ldp` 收尾序列，兼容不同编译版本的 `e0031a2a` 寄存器变体），辅以 `TRUSTOS_AVB_SIG_ORIG` 64 字节上下文精确匹配作为次级回退：
+  - `board_id=1`（内置双 eSIM 版 `B15`）已实测动态定位至 `0x981ec`；
+  - `board_id=6`（插卡版 `B28`）已实测动态定位至 `0x9856c`。
+- `build_images.py` 将修改后的本机载荷套入先按 `dhtb_data_size()` 精确剥离尾零的原机 `sml_a` `DHTB` + `SIMGHDR` 外壳结构，按增量同步更新 `0x30` payload size 及 `SIMGHDR` 内 64 位 `0x18`/`0x28` 偏移值，再严格补齐至 `trustos_b` 目标分区字节数（与实机 `B15` 派生产物 `6,291,456` B 位级完全一致）。
 
 ## 3. 纯 Python 无 WSL `init_boot_a` 打包流水线
 

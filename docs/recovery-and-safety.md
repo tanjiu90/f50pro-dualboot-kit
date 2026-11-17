@@ -1,13 +1,23 @@
-# 故障排查、BROM 恢复与宿主网络安全说明
+# 故障排查、下载协议边界 (`SPRD4:AutoD` vs `SPRD3`) 与宿主网络安全说明
 
-## 1. Windows 驱动准备：Unisoc `SPRD4:AutoD` (`1782:4D00`)
+## 1. 下载模式真相：`SPRD4:AutoD`（依赖正常 SPL/U-Boot）vs 裸机 `SPRD3` BootROM
 
-本设备使用 Unisoc `SPRD4:AutoD` 免外部 FDL 直连下载模式，无需旧版第三方 FDL1/FDL2。
+> **重要工程安全披露（请勿混淆）**：本仓库默认调用的 `spd_dump --kickto 2` 运行在 **`SPRD4:AutoD`**（U-Boot `autodloader`）模式，**并非芯片底层不可变 Mask `SPRD3` BootROM**：
 
-- 当执行 `kit.py backup` 或 `kit.py flash` 时，工具可传入 `--webui-password` 自动通过本地 ZTE WebUI 接口向设备发送安全重启命令；当屏幕上出现 `Waiting for boot_diag` 时，带 `--kickto 2` 参数的 `spd_dump.exe` 会自动拦截重启链路上的 BROM 握手口并进入高速只读/写入通道。
-- **如果全新电脑首次连接出现未知 USB 设备（`VID_1782&PID_4D00` 缺少驱动）**：
-  1. 以管理员运行随工具链释放的 `build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe`（或 Zadig），将设备接口绑定为 **`WinUSB`**；
-  2. 随后重新执行 `kit.py backup` 或 `kit.py flash` 即可识别并保持连接。
+| 对比项 | `SPRD4:AutoD`（本工具链当前通路） | `SPRD3` 裸机 BootROM（真死砖救砖必须通路） |
+| :--- | :--- | :--- |
+| **设备端运行前提** | 闪存上现有的 **`splloader` + `uboot_<slot>` 必须完好并能初始化 USB `boot_diag`** | 即使 `SPL`/`U-Boot` 彻底损坏仍可在硬件层枚举 `1782:4D00` |
+| **`spd_dump` 行为** | 握手回报 `BSL_REP_VER: "SPRD4:AutoD"` 后自动跳过外部 `fdl1`/`fdl2` 上传 | 必须先上传与 **Unisoc `UMS9632`（`0x65008000` / `0xbdfffe00`）** 完全匹配且通过 BootROM 验签的 `FDL1` + `FDL2` |
+| **当 `U-Boot` 或 `SPL` 损坏时** | **`AutoD` 不可用**；`SPL` 反汇编证实其**无 `uboot` 自动切槽回退逻辑**（一旦活动槽 `uboot` 验签失败，报错 `0x4e` 并进入死循环） | 唯一理论救砖出口（需冷上电短窗或硬件触点触发 `SPRD3` + 外部已签名 `UMS9632` `FDL1/FDL2`） |
+| **本仓库支持现状** | **`VERIFIED`（上游 8/8 次实机成功连机路径）**；注意 `r all` 不主动备份 `eMMC boot1` (`splloader_bak`) | **`BLOCKED / NOT INCLUDED`（上游 0/18 次成功实证；本仓库不含官方 `.pac` 或 `UMS9632` 签名 `FDL1/FDL2`）** |
+
+### Windows WinUSB 驱动安装要点
+- 当 `spd_dump` 提示 `Waiting for boot_diag` 或缺少 `1782:4D00` / `1782:4D03` 驱动时，以管理员运行：
+  ```powershell
+  .\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force `
+    .\build\runtime-tools\host-tools-win64\qmk_driver_installer\unisoc_drivers.txt
+  ```
+- **注意**：`v1.0.0` 包内自带的 `install_connected_drivers.bat` 默认读取键盘设备表 `drivers.txt`（不含 `1782:4D00`），请勿直接双击该 `.bat`，必须显式指定 `unisoc_drivers.txt`（或使用 Zadig）。
 
 ---
 
@@ -28,9 +38,13 @@
 
 ---
 
-## 3. 紧急恢复方案（Rollback to Factory）
+## 3. 可用恢复路径与明确限制（Rollback Boundaries）
 
-因第一步备份保存了完整原始镜像（含原厂 `boot_a`, `init_boot_a`, `trustos_a`, `misc` 与全部 BSP 分区），任意时刻都可无损恢复：
+**前提边界**：以下恢复命令**仅在设备仍可进入 `SPRD4:AutoD`（即活动槽位 `splloader` 与 `uboot` 尚能启动，或尚能进入 OpenWrt/Android）时成立**。若因外部误写破坏了 `splloader` 或活动槽 `uboot` 导致 `U-Boot` 无法加载，则无法仅凭本工具包内 `spd_dump --kickto 2` 完成裸机 `SPRD3` 救砖（必须另备外部 `UMS9632` 签名 `FDL1`/`FDL2` 或官方 `.pac`）。
+
+正因如此，本工具包强制执行：
+- `FORBIDDEN_PARTITIONS` 永久封锁 `splloader`、`prodnv`、`calinv`、NV/校准分区、`super`、`userdata`；
+- 刷写槽位 `_b` 同步 `uboot_b <- uboot_a` 时，强制在切换 `misc+2048` 活动槽位**之前**完成全量 SHA-256 读回核验。
 
 ### 场景 A：卡在槽位 `_b`，想切回槽位 `_a`
 - 方法 1：OpenWrt 正常运行时长按机身实体键 5 秒，或 SSH 执行 `/opt/mu300/bin/mu300-next-boot android && reboot`。

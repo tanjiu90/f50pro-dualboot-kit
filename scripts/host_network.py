@@ -154,12 +154,12 @@ def bind_inbox_rndis_driver(*, install: bool = True) -> dict[str, Any]:
 
 
 def isolate_usb_rndis_adapter(static_ip: str = "192.168.77.12") -> dict[str, Any]:
-    """Configure Windows USB RNDIS adapter(s) as static LAN-only without default gateway or DNS."""
+    """Configure Windows USB RNDIS/NCM adapter(s) as static LAN-only without default gateway or DNS."""
     if sys.platform != "win32":
         return {"skipped": "non-windows"}
     ps_script = f"""
 $ErrorActionPreference = 'Stop'
-$ads = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{ $_.InterfaceDescription -match 'RNDIS' -and $_.Status -eq 'Up' }}
+$ads = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{ ($_.InterfaceDescription -match 'RNDIS|UsbNcm|USB Ethernet' -or $_.PnpDeviceID -match 'VID_1D6B&PID_0104') -and $_.Status -eq 'Up' }}
 $updated = @()
 foreach ($ad in $ads) {{
     $reg = "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$($ad.InterfaceGuid)"
@@ -196,18 +196,21 @@ $routes = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyConti
 
 
 def audit_default_routes() -> dict[str, Any]:
-    """Read-only verification that 0.0.0.0/0 and ::/0 do not route via USB RNDIS adapters."""
+    """Read-only verification that 0.0.0.0/0 and ::/0 do not route via USB RNDIS/NCM adapters."""
     if sys.platform != "win32":
         return {"skipped": "non-windows"}
     raw = _ps(
         "$r4 = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric);"
         "$r6 = @(Get-NetRoute -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric);"
-        "$usb = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -match 'RNDIS' } | Select-Object ifIndex,Name,InterfaceDescription,Status);"
+        "$usb = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -match 'RNDIS|UsbNcm|USB Ethernet' -or $_.PnpDeviceID -match 'VID_1D6B&PID_0104' } | Select-Object ifIndex,Name,InterfaceDescription,Status);"
         "@{ ipv4_default = $r4; ipv6_default = $r6; rndis_adapters = $usb } | ConvertTo-Json -Depth 4 -Compress"
     )
     info = json.loads(raw)
     usb_indices = {a["ifIndex"] for a in info.get("rndis_adapters", [])}
-    leaks = [r for r in info.get("ipv4_default", []) + info.get("ipv6_default", []) if r["ifIndex"] in usb_indices]
+    leaks = [
+        r for r in info.get("ipv4_default", []) + info.get("ipv6_default", [])
+        if r.get("ifIndex") in usb_indices or str(r.get("NextHop", "")).startswith(("192.168.77.", "192.168.0."))
+    ]
     info["usb_default_route_leak"] = bool(leaks)
     info["leaks"] = leaks
     return info

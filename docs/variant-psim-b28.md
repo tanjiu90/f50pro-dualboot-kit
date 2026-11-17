@@ -8,7 +8,7 @@
 | 出厂系统 | Android 15 (`SDK 35`, `vendor_boot` hardware `ums9632_1h10_mbb`) |
 | Board ID (`/proc/driver/board_id`) | `6` |
 | SIM 拓扑 | **外置 Nano-SIM 卡槽 + 内置 eSIM 芯片 (`sim_slots=2`, mux 切换)** |
-| `trustos_a` AVB 校验指令典型偏移 | `0x9856c`（仍由 `inspect_backup.py` 经 64B 指纹动态定位，不写死） |
+| `trustos_a` AVB 校验指令典型偏移 | `0x9856c`（由 `inspect_backup.py` 经 ARM64 `ADRP+ADD` 与函数尾扫描动态定位，不写死） |
 
 ## 2. SIM 多路复用（`f50pro-card.sh` 补丁）
 
@@ -19,7 +19,9 @@
   - `6:2` -> `0 psim_select 1`（外置物理 Nano-SIM 主卡通道）
   - `6:3` -> `0 psim_select 0`（外置物理 Nano-SIM 备选路由）
   - `6:4` -> `1 chip_select 0`（内置 eSIM 通道 2）
-- 内核驱动参数通过 `vendor_boot_b` 的 `bootconfig` 注入：`u30pro_sim_mux.layout=mu3356`（由 `build_images.py` 自动保留本机 DTB 后附加）。
+- 内核驱动参数通过 `vendor_boot_b` 的内核 `cmdline` 注入：`u30pro_sim_mux.layout=mu3356`（由 `build_images.py` 严格验证本机 DTB SHA-256 后附加）。
+
+> **实机验证口径说明**：上游工程已基于实机 `B28` 完整验证过 OpenWrt `_b`（含外置 Nano-SIM `CT 46011` 5G NR SA 上网）、Android `_a` (`Magisk 28103` + `UFI-TOOLS`) 及物理 5 秒双向切换（`VERIFIED`）；本独立仓库封装后的 `kit.py` CLI 目前已通过离线单测与安全校验，尚未在实机重跑一轮在线刷写（`UNVERIFIED` live CLI）。
 
 `provision_openwrt.py` 会自动核对 `/opt/mu300/lib/f50pro-card.sh` 的 SHA-256（已合入或待打补丁），并验证合入后哈希 `d283d5a7388d05cae7f2645e6bf9a9f5a7ddee5d09c12a5e69d6f5c56663af47`。
 

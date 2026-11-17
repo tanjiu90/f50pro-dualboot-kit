@@ -10,8 +10,9 @@ This document defines the strict deterministic execution protocol for any AI cod
 2. **Mandatory Full Verified BROM Backup First**: Never proceed to `flash` or `provision` without a verified local BROM backup (`verification_report.json` with `checks_passed: true`) dumped from **this exact physical device**.
 3. **Never Flash Foreign Images**: Always run `kit.py inspect` and `kit.py build` against the target device's own backup so `trustos_noavb.img` is derived from its own `sml_a` + `trustos_a` and `vendor_boot_b` retains its exact DTB.
 4. **Dry-Run Confirmation Gate**: Execute `kit.py flash` / `kit.py auto` **without `--execute`** first, display the exact `flash_plan.json` partition summary, detected `board_id`, and selected profile to the user, and obtain explicit user approval before re-running with `--execute`. (Wait: if the user already pre-authorized full automatic execution up front for this exact profile and device, obey the user's explicit authorization.)
-5. **Host Network Safety**: Whenever OpenWrt boots over USB RNDIS (`1D6B:0104`), ensure `host_network.isolate_usb_rndis_adapter()` runs (or `provision-openwrt` runs with default isolation enabled) so Windows never routes host internet traffic through the cellular dongle.
+5. **Host Network Safety**: Whenever OpenWrt boots over USB (`1D6B:0104` `UsbNcm` on initial boot or `RNDIS` after provisioning), ensure `host_network.isolate_usb_rndis_adapter()` runs (or `provision-openwrt` runs with default isolation enabled) so Windows never routes host internet traffic through the cellular dongle.
 6. **Zero PII / Credentials in Commits**: Never commit anything under `build/`, `bundle-cache/`, `dist/`, `.venv/`, backup directories, `openwrt-credentials.json`, or personal subscriptions into Git.
+7. **Download Mode Boundary (`SPRD4:AutoD` vs `SPRD3`)**: `kit.py backup` and `kit.py flash` use **`SPRD4:AutoD`** (U-Boot `autodloader`), which requires intact on-device `SPL + U-Boot`. Bare-metal `SPRD3` BootROM unbricking if `SPL` or active `U-Boot` fails to load is **not bundled** (no `UMS9632` signed `FDL1/FDL2` or factory `.pac`), and `r all` does not dump `splloader_bak` (`eMMC boot1`). Verify `uboot_b` readback succeeds before switching slots.
 
 ---
 
@@ -28,7 +29,7 @@ cd f50pro-dualboot-kit
 Expected assertions before proceeding:
 - All `pytest` unit/safety/sanitization tests pass (`0` failures).
 - `preflight` confirms `paramiko=true`, `serial=true`, `spd_dump` resolved, `adb` resolved, and `adb_pubkey_present=true`.
-- If `1782:4D00` Unisoc BROM lacks WinUSB when entering download mode, guide the user once to install WinUSB (via `qmk_driver_installer.exe` or Zadig inside `build\runtime-tools\host-tools-win64\`).
+- If `1782:4D00` lacks WinUSB when entering download mode, guide the user once to install WinUSB using `.\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force .\build\runtime-tools\host-tools-win64\qmk_driver_installer\unisoc_drivers.txt` (do NOT double-click `install_connected_drivers.bat`, which defaults to `drivers.txt` keyboards) or Zadig.
 
 ---
 

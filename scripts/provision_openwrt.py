@@ -343,7 +343,13 @@ def provision_openwrt(
             "uci set system.@system[0].hostname='F50Pro'",
             "uci set system.@system[0].zonename='Asia/Shanghai'",
             "uci set system.@system[0].timezone='CST-8'",
+            "uci set unisoc_modem.main.at_port='/dev/stty_nr2'",
+            "uci set unisoc_modem.main.sim_slots='2'",
+            "uci set unisoc_modem.main.platform_defaults='u30pro'",
             "uci set unisoc_modem.main.wifi_device='phy0-ap0'",
+            "uci set luci.main.lang='zh_cn'",
+            "uci set luci.main.mediaurlbase='/luci-static/aurora'",
+            "uci -q delete network.wan.device || true",
             f"WIFI_SEC=default_radio0; uci -q get wireless.default_radio0 >/dev/null || WIFI_SEC=@wifi-iface[0]; uci set wireless.$WIFI_SEC.ssid={_shq(wifi_ssid)}",
             "uci set u30pro.usb=usb",
             "uci set u30pro.usb.mode='rndis'",
@@ -358,8 +364,11 @@ def provision_openwrt(
         cmds.extend([
             "uci commit system",
             "uci commit unisoc_modem",
+            "uci commit luci",
+            "uci commit network",
             "uci commit wireless",
             "uci commit u30pro",
+            "/usr/libexec/unisoc-modem/device-usb set-net rndis permanent 1 >/dev/null",
             "/etc/init.d/f50pro-leds enable >/dev/null 2>&1 || true",
             "/etc/init.d/f50pro-leds restart >/dev/null 2>&1 || true",
             "/etc/init.d/mu300-sysd restart >/dev/null 2>&1 || true",
@@ -374,12 +383,7 @@ def provision_openwrt(
             oc_res = _install_openclash_offline(ssh, sftp, cache_dir=cache_dir, tools_dir=tools_dir)
 
         if applied_pw:
-            # Set root password safely via chpasswd or passwd stdin
-            chan = ssh.invoke_shell()
-            time.sleep(0.3)
-            chan.send(f"printf '%s\\n%s\\n' {_shq(applied_pw)} {_shq(applied_pw)} | passwd root\n")
-            time.sleep(0.8)
-            chan.close()
+            ssh_run(ssh, f"printf '%s\\n%s\\n' {_shq(applied_pw)} {_shq(applied_pw)} | passwd root >/dev/null", check=True)
             pw_candidates = (applied_pw,)
 
         # Commit permanent boot to OpenWrt _b and snapshot exact verified BCAB block

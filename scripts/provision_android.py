@@ -98,7 +98,7 @@ def apply_slot_a_from_openwrt(
             sftp_put_bytes(sftp, payload, remote_img, mode=0o644)
 
             dev = f"/dev/block/by-name/{part}"
-            _, cur_sha, _ = ssh_run(ssh, f"sha256sum {dev} | cut -d' ' -f1")
+            _, cur_sha, _ = ssh_run(ssh, f"head -c {spec['size_bytes']} {dev} | sha256sum | cut -d' ' -f1")
             cur_sha = cur_sha.strip()
             if cur_sha == spec["sha256"]:
                 results[part] = {"status": "already_written", "sha256": cur_sha}
