@@ -390,55 +390,77 @@ def run_brom_backup(
         "reset",
     ]
     cmd, launch_meta = build_spd_invocation(tools_dir, spd_args, spd_mode=spd_mode, usb_dev=usb_dev)
-    proc = subprocess.Popen(
-        cmd,
-        cwd=output_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        **win_no_window_kwargs(),
-    )
 
-    lines: queue.Queue[str | None] = queue.Queue()
-
-    def _reader() -> None:
-        assert proc.stdout
-        with log_path.open("w", encoding="utf-8") as lf:
-            for line in proc.stdout:
-                lf.write(line)
-                lf.flush()
-                lines.put(line)
-        lines.put(None)
-
-    threading.Thread(target=_reader, daemon=True).start()
-    boot_diag_seen = False
-    deadline = time.monotonic() + wait_sec + 900
     tail: list[str] = []
-    while time.monotonic() < deadline:
-        try:
-            item = lines.get(timeout=1.0)
-        except queue.Empty:
-            if proc.poll() is not None:
-                break
-            continue
-        if item is None:
-            break
-        tail.append(item.strip())
-        if len(tail) > 25:
-            tail.pop(0)
-        if not boot_diag_seen and "Waiting for boot_diag" in item:
-            boot_diag_seen = True
-            if webui_password:
-                time.sleep(0.8)
-                trigger_zte_webui_reboot(webui_password, host=webui_host)
-        if FATAL_SPD_RE.search(item) and "Waiting" not in item:
-            proc.terminate()
-            raise RuntimeError(f"spd_dump fatal error: {_explain_libusb_error(item.strip(), launch_meta)}")
+    rc = -1
+    for attempt in range(1, 5):
+        proc = subprocess.Popen(
+            cmd,
+            cwd=output_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            **win_no_window_kwargs(),
+        )
 
-    rc = proc.wait(timeout=30)
+        lines: queue.Queue[str | None] = queue.Queue()
+
+        def _reader(p=proc, q=lines, mode="w" if attempt == 1 else "a") -> None:
+            assert p.stdout
+            with log_path.open(mode, encoding="utf-8") as lf:
+                if mode == "a":
+                    lf.write(f"\n--- pre-handshake retry attempt {attempt} ---\n")
+                for line in p.stdout:
+                    lf.write(line)
+                    lf.flush()
+                    q.put(line)
+            q.put(None)
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+        boot_diag_seen = False
+        handshake_seen = False
+        deadline = time.monotonic() + wait_sec + 900
+        tail = []
+        while time.monotonic() < deadline:
+            try:
+                item = lines.get(timeout=1.0)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            if item is None:
+                break
+            tail.append(item.strip())
+            if len(tail) > 25:
+                tail.pop(0)
+            if any(m in item for m in ("BSL_REP_VER:", "save dir is", "Read Part Done")):
+                handshake_seen = True
+            if not boot_diag_seen and "Waiting for boot_diag" in item:
+                boot_diag_seen = True
+                if webui_password and attempt == 1:
+                    time.sleep(0.8)
+                    trigger_zte_webui_reboot(webui_password, host=webui_host)
+            if FATAL_SPD_RE.search(item) and "Waiting" not in item:
+                proc.terminate()
+                reader_thread.join(timeout=2)
+                raise RuntimeError(f"spd_dump fatal error: {_explain_libusb_error(item.strip(), launch_meta)}")
+
+        rc = proc.wait(timeout=30)
+        reader_thread.join(timeout=2)
+        if rc == 0:
+            break
+        pre_race = (not handshake_seen) and any(
+            tok in "\n".join(tail) for tok in ("Connection failed", "libusb_open_device failed")
+        )
+        if pre_race and attempt < 4:
+            time.sleep(0.15)
+            continue
+        break
+
     if rc != 0:
         raise RuntimeError(f"spd_dump backup failed rc={rc} mode={launch_meta['mode']}; tail={tail[-10:]}")
     rep = verify_backup_dir(output_dir, require_complete_table=True)

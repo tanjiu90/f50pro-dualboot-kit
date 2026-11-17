@@ -125,8 +125,8 @@ SUPPORTED_BOARD_VARIANTS = {
     "6": "F50 Pro 插卡版 (board_id=6, 外置 Nano-SIM + 内置 eSIM 切换)",
 }
 
-# Read-only per-unit partitions hashed in-memory (NEVER exposed raw) to bind plans to one physical device.
-IDENTITY_PARTITIONS: tuple[str, ...] = ("miscdata", "prodnv", "persist")
+# Truly immutable factory partitions across OS reboots (NEVER runtime-mutable prodnv/miscdata) hashed in-memory to bind one device.
+IDENTITY_PARTITIONS: tuple[str, ...] = ("ztecfg", "persist")
 
 # Explicit per-profile operation/partition/offset/length allowlists complementing FORBIDDEN_PARTITIONS.
 _OPENWRT_SLOT_B_ALLOWLIST: dict[str, dict[str, Any]] = {

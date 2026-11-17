@@ -186,16 +186,16 @@ def test_p0_2_swapped_identical_model_device_rejected(
         usb_topology={"bus": 1, "port_path": "1-3", "serial": "SYNTH-DEV-A"},
     )
 
-    # Device B has identical GPT & identical boot/vendor_boot/trustos firmware, only prodnv/miscdata differ!
+    # Device B has identical GPT & identical boot/vendor_boot/trustos firmware, only ztecfg/persist differ!
     mib = 1 << 20
-    dev_b_prodnv = (b"SYNTH_UNIT_B_PRODNV!" * ((mib // 20) + 1))[:mib]
-    dev_b_miscdata = (b"SYNTH_UNIT_B_MISC!" * ((mib // 18) + 1))[:mib]
+    dev_b_ztecfg = (b"SYNTH_UNIT_B_ZTECFG!" * ((mib // 20) + 1))[:mib]
+    dev_b_persist = (b"SYNTH_UNIT_B_PERSIST!" * ((mib // 21) + 1))[:mib]
 
     def _read_device_b(part: str, sz: int, fname: str) -> bytes:
-        if part == "prodnv":
-            return dev_b_prodnv[:sz]
-        if part == "miscdata":
-            return dev_b_miscdata[:sz]
+        if part == "ztecfg":
+            return dev_b_ztecfg[:sz]
+        if part == "persist":
+            return dev_b_persist[:sz]
         return (dev_a_backup / part).read_bytes()[:sz]
 
     sess_b = MagicMock()
@@ -233,13 +233,13 @@ def test_p0_2_swapped_identical_model_device_rejected(
     # Zero PII in plan & hardware_facts: raw partition strings never leaked into JSON artifacts
     plan_txt = (out_a / "flash_plan.json").read_text(encoding="utf-8")
     facts_txt = (out_a / "hardware_facts.json").read_text(encoding="utf-8")
-    assert "SYNTH_UNIT_A_PRODNV" not in plan_txt and "SYNTH_UNIT_A_MISC" not in plan_txt
-    assert "SYNTH_UNIT_A_PRODNV" not in facts_txt and "SYNTH_UNIT_A_MISC" not in facts_txt
+    assert "SYNTH_UNIT_A_ZTECFG" not in plan_txt and "SYNTH_UNIT_A_PERSIST" not in plan_txt
+    assert "SYNTH_UNIT_A_ZTECFG" not in facts_txt and "SYNTH_UNIT_A_PERSIST" not in facts_txt
 
-    # Weak identity (all-zero prodnv/miscdata) must refuse automatic flash without confirm_weak_identity
+    # Weak identity (all-zero ztecfg/persist) must refuse automatic flash without confirm_weak_identity
     mib = 1 << 20
-    (dev_a_backup / "prodnv").write_bytes(b"\x00" * mib)
-    (dev_a_backup / "miscdata").write_bytes(b"\x00" * mib)
+    (dev_a_backup / "ztecfg").write_bytes(b"\x00" * mib)
+    (dev_a_backup / "persist").write_bytes(b"\x00" * mib)
     out_weak = synthetic_env["out_dir"] / "p0_2_weak"
     weak_plan = build_profile(
         backup_dir=dev_a_backup,
@@ -872,5 +872,137 @@ def test_p0_6_offline_plan_dry_run_and_probe_boundaries(
         assert rc_probe == 0
         probe_json = json.loads(probe_out_file.read_text(encoding="utf-8"))
         assert probe_json["overall_status"] == "PASS"
+
+
+def test_real_b15_openwrt_cmdline_board_id_and_device_usb_get(tmp_path: Path) -> None:
+    """Verify real-hardware OpenWrt sprdboot.slot_suffix, zteboot.zte_boardid, and device-usb get JSON parsing."""
+    from provision_openwrt import (
+        _apply_usb_net_mode_transition,
+        _probe_remote_identity_and_usb_mode,
+        resolve_host_usb_net_plan,
+    )
+    from verify_e2e import _parse_openwrt_boot_evidence
+
+    parsed = _parse_openwrt_boot_evidence(
+        "model=f50pro\nboard_id=\nwifi_device=phy0-ap0\nopenwrt_id=OpenWrt\n"
+        "cmdline=console=ttyS1 sprdboot.slot_suffix=_b sprdboot.flash=emmc zteboot.zte_boardid=1\n"
+        "bootargs=\nbutton_long=system-switch\nusb_mode=rndis\n"
+        "/dev/mmcblk0p62 2022600 168392 1837824 8% /mnt/mu300-disk\n"
+    )
+    assert parsed["board_id"] == "1"
+    assert parsed["slot_suffix"] == "_b"
+    assert parsed["slot_evidence_source"] == "/proc/cmdline|bootargs"
+    assert parsed["active_os"] == "openwrt"
+    assert parsed["usb_mode"] == "rndis"
+
+    ssh = MagicMock()
+    captured: list[str] = []
+
+    def _fake_ssh(client, cmd, *, check=True, timeout=60.0):
+        captured.append(cmd)
+        if "usb_get=" in cmd:
+            return (
+                0,
+                'board_id=unknown\ncmdline=console=ttyS1 zteboot.zte_boardid=1\n'
+                'usb_get={"ok":1,"net_current":"rndis","net_mode":"rndis"}\n'
+                'usb_mode=unknown\nhost_hash=deadbeef1234\n',
+                "",
+            )
+        return 0, "", ""
+
+    with patch("provision_openwrt.ssh_run", side_effect=_fake_ssh):
+        ident = _probe_remote_identity_and_usb_mode(ssh)
+        assert ident == {"board_id": "1", "usb_mode": "rndis", "host_hash": "deadbeef1234"}
+
+        plan = resolve_host_usb_net_plan(
+            host_platform="win64",
+            current_mode="ncm",
+            requested_mode="rndis",
+            persist_mode=False,
+        )
+        ssh2 = MagicMock()
+        with (
+            patch("provision_openwrt.wait_for_openwrt_ssh", return_value=ssh2),
+            patch("provision_openwrt.time.sleep"),
+        ):
+            _, trans = _apply_usb_net_mode_transition(
+                ssh,
+                plan=plan,
+                pre_identity={"board_id": "1", "usb_mode": "ncm", "host_hash": "deadbeef1234"},
+                openwrt_host="192.168.77.1",
+                pw_candidates=("",),
+                isolate_host=False,
+                target_iface=None,
+                usb_topology=None,
+                out_dir=tmp_path,
+            )
+    assert trans["scope"] == "once"
+    assert any("device-usb set-net 'rndis' once 1" in c for c in captured)
+
+
+def test_brom_backup_retries_only_pre_handshake_connection_race(
+    synthetic_env: dict[str, Path], tmp_path: Path
+) -> None:
+    """Verify run_brom_backup retries transient pre-handshake 1782:4d00 'Connection failed' races, never post-handshake."""
+    from brom_backup import run_brom_backup
+
+    tools = synthetic_env["tools_dir"]
+    fake_exe = tools / "spd_dump_fake.exe"
+    fake_exe.write_bytes(b"MZ")
+
+    class _RaceProc(_FakePopen):
+        def __init__(self, lines: list[str], rc: int):
+            super().__init__(lines)
+            self._final_rc = rc
+
+        def wait(self, timeout=None):
+            self._rc = self._final_rc
+            return self._rc
+
+    # Case 1: attempt 1 hits pre-handshake 'Connection failed'; attempt 2 succeeds cleanly
+    p1 = _RaceProc(["Waiting for boot_diag/cali_diag/dl_diag connection (120s)\n", "Connection failed\n"], rc=1)
+    p2 = _RaceProc(
+        ["Waiting for boot_diag/cali_diag/dl_diag connection (120s)\n", 'BSL_REP_VER: "SPRD4:AutoD\\0"\n', "save dir is ...\n"],
+        rc=0,
+    )
+    out1 = tmp_path / "bak_retry_ok"
+    calls = {"n": 0}
+
+    def _spawn1(*a, **k):
+        calls["n"] += 1
+        return p1 if calls["n"] == 1 else p2
+
+    with (
+        patch("brom_backup.build_spd_invocation", return_value=([str(fake_exe)], {"mode": "direct"})),
+        patch("brom_backup.subprocess.Popen", side_effect=_spawn1),
+        patch("brom_backup.verify_backup_dir", return_value={"checks_passed": True}),
+        patch("brom_backup.time.sleep"),
+    ):
+        res = run_brom_backup(out1, tools_dir=tools, authorize_device_reboot=True)
+    assert calls["n"] == 2
+    assert res["checks_passed"] is True
+
+    # Case 2: failure AFTER BSL_REP_VER must NEVER retry
+    p_post = _RaceProc(
+        ["Waiting for boot_diag/cali_diag/dl_diag connection (120s)\n", 'BSL_REP_VER: "SPRD4:AutoD\\0"\n', "Connection failed\n"],
+        rc=1,
+    )
+    out2 = tmp_path / "bak_no_retry_post"
+    calls2 = {"n": 0}
+
+    def _spawn2(*a, **k):
+        calls2["n"] += 1
+        return p_post
+
+    with (
+        patch("brom_backup.build_spd_invocation", return_value=([str(fake_exe)], {"mode": "direct"})),
+        patch("brom_backup.subprocess.Popen", side_effect=_spawn2),
+        patch("brom_backup.time.sleep"),
+    ):
+        with pytest.raises(RuntimeError, match="spd_dump backup failed rc=1"):
+            run_brom_backup(out2, tools_dir=tools, authorize_device_reboot=True)
+    assert calls2["n"] == 1
+
+
 
 

@@ -5,6 +5,7 @@ import argparse
 import io
 import json
 import posixpath
+import re
 import secrets
 import string
 import tarfile
@@ -361,18 +362,40 @@ def _probe_remote_identity_and_usb_mode(ssh) -> dict[str, str]:
     """Read non-PII hardware board_id, hashed machine marker, and active USB net mode over SSH."""
     _, out, _ = ssh_run(
         ssh,
-        "printf 'board_id=%s\\nusb_mode=%s\\nhost_hash=%s\\n' "
+        "printf 'board_id=%s\\ncmdline=%s\\nusb_get=%s\\nusb_mode=%s\\nhost_hash=%s\\n' "
         "\"$(cat /proc/driver/board_id 2>/dev/null || echo unknown)\" "
-        "\"$(uci -q get u30pro.usb.mode || /usr/libexec/unisoc-modem/device-usb get-net 2>/dev/null || echo unknown)\" "
+        "\"$(tr '\\r\\n' '  ' </proc/cmdline 2>/dev/null || true)\" "
+        "\"$(/usr/libexec/unisoc-modem/device-usb get 2>/dev/null || true)\" "
+        "\"$(uci -q get u30pro.usb.mode || sed -n 's/^mode=//p' /etc/unisoc-modem/usb-boot.conf 2>/dev/null | head -n 1 || echo unknown)\" "
         "\"$(sha256sum /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null | cut -d' ' -f1 || cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)\"",
         check=False,
     )
     res = {"board_id": "unknown", "usb_mode": "unknown", "host_hash": "unknown"}
+    cmdline = ""
+    usb_get_raw = ""
     for ln in out.splitlines():
         if "=" in ln:
             k, v = ln.split("=", 1)
-            if k.strip() in res and v.strip():
-                res[k.strip()] = v.strip()
+            key = k.strip()
+            val = v.strip()
+            if key == "cmdline":
+                cmdline = val
+            elif key == "usb_get":
+                usb_get_raw = val
+            elif key in res and val:
+                res[key] = val
+    if res["board_id"] == "unknown" and cmdline:
+        m_bid = re.search(r"\bzteboot\.zte_boardid=(\d+)\b", cmdline)
+        if m_bid:
+            res["board_id"] = m_bid.group(1)
+    if usb_get_raw.startswith("{"):
+        try:
+            ujson = json.loads(usb_get_raw)
+            mode_val = str(ujson.get("net_current") or ujson.get("net_mode") or "").strip().lower()
+            if mode_val and mode_val != "unknown":
+                res["usb_mode"] = mode_val
+        except json.JSONDecodeError:
+            pass
     return res
 
 
@@ -391,10 +414,11 @@ def _apply_usb_net_mode_transition(
 ) -> tuple[Any, dict[str, Any]]:
     """Apply an explicit USB gadget mode change cleanly, handling expected disconnect and re-enumeration."""
     target_mode = plan["final_usb_net_mode"]
-    perm_flag = "1" if plan["permanent"] else "0"
+    scope = "permanent" if plan["permanent"] else "once"
     intent = {
         "from_mode": plan["install_usb_net_mode"],
         "to_mode": target_mode,
+        "scope": scope,
         "permanent": plan["permanent"],
         "expected_disconnect": plan["expected_disconnect"],
         "pre_board_id": pre_identity["board_id"],
@@ -409,7 +433,7 @@ def _apply_usb_net_mode_transition(
         ssh_run(
             ssh,
             f"uci set u30pro.usb=usb && uci set u30pro.usb.mode={_shq(target_mode)} && uci commit u30pro && "
-            f"/usr/libexec/unisoc-modem/device-usb set-net {_shq(target_mode)} permanent {perm_flag} >/dev/null",
+            f"/usr/libexec/unisoc-modem/device-usb set-net {_shq(target_mode)} {scope} 1 >/dev/null",
             timeout=25,
         )
     except (EOFError, OSError, RuntimeError):

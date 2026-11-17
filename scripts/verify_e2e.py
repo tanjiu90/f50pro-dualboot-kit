@@ -42,6 +42,7 @@ def _parse_openwrt_boot_evidence(out: str) -> dict[str, Any]:
             "bootargs",
             "openwrt_id",
             "button_long",
+            "usb_mode",
         ):
             k, v = line.split("=", 1)
             fields[k] = v.strip()
@@ -49,12 +50,17 @@ def _parse_openwrt_boot_evidence(out: str) -> dict[str, Any]:
             df_line = line.strip()
 
     evidence_text = f"{fields.get('cmdline', '')} {fields.get('bootargs', '')}"
-    m_slot = re.search(r"(?:androidboot\.)?slot_suffix=(_[ab])\b", evidence_text)
+    m_slot = re.search(r"(?:(?:androidboot|sprdboot)\.)?slot_suffix=(_[ab])\b", evidence_text)
     slot_suffix = m_slot.group(1) if m_slot else "UNKNOWN"
+    board_id = fields.get("board_id") or ""
+    if not board_id or board_id.upper() == "UNKNOWN":
+        m_board = re.search(r"\bzteboot\.zte_boardid=(\d+)\b", evidence_text)
+        if m_board:
+            board_id = m_board.group(1)
     active_os = "openwrt" if fields.get("model") == "f50pro" and fields.get("openwrt_id") else "UNKNOWN"
-    return {
+    out_info = {
         "model": fields.get("model") or "UNKNOWN",
-        "board_id": fields.get("board_id") or "UNKNOWN",
+        "board_id": board_id or "UNKNOWN",
         "wifi_device": fields.get("wifi_device") or "UNKNOWN",
         "slot_suffix": slot_suffix,
         "slot_evidence_source": "/proc/cmdline|bootargs" if m_slot else "UNAVAILABLE",
@@ -62,6 +68,9 @@ def _parse_openwrt_boot_evidence(out: str) -> dict[str, Any]:
         "button_long": fields.get("button_long") or "",
         "rootfs_df": df_line,
     }
+    if fields.get("usb_mode"):
+        out_info["usb_mode"] = fields["usb_mode"]
+    return out_info
 
 
 def _probe_openwrt(host: str, auth_ctx: AuthContext, check_openclash: bool) -> dict[str, Any]:
@@ -83,22 +92,27 @@ def _probe_openwrt(host: str, auth_ctx: AuthContext, check_openclash: bool) -> d
     try:
         _, out, _ = ssh_run(
             ssh,
-            "printf 'model=%s\\nboard_id=%s\\nwifi_device=%s\\nopenwrt_id=%s\\ncmdline=%s\\nbootargs=%s\\nbutton_long=%s\\n' "
+            "printf 'model=%s\\nboard_id=%s\\nwifi_device=%s\\nopenwrt_id=%s\\ncmdline=%s\\nbootargs=%s\\nbutton_long=%s\\nusb_mode=%s\\n' "
             "\"$(cat /etc/mu300/model 2>/dev/null)\" "
             "\"$(cat /proc/driver/board_id 2>/dev/null)\" "
             "\"$(uci -q get unisoc_modem.main.wifi_device 2>/dev/null)\" "
             "\"$(grep -m1 '^DISTRIB_ID=' /etc/openwrt_release 2>/dev/null | cut -d= -f2 | tr -d \"'\\\"\")\" "
-            "\"$(cat /proc/cmdline 2>/dev/null)\" "
-            "\"$(tr -d '\\0' </proc/device-tree/chosen/bootargs 2>/dev/null)\" "
-            "\"$(uci -q get unisoc_modem.main.f50pro_button_long 2>/dev/null)\" && "
-            "df -B1 / | tail -n 1",
+            "\"$(tr '\\r\\n' '  ' </proc/cmdline 2>/dev/null)\" "
+            "\"$(tr '\\0\\r\\n' '   ' </proc/device-tree/chosen/bootargs 2>/dev/null)\" "
+            "\"$(uci -q get unisoc_modem.main.f50pro_button_long 2>/dev/null)\" "
+            "\"$(sed -n 's/^mode=//p' /etc/unisoc-modem/usb-boot.conf 2>/dev/null | head -n 1)\" && "
+            "(df -k / /mnt/mu300-disk 2>/dev/null || df /) | tail -n 1",
             check=False,
         )
         parsed = _parse_openwrt_boot_evidence(out)
         report["reachable"] = True
         report.update(parsed)
         if check_openclash:
-            _, oc_out, _ = ssh_run(ssh, "ss -tln | grep ':9090 ' || true", check=False)
+            _, oc_out, _ = ssh_run(
+                ssh,
+                "(command -v ss >/dev/null 2>&1 && ss -tln || netstat -ltn) | grep -E '(:|:::)9090([[:space:]]|$)' || true",
+                check=False,
+            )
             report["openclash_9090_listening"] = ":9090" in oc_out
     finally:
         ssh.close()

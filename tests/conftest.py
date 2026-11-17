@@ -174,6 +174,10 @@ def synthetic_env(tmp_path: Path) -> dict[str, Path]:
         ("fulldumpdb", 1),
     ]
     (backup_dir / "splloader").write_bytes(b"\x00" * 4096)
+    (backup_dir / "ztecfg").write_bytes((b"SYNTH_UNIT_A_ZTECFG!" * ((mib // 20) + 1))[:mib])
+    xml_rows.append(("ztecfg", 1))
+    (backup_dir / "persist").write_bytes((b"SYNTH_UNIT_A_PERSIST!" * ((mib // 21) + 1))[:mib])
+    xml_rows.append(("persist", 1))
     (backup_dir / "prodnv").write_bytes((b"SYNTH_UNIT_A_PRODNV!" * ((mib // 20) + 1))[:mib])
     xml_rows.append(("prodnv", 1))
     (backup_dir / "miscdata").write_bytes((b"SYNTH_UNIT_A_MISC!" * ((mib // 18) + 1))[:mib])
