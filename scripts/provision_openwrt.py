@@ -18,6 +18,7 @@ from common import (
     DEFAULT_TOOLS_DIR,
     PROFILES,
     REPO_ROOT,
+    detect_host_platform,
     parse_boot_control,
     read_json,
     sha256_bytes,
@@ -115,14 +116,69 @@ def _shq(val: str) -> str:
     return "'" + val.replace("'", "'\\''") + "'"
 
 
-def _prepare_host_rndis(static_ip: str = "192.168.77.12") -> dict[str, Any]:
+class UsbNetModeSwitchTimeoutError(TimeoutError):
+    """Raised when an intentional USB gadget mode transition times out re-enumerating (not a flash failure)."""
+
+
+VALID_USB_NET_MODES = ("auto", "preserve", "ncm", "ecm", "rndis")
+
+
+def resolve_host_usb_net_plan(
+    *,
+    host_platform: str,
+    current_mode: str,
+    requested_mode: str = "auto",
+    persist_mode: bool = False,
+) -> dict[str, Any]:
+    """Host-adapter layer decision for OpenWrt USB network mode.
+
+    Defaults to preserving whichever USB gadget mode (ncm/ecm/rndis) is already working over SSH,
+    never forcing permanent RNDIS across macOS/Linux/Android/Windows unless explicitly requested.
+    """
+    if requested_mode not in VALID_USB_NET_MODES:
+        raise ValueError(f"Unsupported USB net mode {requested_mode!r}; expected {VALID_USB_NET_MODES}")
+    norm_cur = current_mode.strip().lower() or "unknown"
+    if requested_mode in ("auto", "preserve"):
+        return {
+            "host_platform": host_platform,
+            "install_usb_net_mode": norm_cur,
+            "final_usb_net_mode": norm_cur,
+            "switch_required": False,
+            "permanent": False,
+            "expected_disconnect": False,
+            "reason": f"Preserving already-working USB gadget mode ({norm_cur}) on host '{host_platform}'",
+        }
+    switch_req = requested_mode != norm_cur
+    return {
+        "host_platform": host_platform,
+        "install_usb_net_mode": norm_cur,
+        "final_usb_net_mode": requested_mode,
+        "switch_required": switch_req or persist_mode,
+        "permanent": bool(persist_mode),
+        "expected_disconnect": switch_req,
+        "reason": (
+            f"Explicit host-requested USB mode transition {norm_cur} -> {requested_mode} (permanent={bool(persist_mode)})"
+        ),
+    }
+
+
+def _prepare_host_rndis(
+    static_ip: str = "192.168.77.12",
+    *,
+    target_iface: str | None = None,
+    usb_topology: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     res: dict[str, Any] = {}
     res["usbflags_cleared"] = clear_negative_usbflags_rndis()
     try:
         res["driver_bind"] = bind_inbox_rndis_driver(install=True)
     except Exception as exc:
         res["driver_bind_note"] = str(exc)
-    res["network_isolation"] = isolate_usb_rndis_adapter(static_ip=static_ip)
+    res["network_isolation"] = isolate_usb_rndis_adapter(
+        static_ip=static_ip,
+        target_iface=target_iface,
+        usb_topology=usb_topology,
+    )
     return res
 
 
@@ -133,15 +189,17 @@ def wait_for_openwrt_ssh(
     timeout: int = 120,
     isolate_host: bool = True,
     static_ip: str = "192.168.77.12",
+    target_iface: str | None = None,
+    usb_topology: dict[str, Any] | None = None,
 ):
-    """Poll until host RNDIS binds and OpenWrt SSH responds cleanly."""
+    """Poll until target F50 Pro USB interface is isolated and OpenWrt SSH responds cleanly."""
     deadline = time.monotonic() + timeout
     iso_done = False
     last_err: Exception | None = None
     while time.monotonic() < deadline:
         if isolate_host:
             try:
-                _prepare_host_rndis(static_ip=static_ip)
+                _prepare_host_rndis(static_ip=static_ip, target_iface=target_iface, usb_topology=usb_topology)
                 iso_done = True
             except Exception:
                 pass
@@ -150,7 +208,7 @@ def wait_for_openwrt_ssh(
             rc, out, _ = ssh_run(ssh, "cat /etc/mu300/model 2>/dev/null", check=False, timeout=5.0)
             if rc == 0 and out.strip() == "f50pro":
                 if isolate_host and not iso_done:
-                    _prepare_host_rndis(static_ip=static_ip)
+                    _prepare_host_rndis(static_ip=static_ip, target_iface=target_iface, usb_topology=usb_topology)
                 return ssh
             ssh.close()
         except Exception as exc:
@@ -299,6 +357,117 @@ def generate_strong_password(length: int = 16) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _probe_remote_identity_and_usb_mode(ssh) -> dict[str, str]:
+    """Read non-PII hardware board_id, hashed machine marker, and active USB net mode over SSH."""
+    _, out, _ = ssh_run(
+        ssh,
+        "printf 'board_id=%s\\nusb_mode=%s\\nhost_hash=%s\\n' "
+        "\"$(cat /proc/driver/board_id 2>/dev/null || echo unknown)\" "
+        "\"$(uci -q get u30pro.usb.mode || /usr/libexec/unisoc-modem/device-usb get-net 2>/dev/null || echo unknown)\" "
+        "\"$(sha256sum /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null | cut -d' ' -f1 || cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)\"",
+        check=False,
+    )
+    res = {"board_id": "unknown", "usb_mode": "unknown", "host_hash": "unknown"}
+    for ln in out.splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            if k.strip() in res and v.strip():
+                res[k.strip()] = v.strip()
+    return res
+
+
+def _apply_usb_net_mode_transition(
+    ssh,
+    *,
+    plan: dict[str, Any],
+    pre_identity: dict[str, str],
+    openwrt_host: str,
+    pw_candidates: tuple[str, ...],
+    isolate_host: bool,
+    target_iface: str | None,
+    usb_topology: dict[str, Any] | None,
+    out_dir: Path | None,
+    reconnect_timeout: int = 90,
+) -> tuple[Any, dict[str, Any]]:
+    """Apply an explicit USB gadget mode change cleanly, handling expected disconnect and re-enumeration."""
+    target_mode = plan["final_usb_net_mode"]
+    perm_flag = "1" if plan["permanent"] else "0"
+    intent = {
+        "from_mode": plan["install_usb_net_mode"],
+        "to_mode": target_mode,
+        "permanent": plan["permanent"],
+        "expected_disconnect": plan["expected_disconnect"],
+        "pre_board_id": pre_identity["board_id"],
+        "pre_host_hash": pre_identity["host_hash"],
+        "expected_disconnect_observed": False,
+        "reconnected": False,
+    }
+    if out_dir is not None:
+        write_json(out_dir / "usb_net_transition.json", intent)
+
+    try:
+        ssh_run(
+            ssh,
+            f"uci set u30pro.usb=usb && uci set u30pro.usb.mode={_shq(target_mode)} && uci commit u30pro && "
+            f"/usr/libexec/unisoc-modem/device-usb set-net {_shq(target_mode)} permanent {perm_flag} >/dev/null",
+            timeout=25,
+        )
+    except (EOFError, OSError, RuntimeError):
+        # USB gadget mode switch tears down CDC-NCM/ECM/RNDIS immediately; disconnect is expected, NOT flash failure!
+        intent["expected_disconnect_observed"] = True
+
+    if not plan["expected_disconnect"]:
+        intent["reconnected"] = True
+        if out_dir is not None:
+            write_json(out_dir / "usb_net_transition.json", intent)
+        return ssh, intent
+
+    try:
+        ssh.close()
+    except Exception:
+        pass
+    time.sleep(2.0)
+
+    try:
+        ssh2 = wait_for_openwrt_ssh(
+            openwrt_host,
+            passwords=pw_candidates,
+            timeout=reconnect_timeout,
+            isolate_host=isolate_host,
+            target_iface=target_iface,
+            usb_topology=usb_topology,
+        )
+    except TimeoutError as exc:
+        if out_dir is not None:
+            intent["timeout_error"] = str(exc)
+            write_json(out_dir / "usb_net_transition.json", intent)
+        raise UsbNetModeSwitchTimeoutError(
+            f"Timed out waiting for F50 Pro USB re-enumeration after {intent['from_mode']} -> {target_mode} switch: {exc}"
+        ) from exc
+
+    post_identity = _probe_remote_identity_and_usb_mode(ssh2)
+    if (
+        pre_identity["board_id"] != "unknown"
+        and post_identity["board_id"] != "unknown"
+        and pre_identity["board_id"] != post_identity["board_id"]
+    ) or (
+        pre_identity["host_hash"] != "unknown"
+        and post_identity["host_hash"] != "unknown"
+        and pre_identity["host_hash"] != post_identity["host_hash"]
+    ):
+        ssh2.close()
+        raise RuntimeError(
+            f"Target device swapped during USB network mode re-enumeration: "
+            f"expected board={pre_identity['board_id']}/host={pre_identity['host_hash'][:12]} "
+            f"got board={post_identity['board_id']}/host={post_identity['host_hash'][:12]}"
+        )
+    intent["reconnected"] = True
+    intent["post_usb_mode"] = post_identity["usb_mode"]
+    if out_dir is not None:
+        write_json(out_dir / "usb_net_transition.json", intent)
+    return ssh2, intent
+
+
 def provision_openwrt(
     *,
     profile_id: str,
@@ -307,6 +476,10 @@ def provision_openwrt(
     wifi_password: str | None = None,
     root_password: str | None = None,
     generate_password: bool = False,
+    usb_net_mode: str = "auto",
+    usb_net_persist: bool = False,
+    target_iface: str | None = None,
+    usb_topology: dict[str, Any] | None = None,
     tools_dir: Path = DEFAULT_TOOLS_DIR,
     cache_dir: Path = DEFAULT_CACHE_DIR,
     include_openclash: bool = False,
@@ -314,10 +487,11 @@ def provision_openwrt(
     out_dir: Path | None = None,
     reboot_after: bool = True,
 ) -> dict[str, Any]:
-    """Configure OpenWrt _b after flashing and capture verified live known-good-b-bcab.bin."""
+    """Configure OpenWrt _b after flashing without forcing permanent RNDIS across all host OSes."""
     if profile_id not in PROFILES or not PROFILES[profile_id]["openwrt"]:
         raise ValueError(f"Profile {profile_id} does not include OpenWrt")
 
+    host_plat = detect_host_platform()
     pw_candidates: tuple[str, ...] = ("", "root")
     if root_password:
         pw_candidates = (root_password, "", "root")
@@ -326,14 +500,25 @@ def provision_openwrt(
         openwrt_host,
         passwords=pw_candidates,
         isolate_host=isolate_host,
+        target_iface=target_iface,
+        usb_topology=usb_topology,
     )
     applied_pw = root_password
     if not applied_pw and generate_password:
         applied_pw = generate_strong_password()
 
+    transition_meta: dict[str, Any] | None = None
     try:
+        remote_pre = _probe_remote_identity_and_usb_mode(ssh)
+        board_id = remote_pre["board_id"]
+        usb_plan = resolve_host_usb_net_plan(
+            host_platform=host_plat,
+            current_mode=remote_pre["usb_mode"],
+            requested_mode=usb_net_mode,
+            persist_mode=usb_net_persist,
+        )
+
         sftp = ssh.open_sftp()
-        _, board_out, _ = ssh_run(ssh, "cat /proc/driver/board_id 2>/dev/null || echo unknown")
         grow_res = _ensure_rootfs_grown(ssh, sftp)
         board6_sha = _ensure_board6_card_patch(ssh, sftp)
         ui_res = _ensure_capacity_ui(sftp)
@@ -351,8 +536,6 @@ def provision_openwrt(
             "uci set luci.main.mediaurlbase='/luci-static/aurora'",
             "uci -q delete network.wan.device || true",
             f"WIFI_SEC=default_radio0; uci -q get wireless.default_radio0 >/dev/null || WIFI_SEC=@wifi-iface[0]; uci set wireless.$WIFI_SEC.ssid={_shq(wifi_ssid)}",
-            "uci set u30pro.usb=usb",
-            "uci set u30pro.usb.mode='rndis'",
             f"if [ -f /etc/mu300/hotspot.conf ]; then (grep -v '^SSID=' /etc/mu300/hotspot.conf; printf 'SSID=%s\\n' {_shq(wifi_ssid)}) > /tmp/hotspot.conf.new && mv /tmp/hotspot.conf.new /etc/mu300/hotspot.conf; fi",
         ]
         if wifi_password:
@@ -367,8 +550,6 @@ def provision_openwrt(
             "uci commit luci",
             "uci commit network",
             "uci commit wireless",
-            "uci commit u30pro",
-            "/usr/libexec/unisoc-modem/device-usb set-net rndis permanent 1 >/dev/null",
             "/etc/init.d/f50pro-leds enable >/dev/null 2>&1 || true",
             "/etc/init.d/f50pro-leds restart >/dev/null 2>&1 || true",
             "/etc/init.d/mu300-sysd restart >/dev/null 2>&1 || true",
@@ -377,6 +558,20 @@ def provision_openwrt(
             "wifi reload >/dev/null 2>&1 || true",
         ])
         ssh_run(ssh, " && ".join(cmds), timeout=90)
+
+        if usb_plan["switch_required"]:
+            ssh, transition_meta = _apply_usb_net_mode_transition(
+                ssh,
+                plan=usb_plan,
+                pre_identity=remote_pre,
+                openwrt_host=openwrt_host,
+                pw_candidates=pw_candidates,
+                isolate_host=isolate_host,
+                target_iface=target_iface,
+                usb_topology=usb_topology,
+                out_dir=out_dir,
+            )
+            sftp = ssh.open_sftp()
 
         oc_res = None
         if include_openclash:
@@ -394,14 +589,17 @@ def provision_openwrt(
         if bc_info["suffix"] != "_b":
             raise RuntimeError(f"Expected suffix=_b after mu300-next-boot linux, got {bc_info}")
 
+        cred_path: str | None = None
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "known-good-b-bcab.bin").write_bytes(bc_bytes)
             if applied_pw:
+                cfile = out_dir / "openwrt-credentials.json"
                 write_json(
-                    out_dir / "openwrt-credentials.json",
+                    cfile,
                     {"host": openwrt_host, "username": "root", "password": applied_pw},
                 )
+                cred_path = str(cfile)
 
         if reboot_after:
             ssh_run(ssh, "sync && reboot", check=False, timeout=5)
@@ -415,22 +613,29 @@ def provision_openwrt(
             passwords=pw_candidates,
             timeout=150,
             isolate_host=isolate_host,
+            target_iface=target_iface,
+            usb_topology=usb_topology,
         )
         ssh2.close()
 
     result = {
         "status": "OPENWRT_PROVISIONED",
-        "board_id": board_out.strip(),
+        "board_id": board_id,
         "rootfs_grow": grow_res,
         "board6_card_sha256": board6_sha,
         "ui_patches": ui_res,
         "buttons": btn_res,
         "wifi_ssid": wifi_ssid,
         "wifi_device": "phy0-ap0",
-        "usb_mode": "rndis",
+        "install_usb_net_mode": usb_plan["install_usb_net_mode"],
+        "final_usb_net_mode": usb_plan["final_usb_net_mode"],
+        "usb_mode": usb_plan["final_usb_net_mode"],
+        "usb_net_plan": usb_plan,
+        "usb_net_transition": transition_meta,
         "openclash": oc_res,
         "slot_b_bcab": bc_info,
         "password_updated": bool(applied_pw),
+        "credentials_file": cred_path,
     }
     if out_dir is not None:
         write_json(out_dir / "openwrt_provision_report.json", result)
@@ -445,6 +650,9 @@ def main() -> int:
     parser.add_argument("--wifi-password")
     parser.add_argument("--root-password")
     parser.add_argument("--generate-password", action="store_true")
+    parser.add_argument("--usb-net-mode", default="auto", choices=list(VALID_USB_NET_MODES))
+    parser.add_argument("--usb-net-persist", action="store_true", help="Persist USB net mode switch across reboots")
+    parser.add_argument("--target-iface", help="Explicit USB network interface/service name to isolate")
     parser.add_argument("--openclash", action="store_true")
     parser.add_argument("--no-host-isolate", action="store_true")
     parser.add_argument("--no-reboot", action="store_true")
@@ -463,6 +671,9 @@ def main() -> int:
         wifi_password=args.wifi_password,
         root_password=args.root_password,
         generate_password=args.generate_password,
+        usb_net_mode=args.usb_net_mode,
+        usb_net_persist=args.usb_net_persist,
+        target_iface=args.target_iface,
         tools_dir=args.tools_dir,
         cache_dir=args.cache_dir,
         include_openclash=args.openclash,

@@ -387,3 +387,165 @@ def test_p0_3_targeted_nic_selection_ignores_phone_tether_usb_dock_and_wifi_192_
     # 6. Explicit internet-exit mode must not strip default gateway
     res_inet = isolate_usb_rndis_adapter(mode="internet-exit")
     assert res_inet["mode"] == "internet-exit" and res_inet["isolated"] == []
+
+
+def test_p0_4_no_forced_permanent_rndis_and_safe_usb_mode_transition(
+    synthetic_env: dict[str, Path], tmp_path: Path
+) -> None:
+    """P0-4: Default preserves working ncm/ecm/rndis; explicit switch handles disconnect, timeout, and device swap."""
+    from common import build_trial_bcab
+    from provision_openwrt import (
+        UsbNetModeSwitchTimeoutError,
+        provision_openwrt,
+        resolve_host_usb_net_plan,
+    )
+
+    # 1. Host-adapter decisions across macOS, Linux, Android, and Windows default to preserving working modes
+    for plat in ("macos", "linux-x64", "linux-arm64", "android-arm64", "win64"):
+        for cur in ("ncm", "ecm", "rndis"):
+            dec = resolve_host_usb_net_plan(host_platform=plat, current_mode=cur, requested_mode="auto")
+            assert dec["switch_required"] is False
+            assert dec["permanent"] is False
+            assert dec["final_usb_net_mode"] == cur
+
+    # Explicit temporary vs persistent transitions clearly tracked
+    tmp_sw = resolve_host_usb_net_plan(host_platform="win64", current_mode="ncm", requested_mode="rndis", persist_mode=False)
+    assert tmp_sw["switch_required"] is True and tmp_sw["permanent"] is False and tmp_sw["expected_disconnect"] is True
+    perm_sw = resolve_host_usb_net_plan(host_platform="win64", current_mode="ncm", requested_mode="rndis", persist_mode=True)
+    assert perm_sw["switch_required"] is True and perm_sw["permanent"] is True
+
+    # Helper to construct realistic fake SSH session + known-good BCAB block
+    misc_orig = (synthetic_env["backup_dir"] / "misc").read_bytes()[2048:2080]
+    bcab_b = build_trial_bcab(misc_orig, "b", tries=6)
+    tools = synthetic_env["tools_dir"]
+    (tools / "openwrt-base" / "mu300-keys").write_bytes(b"KEYS")
+
+    def _make_fake_ssh(usb_mode: str = "ncm", board_id: str = "6", host_hash: str = "aaa111", *, disconnect_on_setnet: bool = False):
+        ssh = MagicMock()
+        ssh.executed_cmds = []
+
+        def _fake_ssh_run(client, cmd, *, check=True, timeout=60.0):
+            client.executed_cmds.append(cmd)
+            if "device-usb set-net" in cmd and disconnect_on_setnet:
+                raise EOFError("Simulated expected USB gadget re-enumeration disconnect")
+            if "board_id=" in cmd and "usb_mode=" in cmd:
+                return 0, f"board_id={board_id}\nusb_mode={usb_mode}\nhost_hash={host_hash}\n", ""
+            if "f50pro-rootfs-grow.py" in cmd:
+                return 0, json.dumps({"filesystem_bytes": 2147483648}), ""
+            return 0, "", ""
+
+        sftp = MagicMock()
+        ssh.open_sftp.return_value = sftp
+        return ssh, _fake_ssh_run
+
+    # 2. Live provision on macOS with NCM active must preserve NCM and NEVER invoke set-net rndis permanent 1
+    out_ncm = tmp_path / "ow_ncm"
+    ssh_ncm, spy_ncm = _make_fake_ssh(usb_mode="ncm", board_id="6", host_hash="unit_a_hash")
+    with (
+        patch("provision_openwrt.detect_host_platform", return_value="macos"),
+        patch("provision_openwrt.wait_for_openwrt_ssh", return_value=ssh_ncm),
+        patch("provision_openwrt.ssh_run", side_effect=spy_ncm),
+        patch("provision_openwrt._ensure_board6_card_patch", return_value="card_sha"),
+        patch("provision_openwrt._ensure_capacity_ui", return_value={"ui": "ok"}),
+        patch("provision_openwrt._ensure_5s_buttons", return_value={"long_action": "system-switch"}),
+        patch("provision_openwrt.sftp_get_bytes", return_value=bcab_b),
+    ):
+        res_ncm = provision_openwrt(
+            profile_id="2-dual-stock-openwrt",
+            tools_dir=tools,
+            out_dir=out_ncm,
+            reboot_after=False,
+        )
+    assert res_ncm["install_usb_net_mode"] == "ncm"
+    assert res_ncm["final_usb_net_mode"] == "ncm"
+    assert not any("set-net rndis" in c for c in ssh_ncm.executed_cmds)
+    assert not any("u30pro.usb.mode='rndis'" in c for c in ssh_ncm.executed_cmds)
+
+    # 3. Explicit temporary switch ncm -> rndis handles expected USB disconnect cleanly and reconnects to same unit
+    out_sw = tmp_path / "ow_switch"
+    ssh_pre, spy_pre = _make_fake_ssh(usb_mode="ncm", board_id="6", host_hash="unit_a_hash", disconnect_on_setnet=True)
+    ssh_post, spy_post = _make_fake_ssh(usb_mode="rndis", board_id="6", host_hash="unit_a_hash")
+    ssh_seq = iter([ssh_pre, ssh_post])
+
+    def _dispatch_run(client, cmd, *, check=True, timeout=60.0):
+        return spy_pre(client, cmd, check=check, timeout=timeout) if client is ssh_pre else spy_post(client, cmd, check=check, timeout=timeout)
+
+    with (
+        patch("provision_openwrt.detect_host_platform", return_value="win64"),
+        patch("provision_openwrt.wait_for_openwrt_ssh", side_effect=lambda *a, **k: next(ssh_seq)),
+        patch("provision_openwrt.ssh_run", side_effect=_dispatch_run),
+        patch("provision_openwrt.time.sleep"),
+        patch("provision_openwrt._ensure_board6_card_patch", return_value="card_sha"),
+        patch("provision_openwrt._ensure_capacity_ui", return_value={"ui": "ok"}),
+        patch("provision_openwrt._ensure_5s_buttons", return_value={"long_action": "system-switch"}),
+        patch("provision_openwrt.sftp_get_bytes", return_value=bcab_b),
+    ):
+        res_sw = provision_openwrt(
+            profile_id="2-dual-stock-openwrt",
+            usb_net_mode="rndis",
+            usb_net_persist=False,
+            tools_dir=tools,
+            out_dir=out_sw,
+            reboot_after=False,
+        )
+    assert res_sw["install_usb_net_mode"] == "ncm"
+    assert res_sw["final_usb_net_mode"] == "rndis"
+    assert res_sw["usb_net_transition"]["expected_disconnect_observed"] is True
+    assert res_sw["usb_net_transition"]["permanent"] is False
+    assert res_sw["usb_net_transition"]["reconnected"] is True
+
+    # 4. Timeout during re-enumeration raises UsbNetModeSwitchTimeoutError cleanly
+    out_to = tmp_path / "ow_to"
+    ssh_pre2, spy_pre2 = _make_fake_ssh(usb_mode="ncm", board_id="6", host_hash="unit_a_hash", disconnect_on_setnet=True)
+    call_cnt = {"n": 0}
+
+    def _wait_then_timeout(*a, **k):
+        call_cnt["n"] += 1
+        if call_cnt["n"] == 1:
+            return ssh_pre2
+        raise TimeoutError("no interface back")
+
+    with (
+        patch("provision_openwrt.detect_host_platform", return_value="win64"),
+        patch("provision_openwrt.wait_for_openwrt_ssh", side_effect=_wait_then_timeout),
+        patch("provision_openwrt.ssh_run", side_effect=spy_pre2),
+        patch("provision_openwrt.time.sleep"),
+        patch("provision_openwrt._ensure_board6_card_patch", return_value="card_sha"),
+        patch("provision_openwrt._ensure_capacity_ui", return_value={"ui": "ok"}),
+        patch("provision_openwrt._ensure_5s_buttons", return_value={"long_action": "system-switch"}),
+    ):
+        with pytest.raises(UsbNetModeSwitchTimeoutError, match="Timed out waiting for F50 Pro USB re-enumeration"):
+            provision_openwrt(
+                profile_id="2-dual-stock-openwrt",
+                usb_net_mode="rndis",
+                tools_dir=tools,
+                out_dir=out_to,
+                reboot_after=False,
+            )
+
+    # 5. Swapped device during USB re-enumeration must abort cleanly
+    out_swap = tmp_path / "ow_swap"
+    ssh_pre3, spy_pre3 = _make_fake_ssh(usb_mode="ncm", board_id="6", host_hash="unit_a_hash", disconnect_on_setnet=True)
+    ssh_wrong, spy_wrong = _make_fake_ssh(usb_mode="rndis", board_id="1", host_hash="unit_b_hash")
+    seq3 = iter([ssh_pre3, ssh_wrong])
+
+    def _dispatch3(client, cmd, *, check=True, timeout=60.0):
+        return spy_pre3(client, cmd, check=check, timeout=timeout) if client is ssh_pre3 else spy_wrong(client, cmd, check=check, timeout=timeout)
+
+    with (
+        patch("provision_openwrt.detect_host_platform", return_value="win64"),
+        patch("provision_openwrt.wait_for_openwrt_ssh", side_effect=lambda *a, **k: next(seq3)),
+        patch("provision_openwrt.ssh_run", side_effect=_dispatch3),
+        patch("provision_openwrt.time.sleep"),
+        patch("provision_openwrt._ensure_board6_card_patch", return_value="card_sha"),
+        patch("provision_openwrt._ensure_capacity_ui", return_value={"ui": "ok"}),
+        patch("provision_openwrt._ensure_5s_buttons", return_value={"long_action": "system-switch"}),
+    ):
+        with pytest.raises(RuntimeError, match="Target device swapped"):
+            provision_openwrt(
+                profile_id="2-dual-stock-openwrt",
+                usb_net_mode="rndis",
+                tools_dir=tools,
+                out_dir=out_swap,
+                reboot_after=False,
+            )
