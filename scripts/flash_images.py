@@ -29,8 +29,10 @@ from common import (
     DEFAULT_TOOLS_DIR,
     FORBIDDEN_PARTITIONS,
     MISC_BC_OFFSET,
+    PROFILE_ALLOWED_BROM_OPS,
     PROFILES,
     REPO_ROOT,
+    compute_unit_identity_digest,
     detect_host_platform,
     read_json,
     resolve_tool,
@@ -49,17 +51,50 @@ def _token(val: object) -> str:
 
 
 def validate_plan_safety(plan: dict[str, Any]) -> None:
-    """Enforce profile boundaries, forbidden partitions, and artifact digests before touching hardware."""
-    prof = PROFILES[plan["profile"]]
+    """Enforce profile allowlists, forbidden partitions, bounds, and artifact digests before hardware access."""
+    prof_id = plan["profile"]
+    prof = PROFILES[prof_id]
+    allowlist = PROFILE_ALLOWED_BROM_OPS[prof_id]
+
+    part_caps: dict[str, int] | None = None
+    bdir = plan.get("backup_dir")
+    if bdir:
+        xml_p = Path(bdir) / "partition_list.xml"
+        if xml_p.is_file():
+            part_caps = parse_partition_xml(xml_p)
+
     for op in plan["operations"]:
         part = op["partition"]
         if part in FORBIDDEN_PARTITIONS:
             raise ValueError(f"Forbidden partition in plan: {part}")
         if not prof["touches_slot_a"] and part.endswith("_a"):
-            raise ValueError(f"Profile {plan['profile']} forbids touching slot _a ({part})")
+            raise ValueError(f"Profile {prof_id} forbids touching slot _a ({part})")
+        if part not in allowlist:
+            raise ValueError(f"Partition '{part}' is not in profile '{prof_id}' explicit allowlist")
+        spec = allowlist[part]
+        if op.get("op") != spec["op"]:
+            raise ValueError(f"Operation '{op.get('op')}' not permitted for '{part}' (expected '{spec['op']}')")
+        offset = int(op.get("offset", 0))
+        if offset != spec["offset"]:
+            raise ValueError(f"Offset {offset} not permitted for '{part}' (expected {spec['offset']})")
+
         fpath = Path(op["file"])
         if not fpath.is_file() or sha256_file(fpath) != op["sha256"]:
             raise ValueError(f"Missing or corrupted artifact for {part}: {fpath}")
+        actual_sz = fpath.stat().st_size
+        declared_sz = int(op.get("size_bytes", actual_sz))
+        if declared_sz <= 0 or actual_sz != declared_sz:
+            raise ValueError(f"Size mismatch for {part}: file={actual_sz} declared={declared_sz}")
+        if spec.get("exact_size") is not None and declared_sz != spec["exact_size"]:
+            raise ValueError(f"Partition '{part}' requires exact length {spec['exact_size']} B, got {declared_sz}")
+        if part_caps is not None and part in part_caps and part_caps[part] > 0:
+            if offset + declared_sz > part_caps[part]:
+                raise ValueError(
+                    f"Write for '{part}' ({offset}+{declared_sz} B) exceeds GPT capacity ({part_caps[part]} B)"
+                )
+
+    if bdir and not plan.get("device_identity"):
+        raise ValueError("Flash plan missing mandatory device_identity target binding")
 
 
 class _SpdSession:
@@ -230,6 +265,73 @@ def _probe_failure_diag(sess: Any, exc: Exception) -> dict[str, Any]:
     return info
 
 
+def _verify_live_target_identity(
+    sess: Any,
+    plan: dict[str, Any],
+    *,
+    confirm_weak_identity: bool = False,
+    live_board_id: str | None = None,
+    live_usb_topology: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Verify connected device matches plan device_identity without writing raw PII/NV to logs."""
+    identity = plan.get("device_identity")
+    if not identity or not isinstance(identity, dict):
+        raise RuntimeError("Flash plan missing target device_identity binding; re-run `kit.py build`")
+
+    unit_specs = identity.get("unit_identity_partitions") or {}
+    if identity.get("identity_strength") != "strong" or not unit_specs or not identity.get("unit_identity_sha256"):
+        if not confirm_weak_identity:
+            raise RuntimeError(
+                "Target device identity is weak/insufficient (missing non-zero per-unit calibration/identity digest). "
+                "Automatic flash refused; verify physical target manually and pass explicit confirmation if intentional."
+            )
+    if live_board_id and identity.get("board_id") and str(live_board_id) != str(identity["board_id"]):
+        raise RuntimeError(f"Target board_id mismatch: plan={identity['board_id']} vs live={live_board_id}")
+    if live_usb_topology and identity.get("usb_topology"):
+        for k in ("bus", "port_path", "serial"):
+            pv = identity["usb_topology"].get(k)
+            lv = live_usb_topology.get(k)
+            if pv and lv and str(pv) != str(lv):
+                raise RuntimeError(f"Target USB topology mismatch ({k}): plan={pv} vs live={lv}")
+
+    live_part_records: dict[str, dict[str, Any]] = {}
+    for pname, spec in sorted(unit_specs.items()):
+        sz = int(spec["size_bytes"])
+        probe_name = f"_{pname}_id_probe.bin"
+        raw = sess.read_part(pname, sz, probe_name)
+        sess.safe_unlink(probe_name)
+        digest = sha256_bytes(raw)
+        if not raw or not any(raw):
+            raise RuntimeError(f"Live identity partition '{pname}' unexpectedly all-zero on target")
+        if digest != spec["sha256"]:
+            raise RuntimeError(
+                f"Target device identity mismatch on read-only '{pname}': connected hardware is NOT the backup source device"
+            )
+        live_part_records[pname] = {"size_bytes": len(raw), "sha256": digest}
+
+    if unit_specs:
+        live_unit = compute_unit_identity_digest(live_part_records)
+        if live_unit["unit_identity_sha256"] != identity["unit_identity_sha256"]:
+            raise RuntimeError("Target unit_identity_sha256 mismatch against bound flash plan")
+
+    # Cross-check immutable stock firmware partition (vendor_boot_a is untouched across all 3 profiles)
+    fw = identity.get("firmware_build") or {}
+    expected_vb_sha = fw.get("vendor_boot_a_sha256")
+    if expected_vb_sha:
+        vb_sz = (Path(plan["backup_dir"]) / "vendor_boot_a").stat().st_size
+        vb_raw = sess.read_part("vendor_boot_a", vb_sz, "_vendor_boot_a_id_probe.bin")
+        sess.safe_unlink("_vendor_boot_a_id_probe.bin")
+        if sha256_bytes(vb_raw) != expected_vb_sha:
+            raise RuntimeError("Target vendor_boot_a firmware build digest mismatch against backup/plan")
+
+    return {
+        "verified": True,
+        "identity_strength": identity.get("identity_strength"),
+        "verified_sources": sorted(live_part_records.keys()),
+        "unit_identity_sha256": identity.get("unit_identity_sha256"),
+    }
+
+
 def execute_flash(
     plan_path: Path,
     *,
@@ -239,6 +341,9 @@ def execute_flash(
     execute: bool = False,
     spd_mode: str = "auto",
     usb_dev: str | None = None,
+    confirm_weak_identity: bool = False,
+    board_id: str | None = None,
+    usb_topology: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute or dry-run a verified flash_plan.json with full readback verification and safe failure handling."""
     plan = read_json(plan_path)
@@ -325,6 +430,15 @@ def execute_flash(
         if dict(before_tbl) != expected_xml:
             raise RuntimeError("Live GPT partition table differs from verified backup")
 
+        failed_stage = "precheck_identity"
+        identity_check = _verify_live_target_identity(
+            sess,
+            plan,
+            confirm_weak_identity=confirm_weak_identity,
+            live_board_id=board_id,
+            live_usb_topology=usb_topology,
+        )
+
         # Write full partitions first (fulldumpdb before init_boot_b, init_boot_b uses w_force + guard)
         for op in w_ops:
             part = op["partition"]
@@ -391,6 +505,7 @@ def execute_flash(
         summary = {
             "status": "FLASH_AND_READBACK_VERIFIED",
             "profile": plan["profile"],
+            "device_identity_verified": identity_check,
             "reset_sent": True,
             "slot_switched": bool(wof_ops),
             "auto_rollback_attempted": False,
@@ -442,6 +557,8 @@ def main() -> int:
     parser.add_argument("--webui-host", default="http://192.168.0.1:8080")
     parser.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     parser.add_argument("--usb-dev", help="Explicit Termux OTG /dev/bus/usb/XXX/YYY path for --spd-mode termux-usb")
+    parser.add_argument("--confirm-weak-identity", action="store_true", help="Explicit manual override only if unit identity partitions are absent/all-zero")
+    parser.add_argument("--board-id", help="Expected target board_id (1 or 6)")
     parser.add_argument("--execute", action="store_true", help="Actually flash device (default is dry-run)")
     args = parser.parse_args()
     p = args.plan if args.plan.is_absolute() else (REPO_ROOT / args.plan)
@@ -453,6 +570,8 @@ def main() -> int:
         execute=args.execute,
         spd_mode=args.spd_mode,
         usb_dev=args.usb_dev,
+        confirm_weak_identity=args.confirm_weak_identity,
+        board_id=args.board_id,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0

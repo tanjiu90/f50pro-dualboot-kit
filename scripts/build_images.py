@@ -17,6 +17,7 @@ from common import (
     F50PRO_VENDOR_BOOT_EXTRA_ARGS,
     FORBIDDEN_PARTITIONS,
     MISC_BC_OFFSET,
+    PROFILE_ALLOWED_BROM_OPS,
     PROFILES,
     REPO_ROOT,
     TRUSTOS_ORIG_OPCODE,
@@ -221,12 +222,19 @@ def build_profile(
     tools_dir: Path = DEFAULT_TOOLS_DIR,
     adb_pubkey_path: Path | None = None,
     usb_mode: str | None = None,
+    board_id: str | None = None,
+    usb_topology: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Assemble offline images and strict flash_plan.json for the selected profile."""
+    """Assemble offline images and strict target-bound flash_plan.json for the selected profile."""
     if profile_id not in PROFILES:
         raise ValueError(f"Unknown profile {profile_id!r}; expected one of {list(PROFILES)}")
     profile = PROFILES[profile_id]
-    hw = inspect_backup_dir(backup_dir, out_dir / "hardware_facts.json")
+    hw = inspect_backup_dir(
+        backup_dir,
+        out_dir / "hardware_facts.json",
+        board_id=board_id,
+        usb_topology=usb_topology,
+    )
 
     stage3 = out_dir / "stage3"
     stage3.mkdir(parents=True, exist_ok=True)
@@ -360,10 +368,13 @@ def build_profile(
             }
 
     plan = {
+        "plan_version": 2,
         "profile": profile_id,
         "profile_name": profile["name"],
         "backup_dir": str(backup_dir),
         "out_dir": str(out_dir),
+        "device_identity": hw["device_identity"],
+        "allowed_operations_policy": PROFILE_ALLOWED_BROM_OPS[profile_id],
         "touches_slot_a": profile["touches_slot_a"],
         "touches_slot_b": profile["touches_slot_b"],
         "operations": ops,

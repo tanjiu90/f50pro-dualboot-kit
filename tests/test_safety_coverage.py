@@ -54,8 +54,14 @@ def test_flash_aborts_before_wof_on_readback_mismatch(synthetic_env: dict[str, P
 
     fake_sess = MagicMock()
     fake_sess.table.return_value = good_tbl
-    # Pre-check differs -> triggers write; post-write readback returns wrong bytes
-    fake_sess.read_part.side_effect = lambda part, sz, fname: b"\xff" * sz
+
+    def _dev_a_identity_then_corrupt(part: str, sz: int, fname: str) -> bytes:
+        if "_id_probe" in fname:
+            return (synthetic_env["backup_dir"] / part).read_bytes()[:sz]
+        return b"\xff" * sz
+
+    # Identity probes match Device A; pre-check differs -> triggers write; post-write readback returns wrong bytes
+    fake_sess.read_part.side_effect = _dev_a_identity_then_corrupt
     with patch("flash_images.resolve_tool", return_value=tmp_path / "spd_dump.exe"), patch(
         "flash_images._SpdSession", return_value=fake_sess
     ):
@@ -82,7 +88,14 @@ def test_flash_aborts_on_wof_verify_failure(synthetic_env: dict[str, Path], tmp_
 
     fake_sess = MagicMock()
     fake_sess.table.return_value = good_tbl
-    fake_sess.read_part.side_effect = [orig_misc, orig_misc]  # unchanged after wof!
+    misc_calls = iter([orig_misc, orig_misc])  # unchanged after wof!
+
+    def _dev_a_identity_then_wof(part: str, sz: int, fname: str) -> bytes:
+        if "_id_probe" in fname:
+            return (synthetic_env["backup_dir"] / part).read_bytes()[:sz]
+        return next(misc_calls)
+
+    fake_sess.read_part.side_effect = _dev_a_identity_then_wof
     with patch("flash_images.resolve_tool", return_value=tmp_path / "spd_dump.exe"), patch(
         "flash_images._SpdSession", return_value=fake_sess
     ):

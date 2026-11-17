@@ -13,6 +13,7 @@ from common import (
     TRUSTOS_AVB_SIG_OFFSET,
     TRUSTOS_AVB_SIG_ORIG,
     align_up,
+    build_backup_identity_record,
     decompress_lz4_legacy,
     parse_avb_footer,
     parse_boot_control,
@@ -199,8 +200,14 @@ def inspect_boot_banner(boot_bytes: bytes) -> dict[str, Any]:
     }
 
 
-def inspect_backup_dir(backup_dir: Path, out_path: Path | None = None) -> dict[str, Any]:
-    """Audit a BROM backup directory and confirm MU3356 F50 Pro compatibility."""
+def inspect_backup_dir(
+    backup_dir: Path,
+    out_path: Path | None = None,
+    *,
+    board_id: str | None = None,
+    usb_topology: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Audit a BROM backup directory and confirm MU3356 F50 Pro compatibility + non-PII device identity."""
     boot_info = inspect_boot_banner((backup_dir / "boot_a").read_bytes())
     vb_info = inspect_vendor_boot((backup_dir / "vendor_boot_a").read_bytes())
     ib_info = inspect_init_boot((backup_dir / "init_boot_a").read_bytes())
@@ -216,10 +223,25 @@ def inspect_backup_dir(backup_dir: Path, out_path: Path | None = None) -> dict[s
         p: not any((backup_dir / p).read_bytes()[:65536])
         for p in ("boot_b", "vendor_boot_b", "init_boot_b")
     }
+    firmware_build = {
+        "model": ib_info.get("model"),
+        "sdk": ib_info.get("sdk"),
+        "fingerprint": ib_info.get("fingerprint"),
+        "incremental": ib_info.get("incremental"),
+        "dtb_sha256": vb_info.get("dtb_sha256"),
+        "patch_code_offset": tos_info.get("patch_code_offset"),
+    }
+    identity = build_backup_identity_record(
+        backup_dir,
+        board_id=board_id,
+        usb_topology=usb_topology,
+        firmware_build=firmware_build,
+    )
 
     report = {
         "device_family": "ZTE F50 Pro (MU3356 / UMS9632)",
         "supported": True,
+        "device_identity": identity,
         "boot_a": boot_info,
         "vendor_boot_a": vb_info,
         "init_boot_a": ib_info,

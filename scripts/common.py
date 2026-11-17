@@ -125,6 +125,93 @@ SUPPORTED_BOARD_VARIANTS = {
     "6": "F50 Pro 插卡版 (board_id=6, 外置 Nano-SIM + 内置 eSIM 切换)",
 }
 
+# Read-only per-unit partitions hashed in-memory (NEVER exposed raw) to bind plans to one physical device.
+IDENTITY_PARTITIONS: tuple[str, ...] = ("miscdata", "prodnv", "persist")
+
+# Explicit per-profile operation/partition/offset/length allowlists complementing FORBIDDEN_PARTITIONS.
+_OPENWRT_SLOT_B_ALLOWLIST: dict[str, dict[str, Any]] = {
+    **{dst: {"op": "w", "offset": 0, "exact_size": None} for _, dst in BSP_SYNC_PAIRS_F50PRO},
+    "trustos_b": {"op": "w", "offset": 0, "exact_size": None},
+    "boot_b": {"op": "w", "offset": 0, "exact_size": None},
+    "vendor_boot_b": {"op": "w", "offset": 0, "exact_size": None},
+    "fulldumpdb": {"op": "w", "offset": 0, "exact_size": None},
+    "init_boot_b": {"op": "w_force", "offset": 0, "exact_size": None},
+    "misc": {"op": "wof", "offset": MISC_BC_OFFSET, "exact_size": 32},
+}
+
+PROFILE_ALLOWED_BROM_OPS: dict[str, dict[str, dict[str, Any]]] = {
+    "1-android-ufi": {
+        "trustos_a": {"op": "w", "offset": 0, "exact_size": None},
+        "init_boot_a": {"op": "w", "offset": 0, "exact_size": None},
+    },
+    "2-dual-stock-openwrt": dict(_OPENWRT_SLOT_B_ALLOWLIST),
+    "3-dual-full": dict(_OPENWRT_SLOT_B_ALLOWLIST),
+}
+
+PROFILE_ALLOWED_OPENWRT_STAGE_OPS: frozenset[str] = frozenset({"trustos_a", "init_boot_a"})
+
+
+def compute_unit_identity_digest(part_records: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Derive a one-way cryptographic unit fingerprint strictly from non-zero read-only partitions."""
+    sources = sorted(part_records.keys())
+    if not sources:
+        return {"identity_strength": "weak", "unit_identity_sources": [], "unit_identity_sha256": None, "partitions": {}}
+    canonical = "\n".join(
+        f"{p}:{part_records[p]['size_bytes']}:{part_records[p]['sha256']}" for p in sources
+    ).encode("utf-8")
+    return {
+        "identity_strength": "strong",
+        "unit_identity_sources": sources,
+        "unit_identity_sha256": sha256_bytes(canonical),
+        "partitions": part_records,
+    }
+
+
+def build_backup_identity_record(
+    backup_dir: Path,
+    *,
+    board_id: str | None = None,
+    usb_topology: dict[str, Any] | None = None,
+    firmware_build: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble non-PII target identity record combining hashed unit partitions, GPT, firmware build, board_id, and USB topology."""
+    part_records: dict[str, dict[str, Any]] = {}
+    for pname in IDENTITY_PARTITIONS:
+        p = backup_dir / pname
+        if not p.is_file():
+            continue
+        raw = p.read_bytes()
+        if raw and any(raw):
+            part_records[pname] = {"size_bytes": len(raw), "sha256": sha256_bytes(raw)}
+
+    unit_id = compute_unit_identity_digest(part_records)
+    xml_path = backup_dir / "partition_list.xml"
+    sums_path = backup_dir / "SHA256SUMS.txt"
+
+    fw_hashes: dict[str, str] = {}
+    for fw_part in ("trustos_a", "vendor_boot_a", "init_boot_a", "boot_a"):
+        fp = backup_dir / fw_part
+        if fp.is_file():
+            fw_hashes[f"{fw_part}_sha256"] = sha256_file(fp)
+
+    combined_fw = dict(firmware_build or {})
+    combined_fw.update(fw_hashes)
+
+    return {
+        "identity_version": 2,
+        "identity_strength": unit_id["identity_strength"],
+        "unit_identity_sources": unit_id["unit_identity_sources"],
+        "unit_identity_sha256": unit_id["unit_identity_sha256"],
+        "unit_identity_partitions": unit_id["partitions"],
+        "gpt_sha256": sha256_file(xml_path) if xml_path.is_file() else None,
+        "backup_manifest_sha256": sha256_file(sums_path) if sums_path.is_file() else None,
+        "backup_source": str(backup_dir.resolve()),
+        "board_id": board_id,
+        "usb_topology": usb_topology,
+        "firmware_build": combined_fw,
+        "pii_policy": "one_way_sha256_only_no_raw_imei_sn_nv",
+    }
+
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()

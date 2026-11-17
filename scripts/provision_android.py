@@ -13,6 +13,7 @@ from typing import Any
 from common import (
     ASSETS_DIR,
     DEFAULT_TOOLS_DIR,
+    PROFILE_ALLOWED_OPENWRT_STAGE_OPS,
     REPO_ROOT,
     read_json,
     resolve_tool,
@@ -99,6 +100,8 @@ def apply_slot_a_from_openwrt(
         sftp = ssh.open_sftp()
         results: dict[str, Any] = {}
         for part in ("trustos_a", "init_boot_a"):
+            if part not in PROFILE_ALLOWED_OPENWRT_STAGE_OPS or part not in stage:
+                raise ValueError(f"Disallowed or missing stage partition: {part}")
             spec = stage[part]
             payload = Path(spec["file"]).read_bytes()
             if sha256_bytes(payload) != spec["sha256"]:
