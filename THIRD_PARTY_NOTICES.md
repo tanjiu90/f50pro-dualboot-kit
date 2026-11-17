@@ -8,7 +8,7 @@ This repository provides original orchestration scripts, offline patch builders,
 4. **UFI-TOOLS (`4.0.0` `com.minikano.f50_sms`)** — bundled binary APK from upstream `zte-f50pro-macos-toolkit`.
 5. **`luci-app-openclash` (`0.48.002`)** — GPL-3.0 (`https://github.com/vernesong/OpenClash`).
 6. **Mihomo Core (`v1.19.34` linux-arm64)** — GPL-3.0 (`https://github.com/MetaCubeX/mihomo`).
-7. **`spd_dump` (`spd_dump_251` / `spreadtrum_flash`)** — GPL-2.0 (`https://github.com/ilyakurdyukov/spreadtrum_flash`, `TomKing062/spreadtrum_flash` commit `607f701` compiled via Android NDK for `--usb-fd`, `TomKing062/action_spd_dump_it` Linux musl `e49d4de` & Win64 builds, and Universal macOS `spd_dump_mac` from `zte-f50pro-macos-toolkit`).
+7. **`spd_dump` (`spd_dump_251` / `spreadtrum_flash`)** — GPL-2.0 (`https://github.com/ilyakurdyukov/spreadtrum_flash`; open-source `TomKing062/spreadtrum_flash` commit `607f701` compiled from source via CI for macOS 11.0+ Universal `arm64+x86_64` and Android NDK `--usb-fd`, plus `TomKing062/action_spd_dump_it` Linux musl `e49d4de` & Win64 builds).
 8. **Android SDK Platform Tools (`adb`, `fastboot`, `sqlite3`, `mke2fs`)** — Google official `37.0.1` (`win32`, `linux`, `darwin` Universal) under Apache-2.0 / Android SDK License (`https://developer.android.com/tools/releases/platform-tools`).
 9. **GeoSite / Country MMDB** — upstream GeoIP/GeoSite data bundles (clean database files only, zero proxy nodes or subscriptions).
 

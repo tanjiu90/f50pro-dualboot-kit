@@ -65,10 +65,10 @@ List packs + direct URLs without downloading: `python3 scripts/kit.py fetch-asse
 | Pack Key | Release Archive | Size | Needed By | SHA-256 (first 12) |
 | :--- | :--- | :---: | :--- | :--- |
 | `host_tools_win64` | `f50pro-host-tools-win64.zip` | 25.61 MiB | Windows x64 hosts | `ebcdb45807eb` |
-| `host_tools_linux_x64` | `f50pro-host-tools-linux-x64.tar.gz` | 6.33 MiB | Linux `x86_64` hosts | `125896e9b703` |
-| `host_tools_linux_arm64` | `f50pro-host-tools-linux-arm64.tar.gz` | 0.75 MiB | Linux `aarch64` hosts | `f7f81184d1af` |
-| `host_tools_macos` | `f50pro-host-tools-macos-universal.tar.gz` | 10.23 MiB | macOS M1–M4 & Intel hosts | `659d0f307ef5` |
-| `host_tools_android_arm64` | `f50pro-host-tools-android-arm64.tar.gz` | 1.30 MiB | Android Termux OTG hosts | `e5f4f16426ac` |
+| `host_tools_linux_x64` | `f50pro-host-tools-linux-x64.tar.gz` | 6.33 MiB | Linux `x86_64` hosts | `191f86bb8784` |
+| `host_tools_linux_arm64` | `f50pro-host-tools-linux-arm64.tar.gz` | 0.75 MiB | Linux `aarch64` hosts | `61af85e98990` |
+| `host_tools_macos` | `f50pro-host-tools-macos-universal.tar.gz` | 11.18 MiB | macOS M1–M4 & Intel hosts | `f7cfe8a5dc02` |
+| `host_tools_android_arm64` | `f50pro-host-tools-android-arm64.tar.gz` | 1.30 MiB | Android Termux OTG hosts | `b3a8ae891a73` |
 | `openwrt_base` | `f50pro-base-openwrt-25.12.5-pack.tar.xz` | 24.86 MiB | Profiles `2`, `3` | `ebd302a22b35` |
 | `android_pkgs` | `f50pro-android-pkgs-pack.zip` | 30.29 MiB | Profiles `1`, `3` | `242f09e3911f` |
 | `openclash_offline` | `f50pro-openclash-offline-25.12.5-arm64.tar.gz` | 35.78 MiB | Optional (`--openclash`) | `c1b0a739aafe` |

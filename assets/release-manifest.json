@@ -65,7 +65,7 @@
     "host_tools_linux_x64": {
       "filename": "f50pro-host-tools-linux-x64.tar.gz",
       "bytes": 6635958,
-      "sha256": "125896e9b703bc19f20fafd2cf2318417dcd5f15b641ea72df3c6656e0f965a0",
+      "sha256": "191f86bb8784b26077595475933c59777afca4688b5e93ee47abeb2b0ae575dd",
       "platforms": [
         "linux-x64"
       ],
@@ -74,7 +74,7 @@
     "host_tools_linux_arm64": {
       "filename": "f50pro-host-tools-linux-arm64.tar.gz",
       "bytes": 789910,
-      "sha256": "f7f81184d1af3834b6ecac7c1ec966dd79592afd3baeb897fad564367844bffb",
+      "sha256": "61af85e989909f47febf0f207736b1c879a0fa799365ddf54539f80c104be7f7",
       "platforms": [
         "linux-arm64"
       ],
@@ -82,8 +82,8 @@
     },
     "host_tools_macos": {
       "filename": "f50pro-host-tools-macos-universal.tar.gz",
-      "bytes": 10725269,
-      "sha256": "659d0f307ef5d066a9e992fb9aa1042c009073fd4e33cb712638648fb68b126e",
+      "bytes": 11720172,
+      "sha256": "f7cfe8a5dc020567e1e3a7716e5fc1e6aec0f16f30baca4a4c530063fbe7fc82",
       "platforms": [
         "macos"
       ],
@@ -92,7 +92,7 @@
     "host_tools_android_arm64": {
       "filename": "f50pro-host-tools-android-arm64.tar.gz",
       "bytes": 1368075,
-      "sha256": "e5f4f16426ac19eee32fbebbb2850952606046a5b0516c3f8a91a6f408eddb83",
+      "sha256": "b3a8ae891a7372bdee03526df8273e91d4773efd1005c9da8edd43b560fbcbbe",
       "platforms": [
         "android-arm64"
       ],
