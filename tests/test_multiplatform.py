@@ -207,7 +207,7 @@ def test_wireless_adb_connect_for_nonroot_termux(tmp_path: Path) -> None:
             return subprocess.CompletedProcess(cmd, 0, stdout="_a\n", stderr="")
         if "sys.boot_completed" in cmd:
             return subprocess.CompletedProcess(cmd, 0, stdout="1\n", stderr="")
-        if "id -u" in cmd:
+        if any("id -u" in str(part) for part in cmd):
             return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 

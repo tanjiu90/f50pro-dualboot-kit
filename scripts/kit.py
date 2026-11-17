@@ -424,6 +424,8 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
             wifi_password=args.wifi_password,
             root_password=args.root_password,
             generate_password=args.generate_password,
+            zonename=getattr(args, "zonename", "Asia/Shanghai"),
+            timezone=getattr(args, "timezone", "CST-8"),
             tools_dir=args.tools_dir,
             cache_dir=args.cache_dir,
             include_openclash=args.openclash,
@@ -578,6 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ow.add_argument("--usb-net-mode", default="auto", choices=["auto", *sorted(VALID_USB_NET_MODES)])
     p_ow.add_argument("--usb-net-persist", action="store_true")
     p_ow.add_argument("--target-iface")
+    p_ow.add_argument("--zonename", default="Asia/Shanghai")
+    p_ow.add_argument("--timezone", default="CST-8")
 
     p_an = sub.add_parser("provision-android", help="Provision Magisk + UFI-TOOLS on Android _a")
     p_an.add_argument("--plan", type=Path, required=True)
@@ -623,6 +627,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_au.add_argument("--usb-net-mode", default="auto", choices=["auto", *sorted(VALID_USB_NET_MODES)])
     p_au.add_argument("--usb-net-persist", action="store_true")
     p_au.add_argument("--target-iface")
+    p_au.add_argument("--zonename", default="Asia/Shanghai")
+    p_au.add_argument("--timezone", default="CST-8")
     p_au.add_argument("--authorize-device-reboot", action="store_true")
     p_au.add_argument("--local-release-dir", type=Path)
     p_au.add_argument("--execute", action="store_true")
@@ -728,6 +734,8 @@ def main(argv: list[str] | None = None) -> int:
             wifi_password=args.wifi_password,
             root_password=args.root_password,
             generate_password=args.generate_password,
+            zonename=getattr(args, "zonename", "Asia/Shanghai"),
+            timezone=getattr(args, "timezone", "CST-8"),
             tools_dir=args.tools_dir,
             cache_dir=args.cache_dir,
             include_openclash=args.openclash,

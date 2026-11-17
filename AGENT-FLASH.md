@@ -22,7 +22,7 @@ Pin an explicit Release tag (or verified commit SHA) — never pull mutable `mai
 
 - **Windows PC**:
   ```powershell
-  git clone --branch v1.1.1-rc.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.1-rc.3 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   .\scripts\bootstrap.ps1 -Profile <PROFILE_ID>  # add -SkipOpenClash if unused
   .\.venv\Scripts\python.exe -m pytest -v
@@ -30,7 +30,7 @@ Pin an explicit Release tag (or verified commit SHA) — never pull mutable `mai
   ```
 - **Linux (`x86_64` / `arm64`) / macOS (`Universal`) / Android Termux (`arm64`)**:
   ```bash
-  git clone --branch v1.1.1-rc.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.1-rc.3 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   bash scripts/bootstrap.sh --profile <PROFILE_ID>  # add --no-openclash if unused
   .venv/bin/python -m pytest -v

@@ -1272,3 +1272,460 @@ def test_multi_transport_reboot_and_delayed_webui_retry(
     ):
         r_adb = brom_backup.trigger_online_reboot_once(tools_dir=tools)
     assert r_adb["method"] == "adb_reboot"
+
+
+def test_open_remote_fs_fallback_on_dropbear_eof_and_busybox_patch(tmp_path: Path) -> None:
+    """Verify open_remote_fs falls back to stdin/stdout base64 when Dropbear lacks sftp-server, and BusyBox patch works."""
+    import base64
+    import io
+    import posixpath
+    import shlex as _shlex
+
+    from common import ASSETS_DIR, sha256_bytes
+    from provision_openwrt import (
+        BOARD6_AFTER_SHA256,
+        BOARD6_BEFORE_SHA256,
+        SshBase64FS,
+        _ensure_board6_card_patch,
+        open_remote_fs,
+        sftp_get_bytes,
+        sftp_put_bytes,
+    )
+
+    # 1. Native SFTP works untouched when supported
+    ssh_native = MagicMock()
+    native_sftp = MagicMock()
+    ssh_native.open_sftp.return_value = native_sftp
+    assert open_remote_fs(ssh_native) is native_sftp
+
+    # 2. Dropbear EOF during negotiation triggers SshBase64FS seamlessly
+    remote_files: dict[str, bytes] = {}
+    remote_modes: dict[str, int] = {}
+    exec_cmds: list[str] = []
+
+    class _MemChan:
+        def __init__(self, rc: int = 0) -> None:
+            self._rc = rc
+            self.shutdown_called = False
+
+        def shutdown_write(self) -> None:
+            self.shutdown_called = True
+
+        def recv_exit_status(self) -> int:
+            return self._rc
+
+    class _MemStdin:
+        def __init__(self, chan: _MemChan, target_path: str) -> None:
+            self.channel = chan
+            self._buf: list[str] = []
+            self._path = target_path
+
+        def write(self, data: str | bytes) -> int:
+            s = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else data
+            self._buf.append(s)
+            return len(s)
+
+        def flush(self) -> None:
+            raw_b64 = "".join(self._buf).encode("ascii")
+            remote_files[self._path] = base64.b64decode(raw_b64)
+
+    class _FakeDropbearSSH:
+        def open_sftp(self):
+            raise EOFError("EOF during negotiation")
+
+        def exec_command(self, cmd: str, timeout: float = 60.0, get_pty: bool = False):
+            exec_cmds.append(cmd)
+            chan = _MemChan(0)
+            if "base64 -d > " in cmd:
+                dst = _shlex.split(cmd.split("base64 -d > ", 1)[1])[0]
+                st = io.BytesIO(b"")
+                st.channel = chan  # type: ignore[attr-defined]
+                er = io.BytesIO(b"")
+                er.channel = chan  # type: ignore[attr-defined]
+                return _MemStdin(chan, dst), st, er
+            if ": > " in cmd:
+                dst = _shlex.split(cmd.split(": > ", 1)[1])[0]
+                remote_files[dst] = b""
+                st = io.BytesIO(b"")
+                st.channel = chan  # type: ignore[attr-defined]
+                er = io.BytesIO(b"")
+                er.channel = chan  # type: ignore[attr-defined]
+                return io.BytesIO(b""), st, er
+            if cmd.startswith("base64 "):
+                src = _shlex.split(cmd[len("base64 ") :])[0]
+                if src not in remote_files:
+                    err_ch = _MemChan(1)
+                    st = io.BytesIO(b"")
+                    st.channel = err_ch  # type: ignore[attr-defined]
+                    er = io.BytesIO(b"No such file")
+                    er.channel = err_ch  # type: ignore[attr-defined]
+                    return io.BytesIO(b""), st, er
+                encoded = base64.encodebytes(remote_files[src])
+                st = io.BytesIO(encoded)
+                st.channel = chan  # type: ignore[attr-defined]
+                er = io.BytesIO(b"")
+                er.channel = chan  # type: ignore[attr-defined]
+                return io.BytesIO(b""), st, er
+            if cmd.startswith("chmod "):
+                parts = _shlex.split(cmd)
+                remote_modes[parts[2]] = int(parts[1], 8)
+            elif cmd.startswith("mv -f "):
+                parts = _shlex.split(cmd)
+                remote_files[parts[3]] = remote_files.pop(parts[2])
+                if parts[2] in remote_modes:
+                    remote_modes[parts[3]] = remote_modes.pop(parts[2])
+            st = io.BytesIO(b"")
+            st.channel = chan  # type: ignore[attr-defined]
+            er = io.BytesIO(b"")
+            er.channel = chan  # type: ignore[attr-defined]
+            return io.BytesIO(b""), st, er
+
+    fake_ssh = _FakeDropbearSSH()
+    fs = open_remote_fs(fake_ssh)
+    assert isinstance(fs, SshBase64FS)
+
+    # Multi-chunk (>49KB b64) binary roundtrip + empty file + missing file error
+    payload = (b"\x00\xffABcd1234" * 7000) + b"\xde\xad\xbe\xef"
+    sftp_put_bytes(fs, payload, "/etc/openclash/core/clash_meta", mode=0o755)
+    assert sftp_get_bytes(fs, "/etc/openclash/core/clash_meta") == payload
+    assert remote_modes["/etc/openclash/core/clash_meta"] == 0o755
+
+    sftp_put_bytes(fs, b"", "/tmp/empty.flag", mode=0o644)
+    assert sftp_get_bytes(fs, "/tmp/empty.flag") == b""
+
+    with pytest.raises(FileNotFoundError):
+        sftp_get_bytes(fs, "/tmp/does-not-exist")
+
+    # 3. _ensure_board6_card_patch must use BusyBox-compatible `cd / && patch -p1 -N -i ...`
+    fake_card = MagicMock()
+    patch_cmds: list[str] = []
+    reads = iter([
+        b"X" * 100,  # placeholder unused when sha256 mocked; verify command only below
+    ])
+    card_sha_seq = iter([BOARD6_BEFORE_SHA256, BOARD6_AFTER_SHA256])
+
+    def _patch_ssh_run(client, cmd, *, check=True, timeout=60.0):
+        patch_cmds.append(cmd)
+        return 0, "", ""
+
+    with (
+        patch("provision_openwrt.sftp_get_bytes", return_value=b"card"),
+        patch("provision_openwrt.sha256_bytes", side_effect=lambda _: next(card_sha_seq)),
+        patch("provision_openwrt.sftp_put_bytes") as mock_put,
+        patch("provision_openwrt.ssh_run", side_effect=_patch_ssh_run),
+    ):
+        new_sha = _ensure_board6_card_patch(fake_ssh, fs)
+    assert new_sha == BOARD6_AFTER_SHA256
+    assert len(patch_cmds) == 1
+    assert patch_cmds[0] == "cd / && patch -p1 -N -i /tmp/f50pro-board6.patch && rm -f /tmp/f50pro-board6.patch"
+    for bad_flag in ("--batch", "--forward", "--fuzz", " -d "):
+        assert bad_flag not in patch_cmds[0]
+    assert posixpath.basename(mock_put.call_args.args[2]) == "f50pro-board6.patch"
+
+
+def test_win10_broken_ncm_serial_recovery_and_detached_usb_switch(tmp_path: Path) -> None:
+    """Verify Win10 CDC-NCM Error recovers via MI_02 COM port, leaves working NCM untouched, and detaches setsid switch."""
+    import sys
+    import types
+
+    from provision_openwrt import (
+        _apply_usb_net_mode_transition,
+        _extract_win_broken_ncm_com_port,
+        _recover_broken_ncm_via_serial,
+        resolve_host_usb_net_plan,
+        wait_for_openwrt_ssh,
+    )
+
+    # 1. Pure PnP classifier
+    assert _extract_win_broken_ncm_com_port([
+        {"InstanceId": r"USB\VID_1D6B&PID_0104&MI_00\7&1", "Status": "Error", "Class": "Net", "FriendlyName": "CDC NCM"},
+        {"InstanceId": r"USB\VID_1D6B&PID_0104&MI_02\7&1", "Status": "OK", "Class": "Ports", "FriendlyName": "USB 串行设备 (COM7)"},
+        {"InstanceId": r"USB\VID_10C4&PID_EA60\0001", "Status": "OK", "Class": "Ports", "FriendlyName": "CP210x (COM3)"},
+    ]) == "COM7"
+    assert _extract_win_broken_ncm_com_port([
+        {"InstanceId": r"USB\VID_1D6B&PID_0104&MI_00\7&1", "Status": "OK", "Class": "Net", "FriendlyName": "Microsoft UsbNcm"},
+        {"InstanceId": r"USB\VID_1D6B&PID_0104&MI_02\7&1", "Status": "OK", "Class": "Ports", "FriendlyName": "USB 串行设备 (COM7)"},
+    ]) is None
+    assert _extract_win_broken_ncm_com_port([
+        {"InstanceId": r"USB\VID_10C4&PID_EA60\0001", "Status": "Error", "Class": "Ports", "FriendlyName": "Other (COM3)"},
+    ]) is None
+
+    # 2. _recover_broken_ncm_via_serial verifies f50pro, commits _b, sets permanent rndis, and detaches u30pro-usb restart
+    written_cmds: list[str] = []
+
+    class _FakeSerial:
+        def __init__(self, port: str, **kwargs) -> None:
+            self.port = port
+            self._rx = bytearray()
+            self.closed = False
+
+        @property
+        def in_waiting(self) -> int:
+            return len(self._rx)
+
+        def reset_input_buffer(self) -> None:
+            self._rx.clear()
+
+        def write(self, data: bytes) -> int:
+            txt = data.decode("utf-8", "replace")
+            written_cmds.append(txt)
+            if txt == "\r\n" and not self._rx:
+                self._rx.extend(b"Please press Enter to activate this console.\r\n")
+            elif txt == "\r\n":
+                self._rx.extend(b"\r\nroot@OpenWrt:/# ")
+            elif "cat /etc/mu300/model" in txt:
+                tag = txt.split("echo ")[1].split("_B;")[0]
+                self._rx.extend(f"echo {tag}_B; cat ...\r\n{tag}_B\r\nf50pro\r\n{tag}_E:0\r\n".encode("utf-8"))
+            elif "_B;" in txt:
+                tag = txt.split("echo ")[1].split("_B;")[0]
+                self._rx.extend(f"{tag}_B\r\nOK\r\n{tag}_E:0\r\n".encode("utf-8"))
+            return len(data)
+
+        def read(self, n: int = 1) -> bytes:
+            out = bytes(self._rx[:n])
+            del self._rx[:n]
+            return out
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_serial_mod = types.SimpleNamespace(Serial=_FakeSerial)
+    with patch.dict(sys.modules, {"serial": fake_serial_mod}), patch("provision_openwrt.time.sleep"):
+        rec = _recover_broken_ncm_via_serial("COM7")
+    assert rec == {"recovered": True, "com_port": "COM7", "target_mode": "rndis"}
+    joined = "".join(written_cmds)
+    assert "/opt/mu300/bin/mu300-next-boot linux" in joined
+    assert "/usr/libexec/unisoc-modem/device-usb set-net rndis permanent 1" in joined
+    assert "setsid sh -c 'sleep 0.5; /usr/sbin/u30pro-usb stop; sleep 1; /usr/sbin/u30pro-usb start rndis'" in joined
+
+    # Non-f50pro serial banner must abort before running any mutation command
+    bad_cmds: list[str] = []
+
+    class _WrongSerial(_FakeSerial):
+        def write(self, data: bytes) -> int:
+            txt = data.decode("utf-8", "replace")
+            bad_cmds.append(txt)
+            if "cat /etc/mu300/model" in txt:
+                tag = txt.split("echo ")[1].split("_B;")[0]
+                self._rx.extend(f"{tag}_B\r\nother-router\r\n{tag}_E:0\r\n".encode("utf-8"))
+                return len(data)
+            return super().write(data)
+
+    with (
+        patch.dict(sys.modules, {"serial": types.SimpleNamespace(Serial=_WrongSerial)}),
+        patch("provision_openwrt.time.sleep"),
+        pytest.raises(RuntimeError, match="did not identify as f50pro"),
+    ):
+        _recover_broken_ncm_via_serial("COM9")
+    assert not any("device-usb" in c or "mu300-next-boot" in c for c in bad_cmds)
+
+    # 3. wait_for_openwrt_ssh triggers serial recovery on win64 after grace window, NEVER on linux
+    ssh_ok = MagicMock()
+    mono_vals = iter([0.0, 0.1, 6.0, 6.5, 7.0, 8.0])
+    conn_calls = {"n": 0}
+
+    def _conn_after_recover(*a, **k):
+        conn_calls["n"] += 1
+        if conn_calls["n"] == 1:
+            raise OSError("NCM unreachable before serial recovery")
+        return ssh_ok
+
+    with (
+        patch("provision_openwrt.detect_host_platform", return_value="win64"),
+        patch("provision_openwrt._prepare_host_rndis", return_value={}),
+        patch("provision_openwrt.connect_ssh", side_effect=_conn_after_recover),
+        patch("provision_openwrt.ssh_run", return_value=(0, "f50pro\n", "")),
+        patch("provision_openwrt._find_win_broken_ncm_serial_port", return_value="COM7") as mock_find,
+        patch("provision_openwrt._recover_broken_ncm_via_serial", return_value={"recovered": True}) as mock_rec,
+        patch("provision_openwrt.time.monotonic", side_effect=lambda: next(mono_vals, 9.0)),
+        patch("provision_openwrt.time.sleep"),
+    ):
+        assert wait_for_openwrt_ssh("192.168.77.1", timeout=30) is ssh_ok
+    mock_find.assert_called_once()
+    mock_rec.assert_called_once_with("COM7", passwords=("", "root"))
+
+    # Linux never triggers Win10 serial recovery
+    mono_linux = iter([0.0, 0.1, 10.0, 50.0])
+    with (
+        patch("provision_openwrt.detect_host_platform", return_value="linux-x64"),
+        patch("provision_openwrt.connect_ssh", side_effect=OSError("still booting")),
+        patch("provision_openwrt._find_win_broken_ncm_serial_port", side_effect=AssertionError("Must not probe Win PnP on Linux")),
+        patch("provision_openwrt.time.monotonic", side_effect=lambda: next(mono_linux, 99.0)),
+        patch("provision_openwrt.time.sleep"),
+        pytest.raises(TimeoutError),
+    ):
+        wait_for_openwrt_ssh("192.168.77.1", timeout=20, isolate_host=False)
+
+    # 4. _apply_usb_net_mode_transition attaches detached setsid u30pro-usb stop/start when switching live gadget
+    sw_cmds: list[str] = []
+    ssh_pre = MagicMock()
+    ssh_post = MagicMock()
+
+    def _sw_ssh(client, cmd, *, check=True, timeout=60.0):
+        sw_cmds.append(cmd)
+        if "board_id=" in cmd:
+            return 0, "board_id=1\nusb_mode=rndis\nhost_hash=unit_b15\n", ""
+        return 0, "", ""
+
+    plan_sw = resolve_host_usb_net_plan(
+        host_platform="win64",
+        current_mode="ncm",
+        requested_mode="rndis",
+        persist_mode=True,
+    )
+    with (
+        patch("provision_openwrt.ssh_run", side_effect=_sw_ssh),
+        patch("provision_openwrt.wait_for_openwrt_ssh", return_value=ssh_post),
+        patch("provision_openwrt.time.sleep"),
+    ):
+        _, meta_sw = _apply_usb_net_mode_transition(
+            ssh_pre,
+            plan=plan_sw,
+            pre_identity={"board_id": "1", "usb_mode": "ncm", "host_hash": "unit_b15"},
+            openwrt_host="192.168.77.1",
+            pw_candidates=("",),
+            isolate_host=False,
+            target_iface=None,
+            usb_topology=None,
+            out_dir=tmp_path,
+        )
+    assert meta_sw["reconnected"] is True
+    assert any(
+        "device-usb set-net 'rndis' permanent 1" in c
+        and "setsid sh -c" in c
+        and "/usr/sbin/u30pro-usb stop" in c
+        and '/usr/sbin/u30pro-usb start "$1"' in c
+        for c in sw_cmds
+    )
+
+
+def test_provision_openwrt_early_next_boot_timezone_and_pty_passwd_fallback(
+    synthetic_env: dict[str, Path], tmp_path: Path
+) -> None:
+    """Verify mu300-next-boot linux runs immediately on connect, timezone is configurable, and passwd has PTY fallback."""
+    from common import build_trial_bcab
+    from provision_openwrt import _set_root_password_ssh, provision_openwrt
+
+    tools = synthetic_env["tools_dir"]
+    misc_orig = (synthetic_env["backup_dir"] / "misc").read_bytes()[2048:2080]
+    bcab_b = build_trial_bcab(misc_orig, "b", tries=6)
+    ssh = MagicMock()
+    ssh.open_sftp.return_value = MagicMock()
+    executed: list[str] = []
+
+    def _order_ssh(client, cmd, *, check=True, timeout=60.0):
+        executed.append(cmd)
+        if "board_id=" in cmd:
+            return 0, "board_id=1\nusb_mode=rndis\nhost_hash=h1\n", ""
+        if "f50pro-rootfs-grow.py" in cmd:
+            return 0, json.dumps({"filesystem_bytes": 2147483648}), ""
+        return 0, "", ""
+
+    with (
+        patch("provision_openwrt.detect_host_platform", return_value="win64"),
+        patch("provision_openwrt.wait_for_openwrt_ssh", return_value=ssh),
+        patch("provision_openwrt.ssh_run", side_effect=_order_ssh),
+        patch("provision_openwrt._ensure_board6_card_patch", return_value="card_sha"),
+        patch("provision_openwrt._ensure_capacity_ui", return_value={"ui": "ok"}),
+        patch("provision_openwrt._ensure_5s_buttons", return_value={"long_action": "system-switch"}),
+        patch("provision_openwrt.sftp_get_bytes", return_value=bcab_b),
+    ):
+        res = provision_openwrt(
+            profile_id="3-dual-full",
+            zonename="Asia/Singapore",
+            timezone="SGT-8",
+            root_password="SgpPassword99",
+            tools_dir=tools,
+            out_dir=tmp_path / "ow_sg",
+            reboot_after=False,
+        )
+    idx_next_boot = next(i for i, c in enumerate(executed) if "/opt/mu300/bin/mu300-next-boot linux" in c)
+    idx_grow = next(i for i, c in enumerate(executed) if "f50pro-rootfs-grow.py" in c)
+    assert idx_next_boot < idx_grow
+    assert res["zonename"] == "Asia/Singapore"
+    assert res["timezone"] == "SGT-8"
+    assert any("zonename='Asia/Singapore'" in c and "timezone='SGT-8'" in c for c in executed)
+
+    # _set_root_password_ssh falls back to get_pty=True when pipe passwd fails
+    pty_calls: list[tuple[str, bool]] = []
+    ssh_pty = MagicMock()
+    stdin_m = MagicMock()
+    stdout_m = MagicMock()
+    stderr_m = MagicMock()
+    stdout_m.channel.recv_exit_status.return_value = 0
+
+    def _exec_pty(cmd, timeout=30.0, get_pty=False):
+        pty_calls.append((cmd, get_pty))
+        return stdin_m, stdout_m, stderr_m
+
+    ssh_pty.exec_command.side_effect = _exec_pty
+    with (
+        patch("provision_openwrt.ssh_run", side_effect=RuntimeError("pipe rejected")),
+        patch("provision_openwrt.time.sleep"),
+    ):
+        _set_root_password_ssh(ssh_pty, "StrongPass!1")
+    assert pty_calls == [("passwd root", True)]
+    assert [c.args[0] for c in stdin_m.write.call_args_list] == ["StrongPass!1\n", "StrongPass!1\n"]
+
+
+def test_android_su_path_quoting_and_ufi_daemon_first_boot_order(tmp_path: Path) -> None:
+    """Verify /debug_ramdisk/su discovery + POSIX quote preservation in provision_android & verify_e2e, and UFI extract order."""
+    import shlex as _shlex
+
+    from common import ASSETS_DIR
+    from provision_android import _su, resolve_android_su_bin
+    from verify_e2e import _probe_android
+
+    adb_cmds: list[list[str]] = []
+    sql_script = (
+        '/data/adb/magisk/magisk --sqlite '
+        '"INSERT OR REPLACE INTO policies (uid,policy,until,logging,notification) VALUES (2000,2,0,1,1);"'
+    )
+
+    def _fake_adb(cmd, **kwargs):
+        adb_cmds.append(cmd)
+        cmd_str = " ".join(cmd)
+        if "/debug_ramdisk/su" in cmd_str and "command -v su" in cmd_str:
+            return subprocess.CompletedProcess(cmd, 0, stdout="/debug_ramdisk/su\n", stderr="")
+        if "get-state" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="device\n", stderr="")
+        if "ro.boot.slot_suffix" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="_a\n", stderr="")
+        if "sys.boot_completed" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="1\n", stderr="")
+        if "persist.sys.usb.config" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="charging,adb\n", stderr="")
+        if "id -u" in cmd_str:
+            return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+        if "ss -tln" in cmd_str:
+            return subprocess.CompletedProcess(cmd, 0, stdout="LISTEN 0 128 *:2333 *:*\nLISTEN 0 128 *:1146 *:*\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with (
+        patch("provision_android.subprocess.run", side_effect=_fake_adb),
+        patch("verify_e2e.subprocess.run", side_effect=_fake_adb),
+    ):
+        assert resolve_android_su_bin(tmp_path / "adb", serial="ser1") == "/debug_ramdisk/su"
+        _su(tmp_path / "adb", sql_script, serial="ser1")
+        su_exec_cmd = adb_cmds[-1]
+        assert su_exec_cmd[:4] == [str(tmp_path / "adb"), "-s", "ser1", "shell"]
+        # Exact single shell payload decodes back to ['/debug_ramdisk/su', '-c', exact sql_script] without losing double quotes
+        assert _shlex.split(su_exec_cmd[4]) == ["/debug_ramdisk/su", "-c", sql_script]
+
+        probe_res = _probe_android(tmp_path / "adb", serial="ser1")
+    assert probe_res["su_id"] == "0"
+    assert ":2333" in probe_res["ports"] and ":1146" in probe_res["ports"]
+    probe_shell_args = [c[-1] for c in adb_cmds if c[-1].startswith("/debug_ramdisk/su -c ")]
+    assert len(probe_shell_args) >= 3
+
+    # Verify ufi-tools-daemon.sh.tpl wakes MainActivity/WebService and waits for extracted binaries BEFORE starting ttyd
+    tpl = (ASSETS_DIR / "android-scripts" / "ufi-tools-daemon.sh.tpl").read_text(encoding="utf-8")
+    idx_wake = tpl.index("com.minikano.f50_sms/.MainActivity")
+    idx_check_ttyd = tpl.index('[ -x "$FILES_DIR/ttyd" ]')
+    idx_start_socat = tpl.index('setsid "$FILES_DIR/socat"')
+    idx_start_ttyd = tpl.index('"$FILES_DIR/ttyd" --writable --port 1146')
+    assert idx_check_ttyd < idx_wake < idx_start_socat < idx_start_ttyd
+    assert 'grep -q ":1146 "' in tpl

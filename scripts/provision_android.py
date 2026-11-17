@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ from common import (
 )
 from host_network import isolate_usb_rndis_adapter
 from provision_openwrt import (
+    open_remote_fs,
     sftp_put_bytes,
     ssh_run,
     wait_for_openwrt_ssh,
@@ -50,8 +52,21 @@ def _adb(adb_exe: Path, args: list[str], *, serial: str | None = None, check: bo
     return res.stdout.strip()
 
 
+def resolve_android_su_bin(adb_exe: Path, *, serial: str | None = None) -> str:
+    """Locate Magisk/KernelSU su binary on Android even when omitted from default ADB PATH."""
+    probe = (
+        "if [ -x /debug_ramdisk/su ]; then echo /debug_ramdisk/su; "
+        "elif [ -x /sbin/su ]; then echo /sbin/su; "
+        "else command -v su 2>/dev/null || echo su; fi"
+    )
+    out = _adb(adb_exe, ["shell", probe], serial=serial, check=False, timeout=10.0)
+    cand = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    return cand if cand else "su"
+
+
 def _su(adb_exe: Path, script: str, *, serial: str | None = None, check: bool = True, timeout: float = 60.0) -> str:
-    return _adb(adb_exe, ["shell", "su", "-c", script], serial=serial, check=check, timeout=timeout)
+    su_bin = resolve_android_su_bin(adb_exe, serial=serial)
+    return _adb(adb_exe, ["shell", f"{su_bin} -c {shlex.quote(script)}"], serial=serial, check=check, timeout=timeout)
 
 
 def wait_for_adb_slot_a(adb_exe: Path, *, timeout: int = 150, serial: str | None = None) -> str:
@@ -105,7 +120,7 @@ def apply_slot_a_from_openwrt(
     )
     ssh = wait_for_openwrt_ssh(ctx.host, passwords=ctx.candidate_passwords(), isolate_host=isolate_host)
     try:
-        sftp = ssh.open_sftp()
+        sftp = open_remote_fs(ssh)
         results: dict[str, Any] = {}
         for part in ("trustos_a", "init_boot_a"):
             if part not in PROFILE_ALLOWED_OPENWRT_STAGE_OPS or part not in stage:
@@ -272,7 +287,7 @@ def provision_android(
         wait_for_adb_slot_a(adb_exe, timeout=180, serial=serial)
 
         ports_ok = False
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             ss_out = _su(adb_exe, "ss -tln", serial=serial, check=False)
             if ":2333 " in ss_out and ":1146 " in ss_out:

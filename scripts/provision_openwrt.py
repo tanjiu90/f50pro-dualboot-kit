@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import posixpath
 import re
 import secrets
 import string
+import subprocess
 import tarfile
 import time
 from pathlib import Path
@@ -23,6 +25,7 @@ from common import (
     parse_boot_control,
     read_json,
     sha256_bytes,
+    win_no_window_kwargs,
     write_json,
 )
 from host_network import (
@@ -113,6 +116,111 @@ def sftp_get_bytes(sftp, remote_path: str) -> bytes:
         return f.read()
 
 
+class _SshBase64WriteFile:
+    """Writable file-like buffer that streams base64 over SSH stdin to BusyBox base64 -d."""
+
+    def __init__(self, ssh, remote_path: str) -> None:
+        self._ssh = ssh
+        self._remote_path = remote_path
+        self._buf = io.BytesIO()
+        self.closed = False
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        return self._buf.write(data)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        raw = self._buf.getvalue()
+        parent = posixpath.dirname(self._remote_path) or "/"
+        q_parent = _shq(parent)
+        q_path = _shq(self._remote_path)
+        if not raw:
+            ssh_run(self._ssh, f"mkdir -p {q_parent} && : > {q_path}")
+            return
+        timeout = max(120.0, len(raw) / 50000.0 + 30.0)
+        stdin, stdout, stderr = self._ssh.exec_command(
+            f"mkdir -p {q_parent} && base64 -d > {q_path}",
+            timeout=timeout,
+        )
+        b64 = base64.b64encode(raw).decode("ascii")
+        # Stream wrapped base64 chunks via stdin so multi-MB uploads never hit ARG_MAX or line limits.
+        for off in range(0, len(b64), 49152):
+            stdin.write(b64[off : off + 49152] + "\n")
+        stdin.flush()
+        if getattr(stdin, "channel", None) is not None:
+            stdin.channel.shutdown_write()
+        raw_out = stdout.read()
+        raw_err = stderr.read()
+        out = raw_out.decode("utf-8", "replace") if isinstance(raw_out, (bytes, bytearray)) else str(raw_out)
+        err = raw_err.decode("utf-8", "replace") if isinstance(raw_err, (bytes, bytearray)) else str(raw_err)
+        rc = stdout.channel.recv_exit_status()
+        if rc != 0:
+            raise RuntimeError(
+                f"SSH base64 upload failed rc={rc} path={self._remote_path}: stdout={out} stderr={err}"
+            )
+
+    def __enter__(self) -> "_SshBase64WriteFile":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self.closed = True
+
+
+class SshBase64FS:
+    """Duck-typed SFTP fallback over SSH stdin/stdout base64 when Dropbear lacks sftp-server."""
+
+    def __init__(self, ssh) -> None:
+        self._ssh = ssh
+
+    def open(self, remote_path: str, mode: str = "rb"):
+        if "w" in mode:
+            return _SshBase64WriteFile(self._ssh, remote_path)
+        _, stdout, stderr = self._ssh.exec_command(
+            f"base64 {_shq(remote_path)}",
+            timeout=120.0,
+        )
+        raw_out = stdout.read()
+        raw_err = stderr.read()
+        rc = stdout.channel.recv_exit_status()
+        if rc != 0:
+            err_s = raw_err.decode("utf-8", "replace") if isinstance(raw_err, (bytes, bytearray)) else str(raw_err)
+            raise FileNotFoundError(f"Remote read failed rc={rc} ({remote_path}): {err_s.strip()}")
+        b64_bytes = raw_out if isinstance(raw_out, (bytes, bytearray)) else str(raw_out).encode("ascii", "ignore")
+        return io.BytesIO(base64.b64decode(b64_bytes))
+
+    def chmod(self, remote_path: str, mode: int) -> None:
+        ssh_run(self._ssh, f"chmod {mode & 0o777:03o} {_shq(remote_path)}")
+
+    def posix_rename(self, src_path: str, dst_path: str) -> None:
+        ssh_run(self._ssh, f"mv -f {_shq(src_path)} {_shq(dst_path)}")
+
+    def close(self) -> None:
+        pass
+
+
+def open_remote_fs(ssh):
+    """Return native SFTP client or fall back to SshBase64FS when Dropbear rejects SFTP subsystem."""
+    try:
+        return ssh.open_sftp()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if (
+            isinstance(exc, EOFError)
+            or exc.__class__.__name__ in ("SSHException", "ChannelException")
+            or any(tok in msg for tok in ("eof", "negotiation", "subsystem", "sftp"))
+        ):
+            return SshBase64FS(ssh)
+        raise
+
+
 def _shq(val: str) -> str:
     return "'" + val.replace("'", "'\\''") + "'"
 
@@ -183,6 +291,166 @@ def _prepare_host_rndis(
     return res
 
 
+def _extract_win_broken_ncm_com_port(
+    pnp_devices: list[dict[str, Any]],
+    *,
+    usb_topology: dict[str, Any] | None = None,
+) -> str | None:
+    """Detect Windows broken U30PRO CDC NCM + working MI_02 COM port without hijacking healthy NICs."""
+    target_devs = [
+        d for d in pnp_devices
+        if "VID_1D6B&PID_0104" in str(d.get("InstanceId", "")).upper()
+    ]
+    if not target_devs:
+        return None
+    if usb_topology and usb_topology.get("serial"):
+        tok = str(usb_topology["serial"]).strip().upper()
+        filtered = [d for d in target_devs if tok in str(d.get("InstanceId", "")).upper()]
+        if filtered:
+            target_devs = filtered
+
+    if any(
+        str(d.get("Class", "")).lower() == "net" and str(d.get("Status", "")).lower() == "ok"
+        for d in target_devs
+    ):
+        return None
+
+    has_broken_ncm = any(
+        str(d.get("Status", "")).lower() != "ok"
+        and (
+            str(d.get("Class", "")).lower() == "net"
+            or "MI_00" in str(d.get("InstanceId", "")).upper()
+            or "NCM" in str(d.get("FriendlyName", "")).upper()
+        )
+        for d in target_devs
+    )
+    if not has_broken_ncm:
+        return None
+
+    for d in target_devs:
+        inst = str(d.get("InstanceId", "")).upper()
+        cls = str(d.get("Class", "")).lower()
+        status = str(d.get("Status", "")).lower()
+        name = str(d.get("FriendlyName", ""))
+        if status == "ok" and (cls == "ports" or "COM" in name.upper()) and "MI_02" in inst:
+            m = re.search(r"\((COM\d+)\)", name, re.IGNORECASE)
+            if m:
+                return m.group(1).upper()
+    return None
+
+
+def _find_win_broken_ncm_serial_port(*, usb_topology: dict[str, Any] | None = None) -> str | None:
+    """Query Windows PnP once for a broken VID_1D6B&PID_0104 CDC NCM interface paired with MI_02 COM port."""
+    if detect_host_platform() != "win64":
+        return None
+    ps_cmd = (
+        "@(Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'USB\\VID_1D6B&PID_0104*' } | "
+        "Select-Object InstanceId,Status,Class,FriendlyName) | ConvertTo-Json -Compress"
+    )
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            **win_no_window_kwargs(),
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return None
+        parsed = json.loads(res.stdout.strip())
+        devs = [parsed] if isinstance(parsed, dict) else list(parsed)
+    except Exception:
+        return None
+    return _extract_win_broken_ncm_com_port(devs, usb_topology=usb_topology)
+
+
+def _recover_broken_ncm_via_serial(
+    com_port: str,
+    *,
+    passwords: tuple[str, ...] = ("", "root"),
+) -> dict[str, Any]:
+    """Switch broken Win10 CDC NCM device to RNDIS over MI_02 serial console and commit _b boot."""
+    import serial  # type: ignore
+
+    ser = serial.Serial(com_port, baudrate=115200, timeout=0.4, write_timeout=2.0)
+    try:
+        def _read_for(dur: float) -> str:
+            end = time.monotonic() + dur
+            chunks: list[str] = []
+            while time.monotonic() < end:
+                n = ser.in_waiting
+                data = ser.read(n if n > 0 else 1)
+                if data:
+                    chunks.append(data.decode("utf-8", "replace"))
+                else:
+                    time.sleep(0.05)
+            return "".join(chunks)
+
+        ser.reset_input_buffer()
+        ser.write(b"\r\n")
+        ser.flush()
+        banner = _read_for(1.2)
+        if "press enter to activate" in banner.lower():
+            ser.write(b"\r\n")
+            ser.flush()
+            banner += _read_for(0.8)
+        if "login:" in banner.lower():
+            for pw in passwords:
+                ser.write(b"root\r\n")
+                ser.flush()
+                resp = _read_for(0.8)
+                if "password:" in resp.lower():
+                    ser.write((pw + "\r\n").encode("utf-8"))
+                    ser.flush()
+                    resp += _read_for(0.8)
+                if "#" in resp or "root@" in resp:
+                    break
+
+        def _exec(cmd: str, wait_sec: float = 3.0) -> str:
+            tag = f"__F50SER_{secrets.token_hex(4)}__"
+            ser.reset_input_buffer()
+            ser.write(f"echo {tag}_B; {cmd}; echo {tag}_E:$?\r\n".encode("utf-8"))
+            ser.flush()
+            end = time.monotonic() + wait_sec
+            buf = ""
+            while time.monotonic() < end:
+                n = ser.in_waiting
+                data = ser.read(n if n > 0 else 1)
+                if data:
+                    buf += data.decode("utf-8", "replace")
+                    if re.search(rf"{tag}_E:\d+", buf):
+                        break
+                else:
+                    time.sleep(0.05)
+            m_body = re.search(rf"{tag}_B\s*(.*?)\s*{tag}_E:\d+", buf, re.DOTALL)
+            return m_body.group(1) if m_body else buf
+
+        model_out = _exec("cat /etc/mu300/model 2>/dev/null || echo unknown", wait_sec=2.5)
+        if not any(ln.strip() == "f50pro" for ln in model_out.splitlines()):
+            raise RuntimeError(f"Serial port {com_port} did not identify as f50pro: {model_out!r}")
+
+        _exec("/opt/mu300/bin/mu300-next-boot linux", wait_sec=3.0)
+        _exec(
+            "uci set u30pro.usb=usb && uci set u30pro.usb.mode=rndis && uci commit u30pro && "
+            "/usr/libexec/unisoc-modem/device-usb set-net rndis permanent 1",
+            wait_sec=4.0,
+        )
+        ser.write(
+            b"setsid sh -c 'sleep 0.5; /usr/sbin/u30pro-usb stop; sleep 1; /usr/sbin/u30pro-usb start rndis' "
+            b"</dev/null >/dev/null 2>&1 &\r\n"
+        )
+        ser.flush()
+        time.sleep(0.5)
+        return {"recovered": True, "com_port": com_port, "target_mode": "rndis"}
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+
 def wait_for_openwrt_ssh(
     host: str = "192.168.77.1",
     *,
@@ -192,10 +460,13 @@ def wait_for_openwrt_ssh(
     static_ip: str = "192.168.77.12",
     target_iface: str | None = None,
     usb_topology: dict[str, Any] | None = None,
+    auto_recover_broken_ncm_serial: bool = True,
 ):
     """Poll until target F50 Pro USB interface is isolated and OpenWrt SSH responds cleanly."""
     deadline = time.monotonic() + timeout
+    first_poll_at = time.monotonic()
     iso_done = False
+    ncm_serial_attempted = False
     last_err: Exception | None = None
     while time.monotonic() < deadline:
         if isolate_host:
@@ -214,6 +485,21 @@ def wait_for_openwrt_ssh(
             ssh.close()
         except Exception as exc:
             last_err = exc
+        if (
+            auto_recover_broken_ncm_serial
+            and not ncm_serial_attempted
+            and detect_host_platform() == "win64"
+            and (time.monotonic() - first_poll_at) >= 5.0
+        ):
+            com_port = _find_win_broken_ncm_serial_port(usb_topology=usb_topology)
+            if com_port:
+                ncm_serial_attempted = True
+                try:
+                    _recover_broken_ncm_via_serial(com_port, passwords=passwords)
+                    time.sleep(4.0)
+                    continue
+                except Exception as exc_ser:
+                    last_err = exc_ser
         time.sleep(2.5)
     raise TimeoutError(f"Timed out waiting for OpenWrt SSH at {host}: {last_err}")
 
@@ -239,7 +525,7 @@ def _ensure_board6_card_patch(ssh, sftp) -> str:
         raise ValueError(f"Unexpected {remote_card} SHA-256: {cur_sha}")
     patch_bytes = (ASSETS_DIR / "openwrt-patch" / "f50pro-board6.patch").read_bytes().replace(b"\r\n", b"\n")
     sftp_put_bytes(sftp, patch_bytes, "/tmp/f50pro-board6.patch", mode=0o644)
-    ssh_run(ssh, "patch --batch --forward --fuzz=0 -p1 -d / -i /tmp/f50pro-board6.patch && rm -f /tmp/f50pro-board6.patch")
+    ssh_run(ssh, "cd / && patch -p1 -N -i /tmp/f50pro-board6.patch && rm -f /tmp/f50pro-board6.patch")
     new_sha = sha256_bytes(sftp_get_bytes(sftp, remote_card))
     if new_sha != BOARD6_AFTER_SHA256:
         raise RuntimeError(f"board_id=6 patch digest mismatch: {new_sha}")
@@ -429,13 +715,18 @@ def _apply_usb_net_mode_transition(
     if out_dir is not None:
         write_json(out_dir / "usb_net_transition.json", intent)
 
-    try:
-        ssh_run(
-            ssh,
-            f"uci set u30pro.usb=usb && uci set u30pro.usb.mode={_shq(target_mode)} && uci commit u30pro && "
-            f"/usr/libexec/unisoc-modem/device-usb set-net {_shq(target_mode)} {scope} 1 >/dev/null",
-            timeout=25,
+    cfg_cmd = (
+        f"uci set u30pro.usb=usb && uci set u30pro.usb.mode={_shq(target_mode)} && uci commit u30pro && "
+        f"/usr/libexec/unisoc-modem/device-usb set-net {_shq(target_mode)} {scope} 1 >/dev/null"
+    )
+    if plan["expected_disconnect"]:
+        # device-usb set-net updates persistent/once config only; detach gadget restart so SSH tears down cleanly.
+        cfg_cmd += (
+            f" && setsid sh -c 'sleep 0.5; /usr/sbin/u30pro-usb stop; sleep 1; "
+            f"/usr/sbin/u30pro-usb start \"$1\"' _ {_shq(target_mode)} </dev/null >/dev/null 2>&1 &"
         )
+    try:
+        ssh_run(ssh, cfg_cmd, timeout=25)
     except (EOFError, OSError, RuntimeError):
         # USB gadget mode switch tears down CDC-NCM/ECM/RNDIS immediately; disconnect is expected, NOT flash failure!
         intent["expected_disconnect_observed"] = True
@@ -492,6 +783,32 @@ def _apply_usb_net_mode_transition(
     return ssh2, intent
 
 
+def _set_root_password_ssh(ssh, applied_pw: str) -> None:
+    """Set OpenWrt root password reliably with interactive PTY fallback for picky BusyBox/Dropbear builds."""
+    cmd = f"printf '%s\\n%s\\n' {_shq(applied_pw)} {_shq(applied_pw)} | passwd root >/dev/null"
+    try:
+        ssh_run(ssh, cmd, check=True, timeout=30.0)
+    except Exception as exc:
+        exec_fn = getattr(ssh, "exec_command", None)
+        if not callable(exec_fn):
+            raise
+        stdin, stdout, stderr = exec_fn("passwd root", timeout=30.0, get_pty=True)
+        stdin.write(f"{applied_pw}\n")
+        stdin.flush()
+        time.sleep(0.3)
+        stdin.write(f"{applied_pw}\n")
+        stdin.flush()
+        if getattr(stdin, "channel", None) is not None:
+            stdin.channel.shutdown_write()
+        rc = stdout.channel.recv_exit_status()
+        if rc != 0:
+            raw_out = stdout.read()
+            raw_err = stderr.read()
+            raise RuntimeError(
+                f"passwd root PTY fallback failed rc={rc}: out={raw_out!r} err={raw_err!r}"
+            ) from exc
+
+
 def provision_openwrt(
     *,
     profile_id: str,
@@ -500,6 +817,8 @@ def provision_openwrt(
     wifi_password: str | None = None,
     root_password: str | None = None,
     generate_password: bool = False,
+    zonename: str = "Asia/Shanghai",
+    timezone: str = "CST-8",
     usb_net_mode: str = "auto",
     usb_net_persist: bool = False,
     target_iface: str | None = None,
@@ -542,7 +861,10 @@ def provision_openwrt(
             persist_mode=usb_net_persist,
         )
 
-        sftp = ssh.open_sftp()
+        # Commit permanent boot to OpenWrt _b immediately so misc tries=3 trial budget cannot roll back mid-run.
+        ssh_run(ssh, "/opt/mu300/bin/mu300-next-boot linux")
+
+        sftp = open_remote_fs(ssh)
         grow_res = _ensure_rootfs_grown(ssh, sftp)
         board6_sha = _ensure_board6_card_patch(ssh, sftp)
         ui_res = _ensure_capacity_ui(sftp)
@@ -550,8 +872,8 @@ def provision_openwrt(
 
         cmds = [
             "uci set system.@system[0].hostname='F50Pro'",
-            "uci set system.@system[0].zonename='Asia/Shanghai'",
-            "uci set system.@system[0].timezone='CST-8'",
+            f"uci set system.@system[0].zonename={_shq(zonename)}",
+            f"uci set system.@system[0].timezone={_shq(timezone)}",
             "uci set unisoc_modem.main.at_port='/dev/stty_nr2'",
             "uci set unisoc_modem.main.sim_slots='2'",
             "uci set unisoc_modem.main.platform_defaults='u30pro'",
@@ -595,17 +917,17 @@ def provision_openwrt(
                 usb_topology=usb_topology,
                 out_dir=out_dir,
             )
-            sftp = ssh.open_sftp()
+            sftp = open_remote_fs(ssh)
 
         oc_res = None
         if include_openclash:
             oc_res = _install_openclash_offline(ssh, sftp, cache_dir=cache_dir, tools_dir=tools_dir)
 
         if applied_pw:
-            ssh_run(ssh, f"printf '%s\\n%s\\n' {_shq(applied_pw)} {_shq(applied_pw)} | passwd root >/dev/null", check=True)
+            _set_root_password_ssh(ssh, applied_pw)
             pw_candidates = (applied_pw,)
 
-        # Commit permanent boot to OpenWrt _b and snapshot exact verified BCAB block
+        # Confirm permanent boot to OpenWrt _b and snapshot exact verified BCAB block
         ssh_run(ssh, "/opt/mu300/bin/mu300-next-boot linux")
         ssh_run(ssh, "dd if=/dev/block/by-name/misc bs=1 skip=2048 count=32 of=/tmp/known-good-b-bcab.bin 2>/dev/null")
         bc_bytes = sftp_get_bytes(sftp, "/tmp/known-good-b-bcab.bin")
@@ -651,6 +973,8 @@ def provision_openwrt(
         "buttons": btn_res,
         "wifi_ssid": wifi_ssid,
         "wifi_device": "phy0-ap0",
+        "zonename": zonename,
+        "timezone": timezone,
         "install_usb_net_mode": usb_plan["install_usb_net_mode"],
         "final_usb_net_mode": usb_plan["final_usb_net_mode"],
         "usb_mode": usb_plan["final_usb_net_mode"],
@@ -674,6 +998,8 @@ def main() -> int:
     parser.add_argument("--wifi-password")
     parser.add_argument("--root-password")
     parser.add_argument("--generate-password", action="store_true")
+    parser.add_argument("--zonename", default="Asia/Shanghai")
+    parser.add_argument("--timezone", default="CST-8")
     parser.add_argument("--usb-net-mode", default="auto", choices=list(VALID_USB_NET_MODES))
     parser.add_argument("--usb-net-persist", action="store_true", help="Persist USB net mode switch across reboots")
     parser.add_argument("--target-iface", help="Explicit USB network interface/service name to isolate")
@@ -695,6 +1021,8 @@ def main() -> int:
         wifi_password=args.wifi_password,
         root_password=args.root_password,
         generate_password=args.generate_password,
+        zonename=args.zonename,
+        timezone=args.timezone,
         usb_net_mode=args.usb_net_mode,
         usb_net_persist=args.usb_net_persist,
         target_iface=args.target_iface,

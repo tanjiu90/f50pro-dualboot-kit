@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import urllib.request
 from pathlib import Path
@@ -20,6 +21,7 @@ from common import (
     write_json,
 )
 from host_network import audit_default_routes
+from provision_android import resolve_android_su_bin
 from provision_openwrt import connect_ssh, ssh_run
 
 
@@ -142,12 +144,15 @@ def _probe_android(adb_exe: Path | None, *, serial: str | None = None) -> dict[s
         return {"reachable": False, "slot_suffix": "UNKNOWN", "active_os": "UNKNOWN"}
 
     info: dict[str, Any] = {"reachable": True, "active_os": "android"}
+    su_bin = resolve_android_su_bin(adb_exe, serial=serial)
+    q_id = shlex.quote("id -u")
+    q_ports = shlex.quote("ss -tln | grep -E ':(2333|1146) ' || true")
     for key, args in (
         ("slot_suffix", ["shell", "getprop", "ro.boot.slot_suffix"]),
         ("boot_completed", ["shell", "getprop", "sys.boot_completed"]),
         ("usb_config", ["shell", "getprop", "persist.sys.usb.config"]),
-        ("su_id", ["shell", "su", "-c", "id -u"]),
-        ("ports", ["shell", "su", "-c", "ss -tln | grep -E ':(2333|1146) ' || true"]),
+        ("su_id", ["shell", f"{su_bin} -c {q_id}"]),
+        ("ports", ["shell", f"{su_bin} -c {q_ports}"]),
     ):
         r = subprocess.run(
             [*base, *args],

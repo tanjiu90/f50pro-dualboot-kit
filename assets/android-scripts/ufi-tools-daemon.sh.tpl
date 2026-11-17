@@ -62,20 +62,9 @@ for port in 2333 1146 5201 5555; do
     ip6tables -I INPUT 1 -i sipa+ -p tcp --dport "$port" -j DROP >/dev/null 2>&1 || true
 done
 
-if [ -x "$FILES_DIR/socat" ] && ! pgrep -f "$SOCK" >/dev/null 2>&1; then
-  rm -f "$SOCK"
-  setsid "$FILES_DIR/socat" -d UNIX-LISTEN:"$SOCK",fork,reuseaddr,unlink-early,mode=0666 EXEC:/system/bin/sh </dev/null >>/cache/ufi-tools-socat.log 2>&1 &
-  sleep 1
-fi
-[ -S "$SOCK" ] && chmod 0666 "$SOCK" >/dev/null 2>&1 || true
-
-if [ -x "$FILES_DIR/ttyd" ] && ! pgrep -f "ttyd --writable --port 1146" >/dev/null 2>&1; then
-  PATH="$FILES_DIR:$PATH" setsid "$FILES_DIR/ttyd" --writable --port 1146 "$FILES_DIR/login.sh" </dev/null >>/cache/ufi-tools-ttyd.log 2>&1 &
-fi
-
 k=0
-while [ "$k" -lt 4 ]; do
-  if ss -tln 2>/dev/null | grep -q ":2333 "; then
+while [ "$k" -lt 8 ]; do
+  if ss -tln 2>/dev/null | grep -q ":2333 " && [ -x "$FILES_DIR/socat" ] && [ -x "$FILES_DIR/ttyd" ]; then
     break
   fi
   am start -n com.minikano.f50_sms/.MainActivity >/dev/null 2>&1 || true
@@ -87,6 +76,25 @@ while [ "$k" -lt 4 ]; do
   fi
   k=$((k + 1))
 done
+
+if [ -x "$FILES_DIR/socat" ] && ! pgrep -f "$SOCK" >/dev/null 2>&1; then
+  rm -f "$SOCK"
+  setsid "$FILES_DIR/socat" -d UNIX-LISTEN:"$SOCK",fork,reuseaddr,unlink-early,mode=0666 EXEC:/system/bin/sh </dev/null >>/cache/ufi-tools-socat.log 2>&1 &
+  sleep 1
+fi
+[ -S "$SOCK" ] && chmod 0666 "$SOCK" >/dev/null 2>&1 || true
+
+if [ -x "$FILES_DIR/ttyd" ] && ! pgrep -f "ttyd --writable --port 1146" >/dev/null 2>&1; then
+  PATH="$FILES_DIR:$PATH" setsid "$FILES_DIR/ttyd" --writable --port 1146 "$FILES_DIR/login.sh" </dev/null >>/cache/ufi-tools-ttyd.log 2>&1 &
+  t=0
+  while [ "$t" -lt 10 ]; do
+    if ss -tln 2>/dev/null | grep -q ":1146 "; then
+      break
+    fi
+    sleep 1
+    t=$((t + 1))
+  done
+fi
 
 sleep 5
 if [ "$(getprop persist.sys.usb.config)" = "charging,adb" ] && [ "$(getprop sys.usb.state)" != "charging,adb" ]; then
