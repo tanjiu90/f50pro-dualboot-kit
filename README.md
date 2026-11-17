@@ -17,19 +17,22 @@ Designed for **one-click per-OS selective download & deployment** and **autonomo
 
 ---
 
-## Verification & Release Readiness Status (Honest Scope)
+## Verification & Release Readiness Status (Honest Scope: 4 Tiers Separated)
 
-| Scope | Status | Evidence / Limits |
-| :--- | :---: | :--- |
-| **Offline Python builder, safety guards & clean-room HTTPS bootstrap** | `VERIFIED` | Tested in fresh `.venv` (`46` `pytest` cases) + GitHub Actions multi-OS CI (`ubuntu-latest`, `macos-latest`, `windows-latest`) + read-only binary parity against `B15` stock backup. |
-| **Linux / macOS / Android Termux OTG host flashing (`v1.1.0`)** | `CI-VERIFIED` *(host CLI)* / `UNVERIFIED` *(live USB)* | Host binaries verified (`musl` v251 ELFs, `Universal Mach-O` `spd_dump`, Android NDK `spd_dump-termux-usb`, Google `platform-tools 37.0.1`), Linux/macOS CLI/route-parser unit-tested + CI tested. Live F50 Pro USB flashing from Linux/macOS/Android hosts has **not** yet been run on physical hardware; Non-root Android `--usb-fd` cannot auto-run `--kickto 2` reconnect (`EXPERIMENTAL`). |
-| **`B28` (`board_id=6`, Physical SIM) dual-boot architecture** | `VERIFIED` *(upstream)* / `UNVERIFIED` *(this CLI)* | Upstream predecessor project verified full `_a` + `_b` + `5G NR SA` + Wi-Fi 6 + OpenClash + physical `5s` button roundtrip on hardware. Refactored `kit.py` CLI has **not** yet been run end-to-end on physical hardware. |
-| **`B15` (`board_id=1`, Built-in Dual eSIM) dual-boot architecture** | `PARTIAL` *(upstream)* / `UNVERIFIED` *(this CLI)* | Upstream predecessor project flashed `_b` + Android `_a` Magisk + `UFI-TOOLS` + bidirectional roundtrip on `B15` (`final-roundtrip-verify.json`); however, OpenWrt cellular WAN remained disconnected during that snapshot (`wan.up=0`, `net_red=1`) and used a `B28`-built stage3 rootfs. |
-| **Profile `1-android-ufi` & `2-dual-stock-openwrt` isolated runs** | `UNVERIFIED` *(live)* | Plan builders, safety guardrails, and offline output verified via synthetic fixtures; not yet separately flashed end-to-end via `kit.py`. |
-| **`SPRD4:AutoD` backup & partition write/readback** | `VERIFIED` *(upstream)* | Requires healthy on-device **`SPL + U-Boot` (`autodloader`)**. Does **not** capture `splloader_bak` (`eMMC boot1`). |
-| **Bare-metal `SPRD3` BootROM unbrick when `SPL` / `U-Boot` fails** | `BLOCKED` / `NOT INCLUDED` | If active `uboot` or `splloader` fails verification (`SPL 0x4e` halt without auto-fallback), `SPRD4:AutoD` disappears; this kit bundles **no** signed `UMS9632` `FDL1`/`FDL2` (`0x65008000`/`0xbdfffe00`) and **no** factory `.pac`. |
+> **Important integrity notice**: [assets/release-manifest.json](assets/release-manifest.json) verifies **SHA-256 file integrity** against this repository's manifest, **not** cryptographic publisher signatures (GPG / Cosign / GitHub Attestation). Clone/download using an **explicit Release tag or commit SHA** (not mutable `main`), and follow the immutable draft -> upload -> verify -> release flow. Note: `v1.1.0` tag/assets are frozen; P0 safety fixes target **`v1.1.1-rc.1`** on branch `fix/p0-safety-remediation`.
 
-See the full [Release Quality Audit Report](docs/RELEASE_QUALITY_AUDIT_v1.0.0.md).
+| Scope | Compilation / Packaging | Host CLI / Unit & Fault Tests | Live USB Comm | End-to-End Hardware | Notes / Explicit Limits |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **Pure-Python builder & P0 safety guards (`fix/p0-safety-remediation`)** | `PASS` | `PASS` (`52` pytest fault + unit tests) | `N/A` *(offline)* | `N/A` *(offline)* | Offline `plan` / `auto` dry-run perform zero downloads, zero WebUI reboots, zero BROM/SSH/ADB calls; failure injects stop before `reset`/`wof` and persist `flash_state.json`. |
+| **Windows x64 host toolkit (`v1.1.0` + P0)** | `PASS` | `PASS` (`win32` + CI `windows-latest`) | `PASS` *(upstream WinUSB)* | **`B28` VERIFIED *(upstream)*** / `UNVERIFIED` *(this CLI)* | Upstream `B28` verified full `_a`+`_b`+`5G NR SA`+Wi-Fi 6+OpenClash+5s roundtrip; refactored `kit.py` CLI awaiting authorized pilot. |
+| **`B15` (`board_id=1`, Built-in Dual eSIM)** | `PASS` *(image build parity)* | `PASS` *(DTB & offset fixture)* | `PASS` *(upstream dump)* | `PARTIAL` *(dual-boot roundtrip verified upstream)* | Upstream installed & roundtrip-switched `_b <-> _a`; **paid eSIM cellular WAN intentionally NOT tested per user decision (non-blocker)**. |
+| **Linux `x86_64` host** | `PASS` | `PASS` (CI `ubuntu-latest`) | `UNVERIFIED` *(live USB)* | `UNVERIFIED` | CI verifies `bootstrap.sh`, `preflight --strict`, offline `plan`, `spd_dump -h`, and `adb version`; physical USB flash/NCM isolation awaits live run. |
+| **macOS Universal (`arm64` + `x86_64`)** | `PASS` (`Mach-O` + CI `macos-latest`) | `PASS` (CI `macos-latest`) | `UNVERIFIED` *(live USB)* | `UNVERIFIED` | Requires `sudo` / `--spd-mode sudo` for raw `libusb`; `Hardware Port` / `Device` / `Network Service` correlation covered by unit tests. |
+| **Linux `aarch64` (`arm64`) host** | `PASS` (`musl` binary) | **`NOT CI-TESTED`** *(unit parsers only)* | `UNVERIFIED` | `UNVERIFIED` | No native `ubuntu-arm64` runner in CI matrix; relies on distro `android-tools-adb`. |
+| **Android Termux OTG (`arm64`)** | `PASS` (`spd_dump-su`, `spd_dump-termux-usb`) | `PARTIAL` *(CLI argv tests only)* | `UNVERIFIED` | `UNVERIFIED` | **Root (`--spd-mode su`)**: full `--kickto 2`. **Non-Root (`--usb-fd`)**: single-grant FD does not survive reset/re-enumeration (`EXPERIMENTAL`, not turnkey closed-loop). |
+| **`SPRD4:AutoD` vs Bare-Metal `SPRD3` unbrick** | `N/A` | `PASS` *(guard test)* | `VERIFIED` *(upstream `AutoD`)* | **`BLOCKED` on `SPL`/`U-Boot` loss** | Requires intact **`SPL + U-Boot` (`autodloader`)**; bundles **no** signed `UMS9632` `FDL1`/`FDL2` (`0x65008000`/`0xbdfffe00`) or `.pac`; `r all` omits `splloader_bak`. |
+
+See [docs/P0_REMEDIATION_REPORT_v1.1.1-rc.1.md](docs/P0_REMEDIATION_REPORT_v1.1.1-rc.1.md) and [docs/RELEASE_QUALITY_AUDIT_v1.0.0.md](docs/RELEASE_QUALITY_AUDIT_v1.0.0.md).
 
 ---
 
@@ -77,39 +80,41 @@ List packs + direct URLs without downloading: `python3 scripts/kit.py fetch-asse
 
 ## One-Click Deployment
 
-### 1. Bootstrap Python `.venv`, Dependencies & Selected Packs
+### 1. Pinned Clone, Python `.venv`, Dependencies & Selected Packs
 
 ```powershell
-# Windows: auto-selects host_tools_win64 (use -Interactive to customize packs)
-git clone https://github.com/tanjiu90/f50pro-dualboot-kit.git
+# Windows: pin an explicit tag (e.g. v1.1.0) or verified commit SHA, never unpinned main in production
+git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 .\scripts\bootstrap.ps1
 ```
 
 ```bash
-# Linux / macOS / Android Termux: auto-detects OS/arch, or pass --interactive / --platform / --profile
-git clone https://github.com/tanjiu90/f50pro-dualboot-kit.git
+# Linux / macOS / Android Termux: pin tag/SHA, then auto-detect OS/arch or pass --interactive / --profile
+git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 bash scripts/bootstrap.sh --interactive
 ```
 
-This creates `.venv`, installs `paramiko`, `pyserial`, and `pytest`, downloads & SHA-256-verifies your chosen `v1.1.0` packs against [assets/release-manifest.json](assets/release-manifest.json), and generates your local `~/.android/adbkey.pub` if absent.
+This creates `.venv`, installs `paramiko`, `pyserial`, and `pytest`, downloads & SHA-256-verifies your chosen Release packs against [assets/release-manifest.json](assets/release-manifest.json) *(integrity checksum only; not a cryptographic signature)*, and generates your local `~/.android/adbkey.pub` if absent.
 
-### 2. Preflight & Turnkey Workflow
+### 2. Strict Preflight, Read-Only Probe, Explicit Backup & Offline Plan Boundaries
 
 ```bash
-# Check tools, Python modules, ADB pubkey, and host routes (read-only)
-.venv/bin/python scripts/kit.py preflight   # Windows: .\.venv\Scripts\python.exe scripts\kit.py preflight
+# 1. Host tools + modules strict preflight (zero device contact; exits non-zero if missing)
+.venv/bin/python scripts/kit.py preflight --strict --operation backup
 
-# Safe dry-run up through BROM backup, variant inspection, image build, and flash_plan.json
-.venv/bin/python scripts/kit.py auto \
-  --profile 3-dual-full \
-  --work-dir build/my-device \
-  --webui-password "<YOUR_WEBUI_PASSWORD>" \
-  --generate-password \
-  --openclash
+# 2. Read-only non-reboot online probe (SSH/ADB/LuCI/route audit; never triggers REBOOT_DEVICE)
+.venv/bin/python scripts/kit.py probe --profile 3-dual-full --root-password "<PW>"
 
-# Review build/my-device/build/flash_plan.json, then execute flash + provision + E2E verify:
+# 3. Capture BROM backup (requires explicit --authorize-device-reboot because AutoD resets device)
+.venv/bin/python scripts/kit.py backup --output-dir build/my-device/backup --authorize-device-reboot --webui-password "<YOUR_WEBUI_PASSWORD>"
+
+# 4. 100% Offline Plan & Dry-Run (ZERO HTTP downloads, ZERO WebUI reboot, ZERO flash/NIC writes)
+.venv/bin/python scripts/kit.py plan --profile 3-dual-full --work-dir build/my-device --openclash
+# (Equivalent: running `kit.py auto --profile 3-dual-full --work-dir build/my-device` without `--execute`)
+
+# 5. Inspect flash_plan.json (bound to device cryptographic identity & allowlist), then execute with explicit authorization:
 .venv/bin/python scripts/kit.py auto \
   --profile 3-dual-full \
   --work-dir build/my-device \
@@ -120,7 +125,7 @@ This creates `.venv`, installs `paramiko`, `pyserial`, and `pytest`, downloads &
   --execute
 ```
 
-> On macOS (or Linux without udev rules), pass `--spd-mode sudo` or run `sudo .venv/bin/python ...`. On Rooted Android Termux pass `--spd-mode su`. Use `--profile 1-android-ufi` or `--profile 2-dual-stock-openwrt` to deploy the other two configurations (and `fetch-assets --profile ...` automatically skips unneeded bundles!).
+> On macOS (or Linux without `udev` rules), pass `--spd-mode sudo` (use `assets/udev/99-unisoc-f50pro.rules` on Linux for non-root USB access instead of running Python as root). By default `provision-openwrt` preserves working USB modes (`ncm`/`ecm`/`rndis`); pass `--usb-net-mode rndis` (and optional `--usb-net-persist`) only when needed. On Rooted Android Termux pass `--spd-mode su`. Use `--profile 1-android-ufi` or `--profile 2-dual-stock-openwrt` to deploy the other two configurations (`fetch-assets --profile ...` skips unneeded bundles).
 
 ---
 
@@ -139,8 +144,8 @@ Run preflight + bootstrap + full BROM backup + inspect first, then build Profile
 
 1. **Zero WSL Dependency**: Both Magisk `init_boot_a` packing (`CRC32` XZ + LZ4 legacy + AVB footer relocation) and own-device `trustos` derivation run in pure Python on Windows.
 2. **Per-Device Cryptographic Derivation**: Never flashes foreign bootloader binaries or generic `trustos` dumps; `trustos_noavb.img` is derived dynamically from the target device's own `sml_a` + `trustos_a` backup, and `vendor_boot_b` keeps the target device's exact stock DTB SHA-256.
-3. **Immutable Factory Calibration Guards**: `FORBIDDEN_PARTITIONS` blocks writes to `splloader`, `prodnv`, `calinv`, `ztecfg`, `ztepersist`, `persist`, `miscdata`, `super`, `userdata`, and modem NV/calibration partitions.
-4. **Windows Host Cellular Hijack Prevention**: `host_network.py` isolates both `UsbNcm` (initial boot default of base ext4 rootfs) and `RNDIS` (`1D6B:0104`) interfaces to static `192.168.77.12/24`, strips default gateways/DNS/IPv6, and audits the Windows routing table so your host PC stays connected via its primary internet adapter.
+3. **Immutable Factory Calibration & Target Identity Guards**: `FORBIDDEN_PARTITIONS` + per-profile operation allowlists block writes outside approved partitions/ranges, and `flash_plan.json` binds via cryptographic SHA-256 digest of non-zero read-only device identity partitions (`prodnv`/`miscdata`) + GPT layout to prevent cross-unit mixups (never matching on generic USB VID/PID alone).
+4. **Scoped Host Network Isolation & Clean Failure Recovery**: `host_network.py` matches only verified F50 Pro USB interfaces (`1D6B:0104`, never phone USB tethering or USB-C docks), skips normal Wi-Fi gateways (`192.168.0.1`), saves/restores snapshots without clobbering manual configs, and `flash_images.py` stops on write/readback/GPT failure without auto-rebooting or switching slots (`flash_state.json`).
 5. **Clean Configs & Prebuilt Binary Scope**: Optional OpenClash pack contains only signed `.apk`s, `mihomo`, GeoIP databases, and a neutral `proxies: []` [template.yaml](assets/openwrt-patch/openclash-clean/template.yaml) with **zero personal subscriptions or proxy nodes**. Release `v1.0.0` `openwrt-base` rootfs bundles prebuilt `aic8800` Wi-Fi firmware / modem XMLs from reference `B28` extracts and `android-pkgs` bundles upstream `UFI-TOOLS.apk` (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)); Git commits contain zero binary images, IMEIs, NV data, passwords, or device backups.
 
 ---
@@ -148,6 +153,7 @@ Run preflight + bootstrap + full BROM backup + inspect first, then build Profile
 ## Documentation Index
 
 - [AGENT-FLASH.md](AGENT-FLASH.md) — Autonomous AI Agent SOP & safety gates
+- [docs/P0_REMEDIATION_REPORT_v1.1.1-rc.1.md](docs/P0_REMEDIATION_REPORT_v1.1.1-rc.1.md) — P0-1..P0-6 safety remediation report, failure tests & `v1.1.1-rc.1` plan
 - [docs/multi-platform-host.md](docs/multi-platform-host.md) — Linux, macOS, Android Termux OTG & selectable downloads guide
 - [docs/variant-psim-b28.md](docs/variant-psim-b28.md) — F50 Pro 插卡版 (`board_id=6`) hardware & SIM-mux reference
 - [docs/variant-esim-b15.md](docs/variant-esim-b15.md) — F50 Pro 内置双 eSIM 版 (`board_id=1`) reference

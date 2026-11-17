@@ -7,34 +7,34 @@ This document defines the strict deterministic execution protocol for any AI cod
 ## 0. Mandatory Agent Guardrails (Non-Negotiable)
 
 1. **NEVER touch `FORBIDDEN_PARTITIONS`**: Never read-modify-write or flash `splloader`, `prodnv`, `calinv`, `ztecfg`, `ztepersist`, `persist`, `miscdata`, `super`, `userdata`, or modem NV/calibration partitions.
-2. **Mandatory Full Verified BROM Backup First**: Never proceed to `flash` or `provision` without a verified local BROM backup (`verification_report.json` with `checks_passed: true`) dumped from **this exact physical device**.
-3. **Never Flash Foreign Images**: Always run `kit.py inspect` and `kit.py build` against the target device's own backup so `trustos_noavb.img` is derived from its own `sml_a` + `trustos_a` and `vendor_boot_b` retains its exact DTB.
-4. **Dry-Run Confirmation Gate**: Execute `kit.py flash` / `kit.py auto` **without `--execute`** first, display the exact `flash_plan.json` partition summary, detected `board_id`, and selected profile to the user, and obtain explicit user approval before re-running with `--execute`. (Wait: if the user already pre-authorized full automatic execution up front for this exact profile and device, obey the user's explicit authorization.)
-5. **Host Network Safety**: Whenever OpenWrt boots over USB (`1D6B:0104` `UsbNcm` on initial boot or `RNDIS` after provisioning), ensure `host_network.isolate_usb_rndis_adapter()` runs (or `provision-openwrt` runs with default isolation enabled) so Windows never routes host internet traffic through the cellular dongle.
+2. **Mandatory Full Verified BROM Backup First**: Never proceed to `flash` or `provision` without a verified local BROM backup (`verification_report.json` with `checks_passed: true`) dumped from **this exact physical device**. Live `kit.py backup` enters `SPRD4:AutoD` and resets the device, so it explicitly requires `--authorize-device-reboot`; offline `kit.py plan` / `kit.py auto` (without `--execute`) never triggers `REBOOT_DEVICE`, downloads, or device mutations.
+3. **Never Flash Foreign Images (Per-Unit Identity Bound)**: Always run `kit.py inspect` and `kit.py build` against the target device's own backup so `flash_plan.json` embeds the cryptographic `unit_identity_digest` (`prodnv`/`miscdata` SHA-256 + GPT), `trustos_noavb.img` derives from its own `sml_a` + `trustos_a`, and `vendor_boot_b` retains its exact DTB. `flash_images.py` refuses mismatched targets unless explicitly acknowledged.
+4. **Dry-Run & Failure Recovery Gate**: Execute `kit.py plan` (or `kit.py auto` **without `--execute`**) and `kit.py flash --plan ...` (without `--execute`) first, present the partition allowlist/summary, `unit_identity_digest`, detected `board_id`, and selected profile to the user, and obtain explicit approval before `--execute`. If any write/readback/GPT check fails during `flash --execute`, the tool **stops immediately without calling `reset` or switching slots** and records state in `flash_state.json` — inspect `flash_failure_report.json` before touching hardware.
+5. **Host Network & USB Mode Preservation**: Only verified F50 Pro USB interfaces (`1D6B:0104`) are isolated by `host_network.py` (using snapshots and never modifying phone USB tethering, USB-C docks, or Wi-Fi `192.168.0.1`). `provision-openwrt` preserves working USB modes (`ncm`/`ecm`/`rndis`) unless `--usb-net-mode` explicitly changes it.
 6. **Zero PII / Credentials in Commits**: Never commit anything under `build/`, `bundle-cache/`, `dist/`, `.venv/`, backup directories, `openwrt-credentials.json`, or personal subscriptions into Git.
 7. **Download Mode Boundary (`SPRD4:AutoD` vs `SPRD3`)**: `kit.py backup` and `kit.py flash` use **`SPRD4:AutoD`** (U-Boot `autodloader`), which requires intact on-device `SPL + U-Boot`. Bare-metal `SPRD3` BootROM unbricking if `SPL` or active `U-Boot` fails to load is **not bundled** (no `UMS9632` signed `FDL1/FDL2` or factory `.pac`), and `r all` does not dump `splloader_bak` (`eMMC boot1`). Verify `uboot_b` readback succeeds before switching slots.
 
 ---
 
-## Step 1: Clone, Bootstrap (Per-Platform Selectable) & Run Automated Self-Tests
+## Step 1: Pinned Clone, Bootstrap (Per-Platform Selectable) & Strict Preflight
 
-Select **only** the packs needed by the current host OS and requested profile:
+Pin an explicit Release tag (or verified commit SHA) — never pull mutable `main` unpinned in automated flashing — and select **only** the packs needed by the current host OS and requested profile *(note: `release-manifest.json` validates SHA-256 integrity, not cryptographic publisher signatures)*:
 
 - **Windows PC**:
   ```powershell
-  git clone https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   .\scripts\bootstrap.ps1 -Profile <PROFILE_ID>  # add -SkipOpenClash if unused
   .\.venv\Scripts\python.exe -m pytest -v
-  .\.venv\Scripts\python.exe scripts\kit.py preflight
+  .\.venv\Scripts\python.exe scripts\kit.py preflight --strict --operation auto --profile <PROFILE_ID>
   ```
 - **Linux (`x86_64` / `arm64`) / macOS (`Universal`) / Android Termux (`arm64`)**:
   ```bash
-  git clone https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   bash scripts/bootstrap.sh --profile <PROFILE_ID>  # add --no-openclash if unused
   .venv/bin/python -m pytest -v
-  .venv/bin/python scripts/kit.py preflight
+  .venv/bin/python scripts/kit.py preflight --strict --operation auto --profile <PROFILE_ID>
   ```
 
 Expected assertions before proceeding:
@@ -60,6 +60,7 @@ Run read-only BROM dump (on macOS or Linux without udev rules add `--spd-mode su
 ```powershell
 .\.venv\Scripts\python.exe scripts\kit.py backup `
   --output-dir build\device-session\backup `
+  --authorize-device-reboot `
   --webui-password "<WEBUI_PASSWORD>"
 ```
 
@@ -144,7 +145,7 @@ Confirm:
 ```powershell
 .\.venv\Scripts\python.exe scripts\kit.py provision-android `
   --plan build\device-session\build\flash_plan.json `
-  --root-password "<OPENWRT_ROOT_PASSWORD_IF_SET>"
+  --credentials-file build\device-session\build\openwrt-credentials.json
 ```
 
 Confirm:
@@ -154,16 +155,17 @@ Confirm:
 
 ---
 
-## Step 7: Final Live E2E Audit
+## Step 7: Final Live E2E Audit (Strict Non-Zero Exit Code on Failure)
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\kit.py verify `
-  --root-password "<OPENWRT_ROOT_PASSWORD_IF_SET>" `
+  --profile <PROFILE_ID> `
+  --credentials-file build\device-session\build\openwrt-credentials.json `
   --openclash `
   --out build\device-session\final_verify_report.json
 ```
 
-Verify in final output:
-1. `host_routes.usb_default_route_leak == false`
-2. Target OS reachable and healthy (`openwrt.reachable == true`, `luci_http_status == 200` and/or `android.su_id == "0"`)
+Verify in final output (`exit code == 0` and `overall_status == "PASS"`):
+1. `checks.host_route_isolation.status == "PASS"` (`host_routes.usb_default_route_leak == false`)
+2. Real boot evidence checked (`/proc/cmdline` or `bootargs`, never `wifi_device` spoofed as slot; inactive slot under `3-dual-full` marked `NOT_TESTED`, unused profile sides marked `NOT_APPLICABLE`)
 3. Report final summary concisely with profile, `board_id`, backup path, credentials file path (if generated), and live switch instructions (`5s` long press physical key).
