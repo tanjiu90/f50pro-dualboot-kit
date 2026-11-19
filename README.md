@@ -4,6 +4,8 @@ Turnkey, sanitized, **pure-Python (zero-WSL)** toolkit for backing up, building,
 
 Designed for **one-click per-OS selective download & deployment** and **autonomous AI Agent flashing** (`AGENT-FLASH.md`).
 
+> **新手入门 / 零基础用户**：请直接阅读中文零基础保姆级指南 -> [docs/beginner-guide.md](docs/beginner-guide.md)（手把手教你从装 Python/驱动、备份原厂分区到一键双系统及回退）。
+
 ---
 
 ## Supported Hardware Variants
@@ -151,6 +153,7 @@ Run preflight + bootstrap + full BROM backup + inspect first, then build Profile
 
 ## Documentation Index
 
+- [docs/beginner-guide.md](docs/beginner-guide.md) — **零基础小白保姆级使用教程**（Windows 主流程 + macOS / Linux / Termux 附注 + 日常使用与救砖回退）
 - [AGENT-FLASH.md](AGENT-FLASH.md) — Autonomous AI Agent SOP & safety gates
 - [docs/P0_REMEDIATION_REPORT_v1.1.1-rc.1.md](docs/P0_REMEDIATION_REPORT_v1.1.1-rc.1.md) — P0-1..P0-6 safety remediation report, failure tests & `v1.1.1-rc.1` plan
 - [docs/multi-platform-host.md](docs/multi-platform-host.md) — Linux, macOS, Android Termux OTG & selectable downloads guide
