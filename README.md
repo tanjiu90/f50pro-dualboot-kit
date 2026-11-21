@@ -130,6 +130,12 @@ This creates `.venv`, installs `paramiko`, `pyserial`, and `pytest`, downloads &
 
 ---
 
+## Repair a legacy F50 Pro USB boot hang
+
+Older OpenWrt installations with `/etc/init.d/f50pro-usb` can hang during boot when the script removes an ACM serial function held open by the login console. Services later in the boot order, including OpenClash, then remain offline. The [legacy USB boot repair](assets/openwrt-patch/f50pro-legacy-usb-boot-fix.sh) moves the RNDIS default to early initialization and preserves saved USB-mode policies.
+
+With a verified device backup, save `/etc/init.d/f50pro-usb` and `/usr/sbin/u30pro-usb-boot` for rollback. Copy the repair script to `/tmp` and run `sh /tmp/f50pro-legacy-usb-boot-fix.sh` as root over SSH. Reboot OpenWrt to apply the repair and verify the USB profile and affected services. The v1.1.1 base image uses a different startup sequence.
+
 ## AI Agent One-Line Turnkey Prompt
 
 Hand your AI coding Agent (Antigravity, Claude Code, Codex CLI, Cursor, etc.) the repository URL and instruct it to follow [AGENT-FLASH.md](AGENT-FLASH.md):
