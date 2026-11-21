@@ -848,15 +848,18 @@ def _install_openclash_offline(
     synthesized_provides: list[str] = []
     if pkg_paths:
         # Handle either apk (OpenWrt 25.12+) or opkg cleanly.
+        # Use exact `apk info | grep -qx` for dnsmasq vs dnsmasq-full because `apk info -e dnsmasq` matches
+        # dnsmasq-full's virtual `provides=dnsmasq` and would falsely trigger `apk del dnsmasq` on re-runs.
         _, probe_out, _ = ssh_run(
             ssh,
             "KREL=\"$(uname -r 2>/dev/null || echo 6.12.94)\"; "
             "MB=\"/lib/modules/$KREL/modules.builtin\"; "
-            "printf 'has_apk=%s\\nkver=%s\\nhas_dnsmasq=%s\\nhas_kmod_tun=%s\\nhas_kmod_ct=%s\\n"
+            "printf 'has_apk=%s\\nkver=%s\\nhas_dnsmasq=%s\\nhas_dnsmasq_full=%s\\nhas_kmod_tun=%s\\nhas_kmod_ct=%s\\n"
             "builtin_tun=%s\\nbuiltin_ct=%s\\n' "
             "\"$(command -v apk >/dev/null 2>&1 && echo 1 || echo 0)\" "
             "\"$KREL\" "
-            "\"$(apk info -e dnsmasq >/dev/null 2>&1 && echo 1 || echo 0)\" "
+            "\"$(apk info 2>/dev/null | grep -qx dnsmasq && echo 1 || echo 0)\" "
+            "\"$(apk info 2>/dev/null | grep -qx dnsmasq-full && echo 1 || echo 0)\" "
             "\"$(apk info -e kmod-tun >/dev/null 2>&1 && echo 1 || echo 0)\" "
             "\"$(apk info -e kmod-nf-conntrack-netlink >/dev/null 2>&1 && echo 1 || echo 0)\" "
             "\"$(grep -Eq '(^|/)tun\\.ko(\\.|$)' \"$MB\" 2>/dev/null && echo 1 || echo 0)\" "
@@ -895,16 +898,22 @@ def _install_openclash_offline(
 
             # dnsmasq-full provides `dnsmasq`, so bare `!dnsmasq` would exclude dnsmasq-full itself.
             # Before removing stock dnsmasq on the live root, pre-validate the full swap+install against a
-            # cloned apk DB (/tmp/oc-sim) with `--simulate`, and keep a rollback tarball restoring stock
+            # cloned apk DB (/tmp/oc-sim) with `--simulate --force-non-repository --repositories-file /dev/null`
+            # (required by apk-tools 3.0.5 on tmpfs --root), and keep a rollback tarball restoring stock
             # dnsmasq + apk DB + service if live `apk add` fails mid-commit.
             joined_pkgs = " ".join(pkg_paths)
-            if pinfo.get("has_dnsmasq") == "1" and any("dnsmasq-full" in p.name for p in ipks):
+            apk_offline_flags = "--no-network --allow-untrusted --force-non-repository --repositories-file /dev/null"
+            if (
+                pinfo.get("has_dnsmasq") == "1"
+                and pinfo.get("has_dnsmasq_full") != "1"
+                and any("dnsmasq-full" in p.name for p in ipks)
+            ):
                 ssh_run(
                     ssh,
                     "rm -rf /tmp/oc-sim && mkdir -p /tmp/oc-sim/etc /tmp/oc-sim/lib && "
                     "cp -a /etc/apk /tmp/oc-sim/etc/ && cp -a /lib/apk /tmp/oc-sim/lib/ && "
-                    "apk --root /tmp/oc-sim --no-network --no-scripts del dnsmasq && "
-                    f"apk --root /tmp/oc-sim --no-network --no-scripts --allow-untrusted --simulate add {joined_pkgs}; "
+                    "apk --root /tmp/oc-sim --no-network --no-scripts --repositories-file /dev/null del dnsmasq && "
+                    f"apk --root /tmp/oc-sim --no-scripts {apk_offline_flags} --simulate add {joined_pkgs}; "
                     "sim_rc=$?; rm -rf /tmp/oc-sim; exit $sim_rc",
                     timeout=120,
                 )
@@ -915,7 +924,7 @@ def _install_openclash_offline(
                     "etc/apk lib/apk usr/sbin/dnsmasq etc/init.d/dnsmasq etc/dnsmasq.conf etc/config/dhcp && "
                     "[ -s /tmp/oc-dnsmasq-bak.tar.tmp ] && tar -tf /tmp/oc-dnsmasq-bak.tar.tmp >/dev/null && "
                     "mv -f /tmp/oc-dnsmasq-bak.tar.tmp /tmp/oc-dnsmasq-bak.tar) ) && "
-                    f"( (apk del --no-network dnsmasq && apk add --no-network --allow-untrusted {joined_pkgs} && "
+                    f"( (apk del --no-network --repositories-file /dev/null dnsmasq && apk add {apk_offline_flags} {joined_pkgs} && "
                     "apk info -e luci-app-openclash dnsmasq-full >/dev/null && rm -f /tmp/oc-dnsmasq-bak.tar) || "
                     "{ if tar -xf /tmp/oc-dnsmasq-bak.tar -C / && /etc/init.d/dnsmasq start; then "
                     "rm -f /tmp/oc-dnsmasq-bak.tar; "
@@ -925,7 +934,7 @@ def _install_openclash_offline(
             else:
                 ssh_run(
                     ssh,
-                    f"apk add --no-network --allow-untrusted {joined_pkgs} && "
+                    f"apk add {apk_offline_flags} {joined_pkgs} && "
                     "apk info -e luci-app-openclash dnsmasq-full >/dev/null && rm -f /tmp/oc-dnsmasq-bak.tar",
                     timeout=180,
                 )

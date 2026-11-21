@@ -400,7 +400,7 @@ def test_openclash_builtin_kmods_apk_v2_and_subscription_preservation(tmp_path: 
         if "has_apk=" in cmd:
             return (
                 0,
-                "has_apk=1\nkver=6.12.94-u30pro-p1\nhas_dnsmasq=1\nhas_kmod_tun=0\nhas_kmod_ct=0\nbuiltin_tun=1\nbuiltin_ct=1\n",
+                "has_apk=1\nkver=6.12.94-u30pro-p1\nhas_dnsmasq=1\nhas_dnsmasq_full=0\nhas_kmod_tun=0\nhas_kmod_ct=0\nbuiltin_tun=1\nbuiltin_ct=1\n",
                 "",
             )
         return 0, "", ""
@@ -413,11 +413,35 @@ def test_openclash_builtin_kmods_apk_v2_and_subscription_preservation(tmp_path: 
 
     assert res["builtin_kmod_provides"] == ["kmod-tun", "kmod-nf-conntrack-netlink"]
     assert any("f50pro-builtin-kmods-6.12.94-r1.apk" in p for p in uploaded)
-    assert any("--simulate add" in c and "/tmp/oc-sim" in c for c in ran_cmds)
-    apk_cmd = next(c for c in ran_cmds if "apk del --no-network dnsmasq && apk add" in c)
+    assert any("--simulate add" in c and "/tmp/oc-sim" in c and "--force-non-repository" in c and "--repositories-file /dev/null" in c for c in ran_cmds)
+    apk_cmd = next(c for c in ran_cmds if "apk del --no-network" in c and "dnsmasq && apk add" in c)
     assert "oc-dnsmasq-bak.tar" in apk_cmd
+    assert "--force-non-repository" in apk_cmd
     assert "!dnsmasq" not in apk_cmd
     assert "f50pro-builtin-kmods-6.12.94-r1.apk" in apk_cmd
+
+    # Re-run when dnsmasq-full is already installed must NOT run `apk del dnsmasq`
+    rerun_cmds: list[str] = []
+    with (
+        patch(
+            "provision_openwrt.ssh_run",
+            side_effect=lambda _c, cmd, **k: (
+                rerun_cmds.append(cmd)
+                or (
+                    0,
+                    "has_apk=1\nkver=6.12.94-u30pro-p1\nhas_dnsmasq=0\nhas_dnsmasq_full=1\nhas_kmod_tun=1\nhas_kmod_ct=1\nbuiltin_tun=1\nbuiltin_ct=1\n"
+                    if "has_apk=" in cmd
+                    else "",
+                    "",
+                )
+            ),
+        ),
+        patch("provision_openwrt.sftp_put_bytes"),
+    ):
+        res_rerun = _install_openclash_offline(ssh, sftp, tools_dir=tools)
+    assert res_rerun["builtin_kmod_provides"] == []
+    assert not any("apk del" in c for c in rerun_cmds)
+    assert any("apk add" in c and "--force-non-repository" in c for c in rerun_cmds)
 
     # 3. Missing built-in module in kernel modules.builtin must FAIL instead of faking provides
     def _fake_ssh_no_tun(client, cmd, *, check=True, timeout=60.0):
