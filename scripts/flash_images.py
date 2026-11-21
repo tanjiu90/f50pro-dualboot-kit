@@ -28,6 +28,7 @@ from common import (
     REPO_ROOT,
     AuthContext,
     compute_unit_identity_digest,
+    parse_boot_control,
     read_json,
     resolve_tool,
     sha256_bytes,
@@ -56,7 +57,12 @@ def validate_plan_safety(plan: dict[str, Any]) -> None:
         if xml_p.is_file():
             part_caps = parse_partition_xml(xml_p)
 
-    for op in plan["operations"]:
+    ops = plan.get("operations")
+    if not isinstance(ops, list) or not ops:
+        raise ValueError("Flash plan contains no operations")
+
+    seen_targets: set[tuple[str, str, int]] = set()
+    for op in ops:
         part = op["partition"]
         if part in FORBIDDEN_PARTITIONS:
             raise ValueError(f"Forbidden partition in plan: {part}")
@@ -70,6 +76,10 @@ def validate_plan_safety(plan: dict[str, Any]) -> None:
         offset = int(op.get("offset", 0))
         if offset != spec["offset"]:
             raise ValueError(f"Offset {offset} not permitted for '{part}' (expected {spec['offset']})")
+        target_key = (str(op.get("op")), part, offset)
+        if target_key in seen_targets:
+            raise ValueError(f"Duplicate flash operation in plan: {target_key}")
+        seen_targets.add(target_key)
 
         fpath = Path(op["file"])
         if not fpath.is_file() or sha256_file(fpath) != op["sha256"]:
@@ -234,14 +244,21 @@ def execute_flash(
     spd_mode: str = "auto",
     usb_dev: str | None = None,
     confirm_weak_identity: bool = False,
+    allow_dirty_target: bool = False,
     board_id: str | None = None,
     usb_topology: dict[str, Any] | None = None,
     active_session: SpdSession | None = None,
 ) -> dict[str, Any]:
     """Execute or dry-run a verified flash_plan.json with full readback verification and safe failure handling."""
-    plan = read_json(plan_path)
-    validate_plan_safety(plan)
+    if execute:
+        # Invalidate any sibling checkpoint BEFORE reading/parsing plan_path so malformed JSON can never leave
+        # a stale flash_result.json eligible for --resume.
+        (plan_path.parent / "flash-run" / "flash_result.json").unlink(missing_ok=True)
+    plan_raw = plan_path.read_bytes()
+    plan_sha256 = sha256_bytes(plan_raw)
+    plan = json.loads(plan_raw.decode("utf-8"))
     if not execute:
+        validate_plan_safety(plan)
         return {
             "dry_run": True,
             "device_mutated": False,
@@ -254,9 +271,41 @@ def execute_flash(
             ],
         }
 
-    backup_dir = Path(plan["backup_dir"])
+    # Also invalidate out_dir/flash-run/flash_result.json BEFORE backup/plan validation in case out_dir != plan_path.parent.
+    out_dir_raw = plan.get("out_dir")
+    if out_dir_raw:
+        (Path(out_dir_raw) / "flash-run" / "flash_result.json").unlink(missing_ok=True)
+
+    # Verify backup integrity BEFORE validate_plan_safety() parses partition_list.xml so malformed XML
+    # always overwrites any stale checks_passed=true verification_report.json on disk (even on legacy plans
+    # missing backup_sha256sums_sha256).
+    backup_dir_raw = plan.get("backup_dir")
+    if not backup_dir_raw:
+        raise ValueError("Flash plan missing backup_dir")
+    backup_dir = Path(backup_dir_raw)
+    sums_path = backup_dir / "SHA256SUMS.txt"
+    expected_sums_sha = plan.get("backup_sha256sums_sha256")
+    from brom_backup import verify_backup_dir
+
+    verify_backup_dir(
+        backup_dir,
+        require_complete_table=True,
+        require_existing_manifest=True,
+    )
+    if not expected_sums_sha:
+        raise ValueError(
+            "Flash plan missing backup_sha256sums_sha256; rebuild flash_plan.json from the verified backup before live flashing."
+        )
+    if sha256_file(sums_path) != expected_sums_sha:
+        raise ValueError("Backup SHA256SUMS.txt digest changed after flash_plan.json was built")
+
+    validate_plan_safety(plan)
+
     run_dir = Path(plan["out_dir"]) / "flash-run"
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Invalidate any prior flash_result.json before starting a new live flash attempt so a later failure
+    # can never leave a stale success checkpoint eligible for --resume.
+    (run_dir / "flash_result.json").unlink(missing_ok=True)
     prefer_var = "termux-usb" if spd_mode == "termux-usb" else ("su" if spd_mode == "su" else None)
     spd_dump = resolve_tool("spd_dump", tools_dir, prefer_variant=prefer_var)
     expected_xml = parse_partition_xml(backup_dir / "partition_list.xml")
@@ -301,6 +350,7 @@ def execute_flash(
                 "log_path": str(run_dir / "spd_dump_flash.log"),
             }
             write_json(run_dir / "flash_state.json", fail_state)
+            (run_dir / "flash_result.json").unlink(missing_ok=True)
             raise RuntimeError(fail_state["error"]) from exc
 
     w_ops = [o for o in plan["operations"] if o["op"] in ("w", "w_force")]
@@ -340,12 +390,27 @@ def execute_flash(
             failed_stage = f"pre_read:{part}"
             existing = sess.read_part(part, sz, f"{part}_pre.bin")
             sess.safe_unlink(f"{part}_pre.bin")
-            if sha256_bytes(existing) == exp_sha:
+            existing_sha = sha256_bytes(existing)
+            if existing_sha == exp_sha:
                 rec = {"partition": part, "method": "already_verified", "size_bytes": sz, "sha256": exp_sha}
                 results[part] = {"method": "already_verified", "sha256": exp_sha}
                 verified_partitions.append(rec)
                 completed_keys.add(_op_key(op))
                 continue
+            exp_before = op.get("expected_before_sha256")
+            if not allow_dirty_target:
+                if not exp_before:
+                    raise RuntimeError(
+                        f"Flash plan missing expected_before_sha256 baseline for {part}; "
+                        "rebuild from a complete backup or pass allow_dirty_target=True."
+                    )
+                before_len = int(op.get("expected_before_size_bytes") or sz)
+                live_before_sha = sha256_bytes(existing[:before_len]) if before_len < len(existing) else existing_sha
+                if live_before_sha != exp_before:
+                    raise RuntimeError(
+                        f"Live partition {part} differs from verified backup baseline before write "
+                        f"(live={live_before_sha} != backup={exp_before}); take a fresh backup or pass allow_dirty_target=True."
+                    )
 
             failed_stage = f"write:{part}"
             if op["op"] == "w_force":
@@ -377,42 +442,59 @@ def execute_flash(
             part = op["partition"]
             offset = op["offset"]
             sz = op["size_bytes"]
+            exp_wof_sha = op["sha256"]
             data = Path(op["file"]).read_bytes()
+            data_sha = sha256_bytes(data)
+            if len(data) != sz or data_sha != exp_wof_sha:
+                raise RuntimeError(
+                    f"Offset write artifact changed after plan validation on {part}+{offset}: "
+                    f"len={len(data)}/{sz}, sha={data_sha} != {exp_wof_sha}"
+                )
             failed_stage = f"offset_pre_read:{part}+{offset}"
             before_full = sess.read_part(part, (backup_dir / part).stat().st_size, f"{part}_before.bin")
+            if part == "misc":
+                parse_boot_control(before_full)
+            live_slice_sha = sha256_bytes(before_full[offset : offset + sz])
+            if live_slice_sha == exp_wof_sha:
+                rec = {"partition": f"{part}+{offset}", "method": "already_verified", "size_bytes": sz, "sha256": exp_wof_sha}
+                results[f"{part}+{offset}"] = {"method": "already_verified", "sha256": exp_wof_sha}
+                verified_partitions.append(rec)
+                completed_keys.add(_op_key(op))
+                continue
+            exp_before_slice = op.get("expected_before_sha256")
+            if not allow_dirty_target:
+                if not exp_before_slice:
+                    raise RuntimeError(
+                        f"Flash plan missing expected_before_sha256 baseline for {part}+{offset}; "
+                        "rebuild from a complete backup or pass allow_dirty_target=True."
+                    )
+                if live_slice_sha != exp_before_slice:
+                    raise RuntimeError(
+                        f"Live {part}+{offset} state differs from verified backup baseline before wof "
+                        f"(live={live_slice_sha} != backup={exp_before_slice}); pass --resume if BROM flash already succeeded or --allow-dirty-target."
+                    )
+            staged_wof = run_dir / f"{part}_{offset}_verified.bin"
+            staged_wof.write_bytes(data)
             failed_stage = f"offset_write:{part}+{offset}"
-            sess.cmd(["wof", part, offset, op["file"]], "w_mem_to_part_offset: wrote to", timeout=60)
+            sess.cmd(["wof", part, offset, str(staged_wof)], "w_mem_to_part_offset: wrote to", timeout=60)
             failed_stage = f"offset_readback:{part}+{offset}"
             after_full = sess.read_part(part, len(before_full), f"{part}_after.bin")
-            if after_full != before_full[:offset] + data + before_full[offset + sz :]:
+            after_slice_sha = sha256_bytes(after_full[offset : offset + sz])
+            if after_slice_sha != exp_wof_sha or after_full != before_full[:offset] + data + before_full[offset + sz :]:
                 raise RuntimeError(f"Offset write safety check failed on {part}+{offset}")
-            rec = {"partition": f"{part}+{offset}", "method": "wof", "size_bytes": sz, "sha256": sha256_bytes(data)}
-            results[f"{part}+{offset}"] = {"method": "wof", "sha256": sha256_bytes(data)}
+            rec = {"partition": f"{part}+{offset}", "method": "wof", "size_bytes": sz, "sha256": exp_wof_sha}
+            results[f"{part}+{offset}"] = {"method": "wof", "sha256": exp_wof_sha}
             verified_partitions.append(rec)
             completed_keys.add(_op_key(op))
 
-        # Explicit success path: only reset after every operation + readback verified
+        # Explicit success path: all writes and readbacks verified before attempting session reset/close.
         failed_stage = "completed"
-        summary = {
-            "status": "FLASH_AND_READBACK_VERIFIED",
-            "profile": plan["profile"],
-            "reused_brom_session": reused_session,
-            "device_identity_verified": identity_check,
-            "reset_sent": True,
-            "slot_switched": bool(wof_ops),
-            "auto_rollback_attempted": False,
-            "verified_partitions": verified_partitions,
-            "pending_operations": [],
-            "results": results,
-            "log_path": str(run_dir / ("spd_dump_session.log" if reused_session else "spd_dump_flash.log")),
-        }
-        write_json(run_dir / "flash_state.json", summary)
-        write_json(run_dir / "flash_result.json", summary)
-        sess.close(reboot=True)
-        return summary
     except Exception as exc:
         diag = _probe_failure_diag(sess, exc)
-        sess.close(reboot=False)
+        try:
+            sess.close(reboot=False)
+        except Exception as close_exc:
+            diag["close_error"] = str(close_exc)
         pending = [
             {
                 "op": o["op"],
@@ -434,11 +516,44 @@ def execute_flash(
             "verified_partitions": verified_partitions,
             "pending_operations": pending,
             "diagnostic_channel": diag,
-            "log_path": str(run_dir / "spd_dump_flash.log"),
+            "log_path": str(run_dir / ("spd_dump_session.log" if reused_session else "spd_dump_flash.log")),
         }
         write_json(run_dir / "flash_state.json", fail_state)
         write_json(run_dir / "flash_failure_report.json", fail_state)
+        (run_dir / "flash_result.json").unlink(missing_ok=True)
         raise
+
+    # Persist verified write+readback state BEFORE attempting session close/reboot, then update with final
+    # reset_sent & close_warning so post-verification close errors never corrupt FLASH_AND_READBACK_VERIFIED.
+    summary: dict[str, Any] = {
+        "status": "FLASH_AND_READBACK_VERIFIED",
+        "profile": plan["profile"],
+        "plan_sha256": plan_sha256,
+        "backup_sha256sums_sha256": expected_sums_sha,
+        "reused_brom_session": reused_session,
+        "device_identity_verified": identity_check,
+        "reset_sent": False,
+        "slot_switched": bool(wof_ops),
+        "auto_rollback_attempted": False,
+        "verified_partitions": verified_partitions,
+        "pending_operations": [],
+        "results": results,
+        "log_path": str(run_dir / ("spd_dump_session.log" if reused_session else "spd_dump_flash.log")),
+    }
+    write_json(run_dir / "flash_state.json", summary)
+
+    close_warning: str | None = None
+    try:
+        sess.close(reboot=True)
+    except Exception as close_exc:
+        close_warning = str(close_exc)
+    raw_reset_flag = getattr(sess, "_reset_written", None)
+    summary["reset_sent"] = raw_reset_flag if isinstance(raw_reset_flag, bool) else (close_warning is None)
+    if close_warning is not None:
+        summary["close_warning"] = close_warning
+    write_json(run_dir / "flash_state.json", summary)
+    write_json(run_dir / "flash_result.json", summary)
+    return summary
 
 
 def main() -> int:
@@ -452,6 +567,7 @@ def main() -> int:
     parser.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     parser.add_argument("--usb-dev", help="Explicit Termux OTG /dev/bus/usb/XXX/YYY path for --spd-mode termux-usb")
     parser.add_argument("--confirm-weak-identity", action="store_true", help="Explicit manual override only if unit identity partitions are absent/all-zero")
+    parser.add_argument("--allow-dirty-target", action="store_true", help="Allow overwriting live partitions that differ from verified backup baseline")
     parser.add_argument("--board-id", help="Expected target board_id (1 or 6)")
     parser.add_argument("--execute", action="store_true", help="Actually flash device (default is dry-run)")
     args = parser.parse_args()
@@ -467,6 +583,7 @@ def main() -> int:
         spd_mode=args.spd_mode,
         usb_dev=args.usb_dev,
         confirm_weak_identity=args.confirm_weak_identity,
+        allow_dirty_target=args.allow_dirty_target,
         board_id=args.board_id,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))

@@ -19,6 +19,17 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
+function Invoke-Checked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [Parameter(Mandatory = $true)][string[]]$ArgList
+    )
+    & $Exe @ArgList
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code ${LASTEXITCODE}: $Exe $($ArgList -join ' ')"
+    }
+}
+
 $Python = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $Python) { $Python = (Get-Command py -ErrorAction SilentlyContinue).Source }
 if (-not $Python) { throw "Python 3.11+ not found in PATH." }
@@ -29,11 +40,11 @@ if ($ListPacks) {
 }
 
 if (-not (Test-Path "$Root\.venv\Scripts\python.exe")) {
-    & $Python -m venv "$Root\.venv"
+    Invoke-Checked -Exe $Python -ArgList @('-m', 'venv', "$Root\.venv")
 }
 $VenvPy = "$Root\.venv\Scripts\python.exe"
-& $VenvPy -m pip install --upgrade pip
-& $VenvPy -m pip install paramiko pyserial pytest
+Invoke-Checked -Exe $VenvPy -ArgList @('-m', 'pip', 'install', '--upgrade', 'pip')
+Invoke-Checked -Exe $VenvPy -ArgList @('-m', 'pip', 'install', 'paramiko', 'pyserial', 'pytest')
 
 $FetchArgs = @("$Root\scripts\fetch_assets.py")
 if ($Interactive) {
@@ -46,7 +57,7 @@ if ($Interactive) {
     }
     if ($SkipOpenClash) { $FetchArgs += '--no-openclash' }
 }
-& $VenvPy @FetchArgs
+Invoke-Checked -Exe $VenvPy -ArgList $FetchArgs
 
 $AdbPub = Join-Path $env:USERPROFILE ".android\adbkey.pub"
 if (-not (Test-Path $AdbPub)) {
@@ -57,7 +68,7 @@ if (-not (Test-Path $AdbPub)) {
         if ($Cmd) { $AdbExe = $Cmd.Source }
     }
     if ($AdbExe -and (Test-Path $AdbExe)) {
-        & $AdbExe keygen (Join-Path $env:USERPROFILE ".android\adbkey")
+        Invoke-Checked -Exe $AdbExe -ArgList @('keygen', (Join-Path $env:USERPROFILE ".android\adbkey"))
     }
 }
 

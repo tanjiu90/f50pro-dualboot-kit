@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import secrets
 import shutil
 import struct
 import zipfile
@@ -31,6 +32,7 @@ from common import (
     parse_dhtb_header,
     parse_newc_cpio,
     parse_simghdr,
+    read_json,
     repack_boot_v4_with_avb,
     repack_vendor_boot_v4,
     sha256_bytes,
@@ -120,6 +122,7 @@ def build_magisk_init_boot_pure_python(
     usb_mode: str,
     enable_return_b_timer: bool,
     env_dir: Path,
+    rollback_token: str | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Patch init_boot_a with Magisk 28103 overlay cleanly using stdlib Python + AVB0 preservation."""
     page = 4096
@@ -148,9 +151,17 @@ def build_magisk_init_boot_pure_python(
     scripts_dir = ASSETS_DIR / "android-scripts"
     rc_bytes = _render_template(scripts_dir / "overlay-root.rc", {})
     onboot_bytes = _render_template(scripts_dir / "overlay-onboot.sh.tpl", {"__USB_MODE__": usb_mode})
+    effective_token = (
+        (rollback_token if rollback_token is not None else secrets.token_hex(16))
+        if enable_return_b_timer
+        else ""
+    )
     return_b_bytes = _render_template(
         scripts_dir / "overlay-return-b.sh.tpl",
-        {"__ENABLE_RETURN_B_TIMER__": "1" if enable_return_b_timer else "0"},
+        {
+            "__ENABLE_RETURN_B_TIMER__": "1" if enable_return_b_timer else "0",
+            "__ROLLBACK_TOKEN__": effective_token,
+        },
     )
 
     new_items = [
@@ -195,10 +206,18 @@ def build_magisk_init_boot_pure_python(
     # Roundtrip sanity check of footer & CPIO
     parse_avb_footer(candidate)
     meta["entry_count"] = len(merged)
+    meta["rollback_token"] = effective_token
     return candidate, meta
 
 
-def _op(part: str, file_path: Path, method: str = "w", offset: int = 0) -> dict[str, Any]:
+def _op(
+    part: str,
+    file_path: Path,
+    method: str = "w",
+    offset: int = 0,
+    *,
+    backup_dir: Path | None = None,
+) -> dict[str, Any]:
     if part in FORBIDDEN_PARTITIONS:
         raise ValueError(f"Refusing to add forbidden partition to plan: {part}")
     sz = file_path.stat().st_size
@@ -211,6 +230,20 @@ def _op(part: str, file_path: Path, method: str = "w", offset: int = 0) -> dict[
     }
     if offset:
         item["offset"] = offset
+    if backup_dir is not None:
+        bak_part = backup_dir / part
+        if bak_part.is_file():
+            bak_sz = bak_part.stat().st_size
+            if method == "wof" and bak_sz >= offset + sz:
+                with bak_part.open("rb") as fh:
+                    fh.seek(offset)
+                    item["expected_before_size_bytes"] = sz
+                    item["expected_before_sha256"] = sha256_bytes(fh.read(sz))
+            elif method in ("w", "w_force") and bak_sz > 0:
+                before_len = min(bak_sz, sz)
+                with bak_part.open("rb") as fh:
+                    item["expected_before_size_bytes"] = before_len
+                    item["expected_before_sha256"] = sha256_bytes(fh.read(before_len))
     return item
 
 
@@ -224,6 +257,7 @@ def build_profile(
     usb_mode: str | None = None,
     board_id: str | None = None,
     usb_topology: dict[str, Any] | None = None,
+    rollback_token: str | None = None,
 ) -> dict[str, Any]:
     """Assemble offline images and strict target-bound flash_plan.json for the selected profile."""
     if profile_id not in PROFILES:
@@ -241,9 +275,24 @@ def build_profile(
     ops: list[dict[str, Any]] = []
     android_stage: dict[str, Any] | None = None
 
+    gpt_caps: dict[str, int] = {}
+    xml_path = backup_dir / "partition_list.xml"
+    if xml_path.is_file():
+        from brom_backup import parse_partition_xml
+
+        gpt_caps = parse_partition_xml(xml_path)
+
     sml_a = (backup_dir / "sml_a").read_bytes()
     tos_a = (backup_dir / "trustos_a").read_bytes()
-    tos_cap = (backup_dir / "trustos_b").stat().st_size
+    # Use real GPT partition capacity rather than spd_dump's potentially trimmed dump size (e.g. post-OTA).
+    tos_b_cap = gpt_caps.get("trustos_b") or (backup_dir / "trustos_b").stat().st_size
+    tos_a_cap = gpt_caps.get("trustos_a") or (backup_dir / "trustos_a").stat().st_size
+    if profile["openwrt"] and profile["android_root"]:
+        tos_cap = min(tos_b_cap, tos_a_cap)
+    elif profile["android_root"]:
+        tos_cap = tos_a_cap
+    else:
+        tos_cap = tos_b_cap
     tos_noavb = derive_own_trustos_noavb(
         sml_a, tos_a, hw["trustos_a"]["patch_code_offset"], pad_to_size=tos_cap
     )
@@ -264,13 +313,14 @@ def build_profile(
             df = backup_dir / dst_p
             if not sf.is_file() or not df.is_file():
                 raise FileNotFoundError(f"Missing BSP pair {src_p} -> {dst_p} in backup")
-            if sf.stat().st_size == 0 or sf.stat().st_size > df.stat().st_size:
+            dst_cap = gpt_caps.get(dst_p) or df.stat().st_size
+            if sf.stat().st_size == 0 or sf.stat().st_size > dst_cap:
                 raise ValueError(
-                    f"Source {src_p} ({sf.stat().st_size} B) exceeds target {dst_p} capacity ({df.stat().st_size} B)"
+                    f"Source {src_p} ({sf.stat().st_size} B) exceeds target {dst_p} capacity ({dst_cap} B)"
                 )
-            ops.append(_op(dst_p, sf))
+            ops.append(_op(dst_p, sf, backup_dir=backup_dir))
 
-        ops.append(_op("trustos_b", tos_path))
+        ops.append(_op("trustos_b", tos_path, backup_dir=backup_dir))
 
         boot_b, _ = repack_boot_v4_with_avb(
             (backup_dir / "boot_a").read_bytes(),
@@ -282,7 +332,7 @@ def build_profile(
         struct.pack_into("<I", hdr_b, 1580, 0)
         boot_b_path = stage3 / "boot_b.6.12.94.img"
         boot_b_path.write_bytes(bytes(hdr_b))
-        ops.append(_op("boot_b", boot_b_path))
+        ops.append(_op("boot_b", boot_b_path, backup_dir=backup_dir))
 
         vb_b, _ = repack_vendor_boot_v4(
             (backup_dir / "vendor_boot_a").read_bytes(),
@@ -292,22 +342,22 @@ def build_profile(
         )
         vb_b_path = stage3 / "vendor_boot_b.6.12.94.img"
         vb_b_path.write_bytes(vb_b)
-        ops.append(_op("vendor_boot_b", vb_b_path))
+        ops.append(_op("vendor_boot_b", vb_b_path, backup_dir=backup_dir))
 
-        ops.append(_op("fulldumpdb", rootfs_path))
+        ops.append(_op("fulldumpdb", rootfs_path, backup_dir=backup_dir))
 
         empty_ram = encode_lz4_legacy_stored(encode_newc_cpio([]))
         ib_b, _ = repack_boot_v4_with_avb((backup_dir / "init_boot_a").read_bytes(), ramdisk=empty_ram)
         ib_b_path = stage3 / "init_boot_b.img"
         ib_b_path.write_bytes(ib_b)
-        ops.append(_op("init_boot_b", ib_b_path, method="w_force"))
+        ops.append(_op("init_boot_b", ib_b_path, method="w_force", backup_dir=backup_dir))
 
         misc_live = (backup_dir / "misc").read_bytes()[MISC_BC_OFFSET : MISC_BC_OFFSET + 32]
         trial_b = build_trial_bcab(misc_live, "b", tries=3)
         trial_b_path = stage3 / "misc_trial_b.bin"
         trial_b_path.write_bytes(trial_b)
         (stage3 / "misc_rollback_a.bin").write_bytes(misc_live)
-        ops.append(_op("misc", trial_b_path, method="wof", offset=MISC_BC_OFFSET))
+        ops.append(_op("misc", trial_b_path, method="wof", offset=MISC_BC_OFFSET, backup_dir=backup_dir))
 
     if profile["android_root"]:
         apk_path = tools_dir / "android-pkgs" / "Magisk-canary-28103.apk"
@@ -328,6 +378,45 @@ def build_profile(
             known_b_path = stage3 / "known-good-b-bcab.bin"
             known_b_path.write_bytes(known_b_bcab)
 
+        # Reuse existing rollback_token ONLY when retrying an unfinished deployment (same out_dir + profile +
+        # backup manifest + usb_mode + adb_pubkey, AND token was NOT already disarmed on the device) so
+        # interrupted runs resume idempotently without ever letting an old completion marker suppress rollback.
+        effective_rollback_token = rollback_token
+        sums_p_chk = backup_dir / "SHA256SUMS.txt"
+        cur_sums_sha = sha256_file(sums_p_chk) if sums_p_chk.is_file() else None
+        prev_plan_p = out_dir / "flash_plan.json"
+        disarmed_p = out_dir / ".rollback_token_disarmed"
+        disarmed_tokens = (
+            {ln.strip() for ln in disarmed_p.read_text(encoding="utf-8").splitlines() if ln.strip()}
+            if disarmed_p.is_file()
+            else set()
+        )
+        prev_android_done = (out_dir / "android_provision_report.json").is_file()
+        if (
+            effective_rollback_token is None
+            and profile["openwrt"]
+            and cur_sums_sha
+            and prev_plan_p.is_file()
+            and not prev_android_done
+        ):
+            try:
+                prev_plan = read_json(prev_plan_p)
+                prev_stage = prev_plan.get("android_a_stage") if isinstance(prev_plan, dict) else None
+                prev_tok = str(prev_stage.get("rollback_token") or "") if isinstance(prev_stage, dict) else ""
+                if (
+                    isinstance(prev_plan, dict)
+                    and prev_plan.get("profile") == profile_id
+                    and prev_plan.get("backup_sha256sums_sha256") == cur_sums_sha
+                    and isinstance(prev_stage, dict)
+                    and prev_stage.get("usb_mode") == chosen_usb
+                    and prev_stage.get("adb_pubkey_sha256") == key_sha
+                    and prev_tok
+                    and prev_tok not in disarmed_tokens
+                ):
+                    effective_rollback_token = prev_tok
+            except Exception:
+                pass
+
         magisk_dir = stage3 / "magisk-a"
         cand_ib, ib_meta = build_magisk_init_boot_pure_python(
             stock_init_boot=(backup_dir / "init_boot_a").read_bytes(),
@@ -337,20 +426,22 @@ def build_profile(
             usb_mode=chosen_usb,
             enable_return_b_timer=bool(profile["openwrt"]),
             env_dir=magisk_dir / "magisk-env",
+            rollback_token=effective_rollback_token,
         )
         ib_a_path = magisk_dir / "init_boot_a.magisk-28103.img"
         ib_a_path.write_bytes(cand_ib)
 
         if profile_id == "1-android-ufi":
             # Profile 1 touches ONLY Android _a directly via BROM spd_dump
-            ops.append(_op("trustos_a", tos_path))
-            ops.append(_op("init_boot_a", ib_a_path))
+            ops.append(_op("trustos_a", tos_path, backup_dir=backup_dir))
+            ops.append(_op("init_boot_a", ib_a_path, backup_dir=backup_dir))
         else:
             # Profile 3 boots OpenWrt _b first via BROM, then safely writes _a from OpenWrt root
             android_stage = {
                 "apply_from_openwrt": True,
                 "usb_mode": chosen_usb,
                 "adb_pubkey_sha256": key_sha,
+                "rollback_token": ib_meta.get("rollback_token", ""),
                 "trustos_a": {
                     "file": str(tos_path),
                     "size_bytes": len(tos_noavb),
@@ -367,11 +458,13 @@ def build_profile(
                 },
             }
 
+    sums_path = backup_dir / "SHA256SUMS.txt"
     plan = {
         "plan_version": 2,
         "profile": profile_id,
         "profile_name": profile["name"],
         "backup_dir": str(backup_dir),
+        "backup_sha256sums_sha256": sha256_file(sums_path) if sums_path.is_file() else None,
         "out_dir": str(out_dir),
         "device_identity": hw["device_identity"],
         "allowed_operations_policy": PROFILE_ALLOWED_BROM_OPS[profile_id],

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes as c
 import datetime
 import json
@@ -59,7 +60,19 @@ class _DRVINFO_DATA(c.Structure):
     ]
 
 
-def _ps(cmd: str) -> str:
+_PS_SMART_QUOTES = ("\u2018", "\u2019", "\u201a", "\u201b")
+
+
+def _ps_quote(val: str) -> str:
+    """Safely quote an arbitrary string for Windows PowerShell 5.1/7 (immune to ASCII & smart quotes)."""
+    text = str(val)
+    if any(ch in text for ch in _PS_SMART_QUOTES) or any(ord(ch) < 0x20 for ch in text):
+        b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        return f"([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))"
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _ps(cmd: str, *, timeout: float = 30.0) -> str:
     wrapped = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); " + cmd
     res = subprocess.run(
         ["powershell", "-NoProfile", "-Command", wrapped],
@@ -67,6 +80,7 @@ def _ps(cmd: str) -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
+        timeout=timeout,
         **win_no_window_kwargs(),
     )
     if res.returncode != 0:
@@ -148,7 +162,8 @@ def select_target_usb_adapters(
 
         matched.append(item)
 
-    ambiguous = len(matched) > 1 and not target_iface and not (usb_topology and (usb_topology.get("port_path") or usb_topology.get("serial")))
+    # Disambiguation succeeded only when at most 1 candidate remains; missing serial/port_path must never bypass ambiguity.
+    ambiguous = len(matched) > 1
     return {
         "targets": matched,
         "ignored": ignored,
@@ -457,7 +472,14 @@ def _snapshot_linux_iface(ifname: str) -> dict[str, Any]:
         c_res = _run_cmd([nmcli, "-g", "GENERAL.CONNECTION", "dev", "show", ifname], check=False)
         nm_conn = c_res.stdout.strip() if c_res.returncode == 0 else ""
         if nm_conn and nm_conn != "--":
-            for k in ("ipv4.method", "ipv4.addresses", "ipv4.gateway", "ipv4.never-default", "ipv6.method"):
+            for k in (
+                "ipv4.method",
+                "ipv4.addresses",
+                "ipv4.gateway",
+                "ipv4.never-default",
+                "ipv4.ignore-auto-dns",
+                "ipv6.method",
+            ):
                 v_res = _run_cmd([nmcli, "-g", k, "con", "show", nm_conn], check=False)
                 nm_state[k] = v_res.stdout.strip()
     return {
@@ -482,24 +504,84 @@ def _snapshot_macos_service(svc: str, dev: str) -> dict[str, Any]:
 
 
 def _snapshot_windows_adapter(iface_name: str) -> dict[str, Any]:
+    q_name = _ps_quote(iface_name)
     raw = _ps(
-        f"$ad = Get-NetAdapter -Name '{iface_name}' -ErrorAction SilentlyContinue; "
+        f"$ad = Get-NetAdapter -Name {q_name} -ErrorAction SilentlyContinue; "
         "if ($ad) { "
+        "$ifv4 = Get-NetIPInterface -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue; "
         "$ips = @(Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object IPAddress,PrefixLength,PrefixOrigin); "
+        "$gws = @(Get-NetRoute -InterfaceIndex $ad.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop); "
         "$dns = (Get-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses; "
+        "$reg = \"HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$($ad.InterfaceGuid)\"; "
+        "$ns = if (Test-Path $reg) { (Get-ItemProperty -Path $reg -Name NameServer -ErrorAction SilentlyContinue).NameServer } else { '' }; "
+        "$staticDns = if ($ns) { @($ns -split '[,\\s]+' | Where-Object { $_ }) } else { @() }; "
         "$v6 = (Get-NetAdapterBinding -Name $ad.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue).Enabled; "
-        "@{ name = $ad.Name; ifIndex = $ad.ifIndex; ips = $ips; dns = @($dns); ipv6_enabled = $v6 } | ConvertTo-Json -Depth 4 -Compress }"
+        "$regDns = (Get-DnsClient -InterfaceIndex $ad.ifIndex -ErrorAction SilentlyContinue).RegisterThisConnectionsAddress; "
+        "@{ name = $ad.Name; ifIndex = $ad.ifIndex; dhcp = ($ifv4.Dhcp -eq 'Enabled'); ips = $ips; gateways = $gws; dns = @($dns); static_dns = $staticDns; ipv6_enabled = $v6; register_dns = $regDns } | ConvertTo-Json -Depth 4 -Compress }"
     )
     return {"platform": "win64", **json.loads(raw)} if raw else {"platform": "win64", "name": iface_name}
 
 
-def restore_network_snapshot(snapshot_path: Path, *, force: bool = False) -> dict[str, Any]:
+def _snapshot_entry_key(entry: dict[str, Any]) -> tuple[str, str]:
+    plat = str(entry.get("platform") or "")
+    ident = str(entry.get("name") or entry.get("iface") or entry.get("network_service") or "")
+    return (plat, ident)
+
+
+def _save_initial_snapshot(
+    snapshot_path: Path | None,
+    applied_static_ip: str,
+    new_entries: list[dict[str, Any]],
+) -> None:
+    """Persist pre-isolation snapshot without overwriting already-captured adapter baselines on reconnects."""
+    if snapshot_path is None:
+        return
+    merged_entries: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if snapshot_path.is_file():
+        try:
+            existing = read_json(snapshot_path)
+            if isinstance(existing, dict) and isinstance(existing.get("entries"), list):
+                created_at = str(existing.get("created_at") or created_at)
+                for item in existing["entries"]:
+                    if isinstance(item, dict):
+                        key = _snapshot_entry_key(item)
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            merged_entries.append(item)
+        except Exception:
+            pass
+    for item in new_entries:
+        key = _snapshot_entry_key(item)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            merged_entries.append(item)
+    write_json(
+        snapshot_path,
+        {
+            "created_at": created_at,
+            "applied_static_ip": applied_static_ip,
+            "entries": merged_entries,
+        },
+    )
+
+
+def restore_network_snapshot(
+    snapshot_path: Path,
+    *,
+    force: bool = False,
+    target_names: set[str] | None = None,
+) -> dict[str, Any]:
     """Restore pre-isolation network settings ONLY if current state still matches what we applied (or force=True)."""
     snap = read_json(snapshot_path)
     results: list[dict[str, Any]] = []
     for entry in snap.get("entries", []):
         applied_ip = snap.get("applied_static_ip", "192.168.77.12")
         plat = entry.get("platform")
+        ident = entry.get("name") or entry.get("iface") or entry.get("network_service")
+        if target_names is not None and ident not in target_names:
+            continue
         if plat == "linux":
             ifname = entry["iface"]
             cur = _snapshot_linux_iface(ifname)
@@ -525,6 +607,8 @@ def restore_network_snapshot(snapshot_path: Path, *, force: bool = False) -> dic
                         nm.get("ipv4.gateway", ""),
                         "ipv4.never-default",
                         nm.get("ipv4.never-default") or "no",
+                        "ipv4.ignore-auto-dns",
+                        nm.get("ipv4.ignore-auto-dns") or "no",
                         "ipv6.method",
                         nm.get("ipv6.method") or "auto",
                     ]
@@ -540,9 +624,28 @@ def restore_network_snapshot(snapshot_path: Path, *, force: bool = False) -> dic
             if not force and f"IP address: {applied_ip}" not in cur.get("getinfo", ""):
                 results.append({"network_service": svc, "status": "skipped_user_modified"})
                 continue
-            _run_priv_posix(["networksetup", "-setdhcp", svc])
-            _run_priv_posix(["networksetup", "-setv6automatic", svc], check=False)
-            results.append({"network_service": svc, "status": "restored_dhcp"})
+            orig_info = entry.get("getinfo", "")
+            if "Manual Configuration" in orig_info:
+                m_ip = re.search(r"^IP address:\s*(\S+)", orig_info, re.M)
+                m_mask = re.search(r"^Subnet mask:\s*(\S+)", orig_info, re.M)
+                m_gw = re.search(r"^Router:\s*(\S+)", orig_info, re.M)
+                if m_ip and m_mask:
+                    gw = m_gw.group(1) if m_gw and m_gw.group(1) != "(null)" else ""
+                    _run_priv_posix(["networksetup", "-setmanual", svc, m_ip.group(1), m_mask.group(1), gw])
+                else:
+                    _run_priv_posix(["networksetup", "-setdhcp", svc])
+            else:
+                _run_priv_posix(["networksetup", "-setdhcp", svc])
+            orig_dns = [ln.strip() for ln in entry.get("getdnsservers", "").splitlines() if ln.strip()]
+            if orig_dns and not orig_dns[0].lower().startswith("there aren't"):
+                _run_priv_posix(["networksetup", "-setdnsservers", svc, *orig_dns], check=False)
+            else:
+                _run_priv_posix(["networksetup", "-setdnsservers", svc, "Empty"], check=False)
+            if "IPv6: Off" in orig_info:
+                _run_priv_posix(["networksetup", "-setv6off", svc], check=False)
+            else:
+                _run_priv_posix(["networksetup", "-setv6automatic", svc], check=False)
+            results.append({"network_service": svc, "status": "restored_macos"})
         elif plat == "win64":
             name = entry["name"]
             cur = _snapshot_windows_adapter(name)
@@ -550,11 +653,78 @@ def restore_network_snapshot(snapshot_path: Path, *, force: bool = False) -> dic
             if not force and live_ips != [applied_ip]:
                 results.append({"iface": name, "status": "skipped_user_modified", "live_ips": live_ips})
                 continue
-            _ps(
-                f"Set-NetIPInterface -InterfaceAlias '{name}' -AddressFamily IPv4 -Dhcp Enabled -AutomaticMetric Enabled -ErrorAction SilentlyContinue; "
-                f"Enable-NetAdapterBinding -Name '{name}' -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue"
+            q_name = _ps_quote(name)
+            was_dhcp = entry.get("dhcp")
+            orig_ips = entry.get("ips") or []
+            if was_dhcp is None:
+                was_dhcp = not any(str(x.get("PrefixOrigin", "")).lower() == "manual" for x in orig_ips)
+            v6_enabled = entry.get("ipv6_enabled", True)
+            reg_dns = entry.get("register_dns", True)
+            orig_static_dns = [d for d in (entry.get("static_dns") or []) if d]
+            orig_dns = [d for d in (entry.get("dns") or []) if d]
+            # For DHCP adapters, only apply explicit static_dns overrides (never pin DHCP-leased DNS as static).
+            dns_to_set = orig_static_dns if was_dhcp else (orig_static_dns or orig_dns)
+            orig_gws = [g for g in (entry.get("gateways") or []) if g and g != "0.0.0.0"]
+
+            ps_lines = [
+                "$errs = @()",
+                f"$ad = Get-NetAdapter -Name {q_name} -ErrorAction SilentlyContinue",
+                "if (-not $ad) { @{ found = $false; errors = @('adapter_not_found') } | ConvertTo-Json -Compress } else {",
+                "  $reg = \"HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$($ad.InterfaceGuid)\"",
+            ]
+            if was_dhcp:
+                ps_lines.extend([
+                    "  if (Test-Path $reg) {",
+                    "    try { Set-ItemProperty -Path $reg -Name EnableDHCP -Value 1 -Type DWord -ErrorAction Stop } catch { $errs += $_.Exception.Message }",
+                    "    Remove-ItemProperty -Path $reg -Name IPAddress,SubnetMask,DefaultGateway,NameServer -ErrorAction SilentlyContinue",
+                    "  }",
+                    "  Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' } | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue",
+                    "  try { Set-NetIPInterface -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -Dhcp Enabled -AutomaticMetric Enabled -ErrorAction Stop } catch { $errs += $_.Exception.Message }",
+                ])
+            else:
+                manual_ips = [x for x in orig_ips if x.get("IPAddress")]
+                ps_lines.append(
+                    "  Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue"
+                )
+                for idx_ip, ip_rec in enumerate(manual_ips):
+                    ip_val = _ps_quote(ip_rec["IPAddress"])
+                    plen = int(ip_rec.get("PrefixLength") or 24)
+                    gw_arg = f" -DefaultGateway {_ps_quote(orig_gws[0])}" if (idx_ip == 0 and orig_gws) else ""
+                    ps_lines.append(
+                        f"  try {{ New-NetIPAddress -InterfaceIndex $ad.ifIndex -IPAddress {ip_val} -PrefixLength {plen}{gw_arg} -Confirm:$false -ErrorAction Stop | Out-Null }} catch {{ $errs += $_.Exception.Message }}"
+                    )
+            if dns_to_set:
+                dns_arr = ",".join(_ps_quote(d) for d in dns_to_set)
+                ps_lines.append(
+                    f"  try {{ Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ServerAddresses @({dns_arr}) -ErrorAction Stop }} catch {{ $errs += $_.Exception.Message }}"
+                )
+            else:
+                ps_lines.append(
+                    "  try { Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ResetServerAddresses -ErrorAction Stop } catch { $errs += $_.Exception.Message }"
+                )
+            reg_dns_ps = "$true" if reg_dns else "$false"
+            ps_lines.append(
+                f"  try {{ Set-DnsClient -InterfaceIndex $ad.ifIndex -RegisterThisConnectionsAddress {reg_dns_ps} -ErrorAction Stop }} catch {{ $errs += $_.Exception.Message }}"
             )
-            results.append({"iface": name, "status": "restored_dhcp"})
+            if v6_enabled is False:
+                ps_lines.append(
+                    "  try { Disable-NetAdapterBinding -Name $ad.Name -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop } catch { $errs += $_.Exception.Message }"
+                )
+            else:
+                ps_lines.append(
+                    "  try { Enable-NetAdapterBinding -Name $ad.Name -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop } catch { $errs += $_.Exception.Message }"
+                )
+            ps_lines.append("  @{ found = $true; errors = $errs } | ConvertTo-Json -Compress")
+            ps_lines.append("}")
+            raw_res = _ps("\n".join(ps_lines))
+            ps_meta = json.loads(raw_res) if raw_res and raw_res.strip().startswith("{") else {"found": True, "errors": []}
+            if not ps_meta.get("found", True):
+                results.append({"iface": name, "status": "adapter_not_found"})
+            elif ps_meta.get("errors"):
+                err_list = ps_meta["errors"] if isinstance(ps_meta["errors"], list) else [ps_meta["errors"]]
+                raise RuntimeError(f"Failed restoring Windows network adapter {name!r}: {err_list}")
+            else:
+                results.append({"iface": name, "status": "restored_dhcp" if was_dhcp else "restored_static"})
     return {"snapshot_path": str(snapshot_path), "results": results}
 
 
@@ -573,11 +743,120 @@ def isolate_usb_rndis_adapter(
 
     plat = detect_host_platform()
     if mode == "internet-exit":
+        restored: list[dict[str, Any]] = []
+        if snapshot_path is not None and snapshot_path.is_file():
+            rest = restore_network_snapshot(
+                snapshot_path,
+                force=False,
+                target_names={target_iface} if target_iface else None,
+            )
+            restored = rest.get("results", [])
+        elif plat == "win64":
+            try:
+                cand_raw = _ps(
+                    "$ads = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } "
+                    "| ForEach-Object { @{ name = $_.Name; ifIndex = $_.ifIndex; desc = $_.InterfaceDescription; pnp_id = $_.PnpDeviceID; "
+                    "vid = if ($_.PnpDeviceID -match 'VID_([0-9A-Fa-f]{4})') { $Matches[1].ToLower() } else { '' }; "
+                    "pid = if ($_.PnpDeviceID -match 'PID_([0-9A-Fa-f]{4})') { $Matches[1].ToLower() } else { '' }; "
+                    "serial = if ($_.PnpDeviceID -match '\\\\([^\\\\]+)$') { $Matches[1] } else { '' } } }); "
+                    "$ads | ConvertTo-Json -Depth 4 -Compress"
+                )
+                cands = json.loads(cand_raw) if cand_raw else []
+                if isinstance(cands, dict):
+                    cands = [cands]
+                sel = select_target_usb_adapters(
+                    cands,
+                    target_iface=target_iface,
+                    usb_topology=usb_topology,
+                    include_zte_android=include_zte_android,
+                )
+                if not sel["ambiguous"]:
+                    for t in sel["targets"]:
+                        snap = _snapshot_windows_adapter(t["name"])
+                        live_ips = [x.get("IPAddress") for x in snap.get("ips", [])]
+                        if static_ip in live_ips:
+                            q_name = _ps_quote(t["name"])
+                            _ps(
+                                f"$ad = Get-NetAdapter -Name {q_name} -ErrorAction SilentlyContinue; "
+                                "if ($ad) { "
+                                "$reg = \"HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$($ad.InterfaceGuid)\"; "
+                                "if (Test-Path $reg) { Set-ItemProperty -Path $reg -Name EnableDHCP -Value 1 -Type DWord -ErrorAction SilentlyContinue; "
+                                "Remove-ItemProperty -Path $reg -Name IPAddress,SubnetMask,DefaultGateway,NameServer -ErrorAction SilentlyContinue }; "
+                                "Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' } | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; "
+                                "Set-NetIPInterface -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -Dhcp Enabled -AutomaticMetric Enabled -ErrorAction SilentlyContinue; "
+                                "Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue; "
+                                "Set-DnsClient -InterfaceIndex $ad.ifIndex -RegisterThisConnectionsAddress $true -ErrorAction SilentlyContinue; "
+                                "Enable-NetAdapterBinding -Name $ad.Name -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue }"
+                            )
+                            restored.append({"iface": t["name"], "status": "restored_dhcp_internet_exit"})
+            except Exception:
+                pass
+        elif plat in ("linux-x64", "linux-arm64"):
+            try:
+                cands = _detect_linux_net_candidates()
+                sel = select_target_usb_adapters(
+                    cands,
+                    target_iface=target_iface,
+                    usb_topology=usb_topology,
+                    include_zte_android=include_zte_android,
+                )
+                nmcli = shutil.which("nmcli")
+                if not sel["ambiguous"] and nmcli:
+                    for t in sel["targets"]:
+                        snap = _snapshot_linux_iface(t["name"])
+                        cur_ips = [ai.get("local") for blk in snap.get("ip_addr_json", []) for ai in blk.get("addr_info", [])]
+                        conn = snap.get("nm_connection", "")
+                        if static_ip in cur_ips and conn and conn != "--":
+                            _run_priv_posix(
+                                [
+                                    nmcli,
+                                    "con",
+                                    "mod",
+                                    conn,
+                                    "ipv4.method",
+                                    "auto",
+                                    "ipv4.addresses",
+                                    "",
+                                    "ipv4.gateway",
+                                    "",
+                                    "ipv4.never-default",
+                                    "no",
+                                    "ipv4.ignore-auto-dns",
+                                    "no",
+                                    "ipv6.method",
+                                    "auto",
+                                ]
+                            )
+                            _run_priv_posix([nmcli, "dev", "reapply", t["name"]], check=False)
+                            restored.append({"iface": t["name"], "status": "restored_dhcp_internet_exit"})
+            except Exception:
+                pass
+        elif plat == "macos":
+            try:
+                cands = _detect_macos_candidates()
+                sel = select_target_usb_adapters(
+                    cands,
+                    target_iface=target_iface,
+                    usb_topology=usb_topology,
+                    include_zte_android=include_zte_android,
+                )
+                if not sel["ambiguous"]:
+                    for t in sel["targets"]:
+                        svc = t["network_service"]
+                        snap = _snapshot_macos_service(svc, t["device"])
+                        if f"IP address: {static_ip}" in snap.get("getinfo", ""):
+                            _run_priv_posix(["networksetup", "-setdhcp", svc])
+                            _run_priv_posix(["networksetup", "-setdnsservers", svc, "Empty"], check=False)
+                            _run_priv_posix(["networksetup", "-setv6automatic", svc], check=False)
+                            restored.append({"network_service": svc, "status": "restored_dhcp_internet_exit"})
+            except Exception:
+                pass
         return {
             "host_platform": plat,
             "mode": "internet-exit",
             "isolated": [],
-            "note": "Internet-exit mode requested explicitly; leaving target F50 Pro DHCP/default gateway active.",
+            "restored": restored,
+            "note": "Internet-exit mode active; target F50 Pro DHCP/default gateway enabled.",
         }
 
     if plat == "win64":
@@ -605,18 +884,11 @@ def isolate_usb_rndis_adapter(
             return {"host_platform": "win64", "mode": mode, "isolated": [], "ignored": sel["ignored"], "status": "no_target_matched"}
 
         snapshots = [_snapshot_windows_adapter(t["name"]) for t in targets]
-        if snapshot_path is not None:
-            write_json(
-                snapshot_path,
-                {
-                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "applied_static_ip": static_ip,
-                    "entries": snapshots,
-                },
-            )
+        _save_initial_snapshot(snapshot_path, static_ip, snapshots)
 
         target_names = [t["name"] for t in targets]
-        names_ps = ",".join(f"'{n}'" for n in target_names)
+        names_ps = ",".join(_ps_quote(n) for n in target_names)
+        q_ip = _ps_quote(static_ip)
         ps_script = f"""
 $ErrorActionPreference = 'Stop'
 $ads = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -in @({names_ps}) }}
@@ -625,7 +897,7 @@ foreach ($ad in $ads) {{
     $reg = "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$($ad.InterfaceGuid)"
     if (Test-Path $reg) {{
         Set-ItemProperty -Path $reg -Name EnableDHCP -Value 0 -Type DWord
-        Set-ItemProperty -Path $reg -Name IPAddress -Value ([string[]]@('{static_ip}')) -Type MultiString
+        Set-ItemProperty -Path $reg -Name IPAddress -Value ([string[]]@({q_ip})) -Type MultiString
         Set-ItemProperty -Path $reg -Name SubnetMask -Value ([string[]]@('255.255.255.0')) -Type MultiString
         Set-ItemProperty -Path $reg -Name DefaultGateway -Value ([string[]]@()) -Type MultiString
         Set-ItemProperty -Path $reg -Name NameServer -Value '' -Type String
@@ -634,24 +906,37 @@ foreach ($ad in $ads) {{
     }}
     Disable-NetAdapterBinding -Name $ad.Name -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue
     Set-NetIPInterface -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -Dhcp Disabled -AutomaticMetric Disabled -InterfaceMetric 5000 -ErrorAction SilentlyContinue
-    Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -ne '{static_ip}' }} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-    if (-not (Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq '{static_ip}' }})) {{
-        New-NetIPAddress -InterfaceIndex $ad.ifIndex -IPAddress '{static_ip}' -PrefixLength 24 -Confirm:$false | Out-Null
+    Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -ne {q_ip} }} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+    if (-not (Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq {q_ip} }})) {{
+        New-NetIPAddress -InterfaceIndex $ad.ifIndex -IPAddress {q_ip} -PrefixLength 24 -Confirm:$false | Out-Null
     }}
     Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue
     Set-DnsClient -InterfaceIndex $ad.ifIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
     Get-NetRoute -InterfaceIndex $ad.ifIndex -DestinationPrefix '0.0.0.0/0','::/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-    $updated += @{{ name = $ad.Name; ifIndex = $ad.ifIndex; pnp_id = $ad.PnpDeviceID; ip = '{static_ip}' }}
+    $updated += @{{ name = $ad.Name; ifIndex = $ad.ifIndex; pnp_id = $ad.PnpDeviceID; ip = {q_ip} }}
 }}
 Start-Sleep -Seconds 2
 $targetIdx = @($ads | ForEach-Object {{ $_.ifIndex }})
-$routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' -ErrorAction SilentlyContinue | Where-Object {{ $_.ifIndex -in $targetIdx }} | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric)
-@{{ isolated = $updated; target_default_routes = $routes }} | ConvertTo-Json -Depth 4 -Compress
+$qErrs = @()
+$allRoutes = @()
+try {{ $allRoutes = @(Get-NetRoute -ErrorAction Stop | Select-Object DestinationPrefix,ifIndex,InterfaceAlias,NextHop,RouteMetric) }} catch {{ if ($_.CategoryInfo.Category -ne 'ObjectNotFound') {{ $qErrs += ('routes:' + $_.Exception.Message) }} }}
+$routes = @($allRoutes | Where-Object {{ ($_.DestinationPrefix -eq '0.0.0.0/0' -or $_.DestinationPrefix -eq '::/0') -and ($_.ifIndex -in $targetIdx) }} | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric)
+@{{ isolated = $updated; target_default_routes = $routes; query_errors = $qErrs }} | ConvertTo-Json -Depth 4 -Compress
 """
         raw = _ps(ps_script)
-        data = json.loads(raw) if raw else {"isolated": [], "target_default_routes": []}
+        data = json.loads(raw) if raw else {"isolated": [], "target_default_routes": [], "query_errors": ["empty_ps_output"]}
         if data.get("target_default_routes"):
             raise RuntimeError(f"Default gateway leak persists on correlated F50 Pro adapter: {data['target_default_routes']}")
+        if data.get("query_errors"):
+            raise RuntimeError(f"Windows route verification failed after isolation: {data['query_errors']}")
+        audit = audit_default_routes(
+            target_iface=target_iface,
+            usb_topology=usb_topology,
+            include_zte_android=include_zte_android,
+        )
+        if audit.get("usb_default_route_leak") or audit.get("audit_incomplete"):
+            raise RuntimeError(f"Windows default gateway leak or incomplete route audit after isolation: {audit}")
+        data["audit"] = audit
         data["ignored"] = sel["ignored"]
         return data
 
@@ -670,15 +955,7 @@ $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' -ErrorAction Sile
             return {"host_platform": plat, "mode": mode, "isolated": [], "ignored": sel["ignored"], "status": "no_target_matched"}
 
         snapshots = [_snapshot_linux_iface(t["name"]) for t in targets]
-        if snapshot_path is not None:
-            write_json(
-                snapshot_path,
-                {
-                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "applied_static_ip": static_ip,
-                    "entries": snapshots,
-                },
-            )
+        _save_initial_snapshot(snapshot_path, static_ip, snapshots)
 
         updated: list[dict[str, Any]] = []
         nmcli = shutil.which("nmcli")
@@ -717,8 +994,8 @@ $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' -ErrorAction Sile
             updated.append({"name": ifname, "method": "iproute2", "ip": static_ip})
 
         audit = audit_default_routes(target_iface=target_iface, usb_topology=usb_topology, include_zte_android=include_zte_android)
-        if audit.get("usb_default_route_leak"):
-            raise RuntimeError(f"Linux default gateway leak persists after isolation: {audit['leaks']}")
+        if audit.get("usb_default_route_leak") or audit.get("audit_incomplete"):
+            raise RuntimeError(f"Linux default gateway leak or incomplete route audit after isolation: {audit}")
         return {"host_platform": plat, "mode": mode, "isolated": updated, "ignored": sel["ignored"], "audit": audit}
 
     if plat == "macos":
@@ -736,15 +1013,7 @@ $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' -ErrorAction Sile
             return {"host_platform": "macos", "mode": mode, "isolated": [], "ignored": sel["ignored"], "status": "no_target_matched"}
 
         snapshots = [_snapshot_macos_service(t["network_service"], t["device"]) for t in targets]
-        if snapshot_path is not None:
-            write_json(
-                snapshot_path,
-                {
-                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "applied_static_ip": static_ip,
-                    "entries": snapshots,
-                },
-            )
+        _save_initial_snapshot(snapshot_path, static_ip, snapshots)
 
         updated = []
         for item in targets:
@@ -756,8 +1025,8 @@ $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' -ErrorAction Sile
             _run_priv_posix(["route", "-n", "delete", "default", "-ifscope", dev], check=False)
             updated.append({"network_service": svc, "hardware_port": item.get("hardware_port"), "device": dev, "ip": static_ip})
         audit = audit_default_routes(target_iface=target_iface, usb_topology=usb_topology, include_zte_android=include_zte_android)
-        if audit.get("usb_default_route_leak"):
-            raise RuntimeError(f"macOS default gateway leak persists after isolation: {audit['leaks']}")
+        if audit.get("usb_default_route_leak") or audit.get("audit_incomplete"):
+            raise RuntimeError(f"macOS default gateway leak or incomplete route audit after isolation: {audit}")
         return {"host_platform": "macos", "mode": mode, "isolated": updated, "ignored": sel["ignored"], "audit": audit}
 
     return {
@@ -775,16 +1044,22 @@ def audit_default_routes(
 ) -> dict[str, Any]:
     """Read-only verification that 0.0.0.0/0 and ::/0 do not route via correlated F50 Pro USB interface(s)."""
     if sys.platform == "win32":
+        pnp_regex = "VID_1D6B&PID_0104|VID_19D2" if include_zte_android else "VID_1D6B&PID_0104"
         raw = _ps(
-            "$r4 = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric);"
-            "$r6 = @(Get-NetRoute -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric);"
-            "$usb = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.PnpDeviceID -match 'VID_1D6B&PID_0104' } | Select-Object ifIndex,Name,InterfaceDescription,PnpDeviceID,Status);"
-            "@{ ipv4_default = $r4; ipv6_default = $r6; rndis_adapters = $usb } | ConvertTo-Json -Depth 4 -Compress"
+            "$qErrs = @();"
+            "$allRoutes = @(); try { $allRoutes = @(Get-NetRoute -ErrorAction Stop | Select-Object DestinationPrefix,ifIndex,InterfaceAlias,NextHop,RouteMetric) } catch { if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { $qErrs += ('routes:' + $_.Exception.Message) } };"
+            "$r4 = @($allRoutes | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric);"
+            "$r6 = @($allRoutes | Where-Object { $_.DestinationPrefix -eq '::/0' } | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric);"
+            f"$usb = @(); try {{ $usb = @(Get-NetAdapter -ErrorAction Stop | Where-Object {{ $_.PnpDeviceID -match '{pnp_regex}' }} | Select-Object ifIndex,Name,InterfaceDescription,PnpDeviceID,Status) }} catch {{ if ($_.CategoryInfo.Category -ne 'ObjectNotFound') {{ $qErrs += ('usb:' + $_.Exception.Message) }} }};"
+            "@{ ipv4_default = $r4; ipv6_default = $r6; rndis_adapters = $usb; query_errors = $qErrs } | ConvertTo-Json -Depth 4 -Compress"
         )
         info = json.loads(raw)
-        cands = info.get("rndis_adapters", [])
-        if target_iface:
-            cands = [a for a in cands if a.get("Name") == target_iface]
+        all_cands = info.get("rndis_adapters", [])
+        cands = [a for a in all_cands if a.get("Name") == target_iface] if target_iface else list(all_cands)
+        if target_iface and not cands and all_cands:
+            # Stale/renamed --target-iface must NEVER mask an active default-route leak on a live F50 Pro adapter.
+            cands = list(all_cands)
+            info["target_iface_not_found"] = target_iface
         usb_indices = {a["ifIndex"] for a in cands}
         # Only count default routes actually egressing an identified F50 Pro interface (NOT normal Wi-Fi on 192.168.0.1!)
         leaks = [
@@ -795,6 +1070,10 @@ def audit_default_routes(
         info["host_platform"] = "win64"
         info["usb_default_route_leak"] = bool(leaks)
         info["leaks"] = leaks
+        q_errs = info.get("query_errors")
+        if q_errs:
+            info["audit_incomplete"] = True
+            info["warning"] = f"Windows route/adapter query failed: {q_errs}"
         return info
 
     plat = detect_host_platform()
@@ -807,21 +1086,45 @@ def audit_default_routes(
             include_zte_android=include_zte_android,
         )
         target_names = {x["name"] for x in sel["targets"]}
+        stale_target_iface: str | None = None
+        if target_iface and not target_names:
+            fallback_sel = select_target_usb_adapters(
+                cands,
+                usb_topology=usb_topology,
+                include_zte_android=include_zte_android,
+            )
+            if fallback_sel["targets"]:
+                target_names = {x["name"] for x in fallback_sel["targets"]}
+                stale_target_iface = target_iface
         if not shutil.which("ip"):
-            return {
+            out_miss: dict[str, Any] = {
                 "host_platform": plat,
                 "usb_default_route_leak": False,
+                "audit_incomplete": True,
                 "usb_adapters": sel["targets"],
                 "ambiguous": sel["ambiguous"],
                 "warning": "ip command missing",
             }
+            if stale_target_iface:
+                out_miss["target_iface_not_found"] = stale_target_iface
+            return out_miss
         r4 = _run_cmd(["ip", "-j", "route", "show", "default"], check=False)
         r6 = _run_cmd(["ip", "-j", "-6", "route", "show", "default"], check=False)
-        info = parse_linux_ip_routes(r4.stdout if r4.returncode == 0 else "[]", r6.stdout if r6.returncode == 0 else "[]", target_names)
+        # Always parse whichever address family succeeded so an active IPv4 leak is never masked by an IPv6 query error.
+        info = parse_linux_ip_routes(
+            r4.stdout if r4.returncode == 0 else "[]",
+            r6.stdout if r6.returncode == 0 else "[]",
+            target_names,
+        )
         info["host_platform"] = plat
         info["usb_adapters"] = sel["targets"]
         info["ambiguous"] = sel["ambiguous"]
         info["ignored_non_target_ifaces"] = sel["ignored"]
+        if stale_target_iface:
+            info["target_iface_not_found"] = stale_target_iface
+        if r4.returncode != 0 or r6.returncode != 0:
+            info["audit_incomplete"] = True
+            info["warning"] = f"ip route inspection failed (rc4={r4.returncode}, rc6={r6.returncode})"
         return info
 
     if plat == "macos":
@@ -833,12 +1136,32 @@ def audit_default_routes(
             include_zte_android=include_zte_android,
         )
         target_devs = {x["device"] for x in sel["targets"] if x.get("device")}
+        stale_mac_iface: str | None = None
+        if target_iface and not target_devs:
+            fallback_mac = select_target_usb_adapters(
+                cands,
+                usb_topology=usb_topology,
+                include_zte_android=include_zte_android,
+            )
+            fb_devs = {x["device"] for x in fallback_mac["targets"] if x.get("device")}
+            if fb_devs:
+                target_devs = fb_devs
+                stale_mac_iface = target_iface
         r4 = _run_cmd(["netstat", "-rn", "-f", "inet"], check=False)
         r6 = _run_cmd(["netstat", "-rn", "-f", "inet6"], check=False)
-        info = parse_macos_netstat_routes(r4.stdout, r6.stdout, target_devs)
+        info = parse_macos_netstat_routes(
+            r4.stdout if r4.returncode == 0 else "",
+            r6.stdout if r6.returncode == 0 else "",
+            target_devs,
+        )
         info["usb_adapters"] = sel["targets"]
         info["ambiguous"] = sel["ambiguous"]
         info["ignored_non_target_services"] = sel["ignored"]
+        if stale_mac_iface:
+            info["target_iface_not_found"] = stale_mac_iface
+        if r4.returncode != 0 or r6.returncode != 0:
+            info["audit_incomplete"] = True
+            info["warning"] = f"netstat route inspection failed (rc4={r4.returncode}, rc6={r6.returncode})"
         return info
 
     # Android host (Termux / rooted phone): read-only check without falsely claiming 192.168.0.1 Wi-Fi is a leak
@@ -875,7 +1198,7 @@ def main() -> int:
     if args.cmd == "audit":
         res = audit_default_routes(target_iface=args.target_iface)
         print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 1 if res.get("usb_default_route_leak") else 0
+        return 1 if (res.get("usb_default_route_leak") or res.get("audit_incomplete")) else 0
     if args.cmd == "bind-rndis":
         clear_negative_usbflags_rndis()
         res = bind_inbox_rndis_driver(install=True)

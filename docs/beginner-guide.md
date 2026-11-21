@@ -164,7 +164,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 检查输出里的关键信息：
 - `"status": "DRY_RUN_READY"`
-- `"board_id"`：会显示 `"6"`（插卡版 `B28`）或 `"1"`（内置双 eSIM 版 `B15`），确认识别无误！
+- `"inspect"` 中的 `"trustos_a"` 补丁偏移与 `"vendor_boot_a"` DTB 摘要已自动识别（注：离线备份阶段 `"board_id"` 为 `null`，会在刷入 OpenWrt 连上 SSH 后实时读取为 `"6"` 或 `"1"`）
 - `"device_mutated": false`
 - 也可以打开 `build\my-f50pro\build\flash_plan.json` 看一眼写入清单，确认被禁止分区（`FORBIDDEN_PARTITIONS`）写入数为 0。
 
@@ -264,9 +264,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 - **在方案 3 下**：为了防止安卓侧插回 Windows 时偷跑手机流量或劫持电脑断网，安卓侧默认设置为了 **`charging,adb`（仅充电 + ADB，不向电脑暴露 USB 网卡）**。
   - 所以切到安卓后，用手机或电脑**连接 F50 Pro 发出的安卓 Wi-Fi 热点**，然后浏览器访问：
     - **UFI-TOOLS 后台**：`http://192.168.0.1:2333`
-    - **网页终端 (ttyd)**：`http://192.168.0.1:1146`
+    - **网页终端 (ttyd)**：`http://192.168.0.1:1146`（默认使用 UFI-TOOLS 应用内设置的登录口令；若应用尚未设置口令，请查看本机生成的随机初始口令文件 `build\<session>\build\android-ttyd-credentials.json`，已彻底移除 APK 硬编码后备口令）
   - 电脑端也可以在 USB 直连时通过 `adb shell` 调试（已自动内置免弹窗 RSA 公钥）。
-- **在方案 1 下**：默认保持 `rndis,serial_smd,diag,adb`，插 USB 即可直接访问 `http://192.168.0.1:2333` 和 `:1146`。
+- **在方案 1 下**：默认保持 `rndis,serial_smd,diag,adb`，插 USB 即可直接访问 `http://192.168.0.1:2333` 和 `:1146`（初始网页终端随机口令同样保存在 `android-ttyd-credentials.json`）。
 
 ### 6. 电脑端上网与管理口模式切换（防断网隔离）
 - 平时插在电脑上只想当管理口、**不抢电脑原本 Wi-Fi/宽带网络**，工具默认就是 `management` 隔离模式（电脑保持原网络，通过 `192.168.77.1` 管理路由器）。

@@ -119,9 +119,15 @@ ADB_KEY_DIR="$HOME/.android"
 ADB_PUB="$ADB_KEY_DIR/adbkey.pub"
 if [[ ! -f "$ADB_PUB" ]]; then
   ADB_BIN=""
+  PLAT_ADB=""
+  case "$DETECTED" in
+    linux-x64) PLAT_ADB="$ROOT/build/runtime-tools/host-tools-linux-x64/platform-tools/adb" ;;
+    linux-arm64) PLAT_ADB="$ROOT/build/runtime-tools/host-tools-linux-arm64/bin/adb" ;;
+    macos) PLAT_ADB="$ROOT/build/runtime-tools/host-tools-macos/platform-tools/adb" ;;
+    android-arm64) PLAT_ADB="$ROOT/build/runtime-tools/host-tools-android-arm64/bin/adb" ;;
+  esac
   for cand in \
-    "$ROOT/build/runtime-tools/host-tools-linux-x64/platform-tools/adb" \
-    "$ROOT/build/runtime-tools/host-tools-macos/platform-tools/adb" \
+    "$PLAT_ADB" \
     "$(command -v adb 2>/dev/null || true)" \
     "$(command -v termux-adb 2>/dev/null || true)"; do
     if [[ -n "$cand" && -x "$cand" ]]; then
@@ -147,7 +153,7 @@ case "$DETECTED" in
     ;;
   macos)
     echo "macOS tip: macOS raw USB BootROM/AutoD claiming requires root (sudo). Example:"
-    echo "  sudo .venv/bin/python scripts/kit.py backup --output-dir build/device-session/backup"
+    echo "  sudo .venv/bin/python scripts/kit.py backup --output-dir build/device-session/backup --authorize-device-reboot"
     ;;
   android-arm64)
     echo "Android Termux note:"

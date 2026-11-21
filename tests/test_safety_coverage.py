@@ -56,7 +56,7 @@ def test_flash_aborts_before_wof_on_readback_mismatch(synthetic_env: dict[str, P
     fake_sess.table.return_value = good_tbl
 
     def _dev_a_identity_then_corrupt(part: str, sz: int, fname: str) -> bytes:
-        if "_id_probe" in fname:
+        if "_id_probe" in fname or "_pre" in fname:
             return (synthetic_env["backup_dir"] / part).read_bytes()[:sz]
         return b"\xff" * sz
 

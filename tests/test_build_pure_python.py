@@ -30,7 +30,7 @@ def test_inspect_detects_trustos_offset_dynamically(synthetic_env: dict[str, Pat
 def test_arm64_dis_avb_ast_locator() -> None:
     """Exercise the pure-Python ARM64 ADRP+ADD+epilogue TrustOS scanner."""
     from inspect_backup import locate_trustos_patch_offset
-    from tests.conftest import make_synthetic_dhtb
+    from conftest import make_synthetic_dhtb
 
     # Construct minimal AArch64 function referencing '### enter avb_slot_verify. ###'
     payload = bytearray(0x2000)

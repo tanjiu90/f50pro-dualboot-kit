@@ -35,7 +35,11 @@
 手动运行网络修复与审计：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\host_network.py --install --isolate --audit
+.\.venv\Scripts\python.exe scripts\host_network.py bind-rndis
+.\.venv\Scripts\python.exe scripts\host_network.py isolate --snapshot build\device-session\build\host_network_snapshot.json
+.\.venv\Scripts\python.exe scripts\host_network.py audit
+# 需要恢复隔离前的原始网卡配置时：
+.\.venv\Scripts\python.exe scripts\host_network.py restore --snapshot build\device-session\build\host_network_snapshot.json
 ```
 
 ---

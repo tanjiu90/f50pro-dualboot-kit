@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import http.cookiejar
 import json
 import os
@@ -18,6 +19,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -103,7 +105,11 @@ def _attempt_zte_webui_reboot_once(
         return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
 
     jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    # Explicitly bypass OS/environment HTTP proxies when talking to local 192.168.0.1 WebUI.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPCookieProcessor(jar),
+    )
 
     def zget(cmd: str) -> dict[str, Any]:
         url = f"{host}/goform/goform_get_cmd_process?isTest=false&multi_data=1&cmd={urllib.parse.quote(cmd)}"
@@ -133,13 +139,26 @@ def _attempt_zte_webui_reboot_once(
         return None
 
     login_hash = sha_u(sha_u(password) + info["LD"])
-    login_res = zpost({"isTest": "false", "goformId": "LOGIN", "password": login_hash})
+    try:
+        login_res = zpost({"isTest": "false", "goformId": "LOGIN", "password": login_hash})
+    except Exception:
+        return None
     if str(login_res.get("result")) not in ("0", "4"):
         raise WebUIAuthError(f"WebUI login failed: {login_res}")
 
-    rd = zget("RD")["RD"]
+    try:
+        rd_resp = zget("RD")
+        rd = rd_resp.get("RD") if isinstance(rd_resp, dict) else None
+    except Exception:
+        return None
+    if not rd:
+        return None
     ad = sha_u(sha_u(info.get("wa_inner_version", "") + info.get("cr_version", "")) + rd)
-    reb = zpost({"isTest": "false", "goformId": "REBOOT_DEVICE", "AD": ad})
+    try:
+        reb = zpost({"isTest": "false", "goformId": "REBOOT_DEVICE", "AD": ad})
+    except (OSError, http.client.HTTPException, urllib.error.URLError) as exc:
+        # Router may drop TCP immediately as it begins rebooting.
+        reb = {"connection_reset_during_reboot": True, "detail": str(exc)}
     return {"method": "webui_reboot_device", "cr_version": info.get("cr_version"), "reboot_response": reb}
 
 
@@ -285,15 +304,101 @@ def parse_partition_xml(xml_path: Path) -> dict[str, int]:
     return out
 
 
-def verify_backup_dir(backup_dir: Path, *, require_complete_table: bool = True) -> dict[str, Any]:
-    """Verify full BROM backup completeness, exact byte sizes, misc BCAB CRC, and write SHA256SUMS.txt."""
+def _parse_sha256sums(sums_path: Path) -> dict[str, str]:
+    """Parse standard `<64-hex>  <filename>` SHA256SUMS.txt manifest strictly (no duplicates or path traversal)."""
+    expected: dict[str, str] = {}
+    for lineno, raw in enumerate(sums_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.match(r"^([0-9a-fA-F]{64})\s+\*?(.+)$", line)
+        if not m:
+            raise ValueError(f"Malformed SHA256SUMS.txt line {lineno}: {raw!r}")
+        name = m.group(2).strip()
+        if (
+            not name
+            or name in (".", "..")
+            or "/" in name
+            or "\\" in name
+            or Path(name).name != name
+        ):
+            raise ValueError(f"Unsafe filename in SHA256SUMS.txt line {lineno}: {name!r}")
+        if name in expected:
+            raise ValueError(f"Duplicate filename in SHA256SUMS.txt line {lineno}: {name!r}")
+        expected[name] = m.group(1).lower()
+    return expected
+
+
+def _ensure_clean_backup_dir(output_dir: Path) -> None:
+    """Refuse dumping a fresh backup into a non-empty directory containing stale backup or partition files."""
+    if not output_dir.exists():
+        return
+    ignored_os_meta = {".DS_Store", "Thumbs.db", "desktop.ini"}
+    stale = sorted(p.name for p in output_dir.iterdir() if p.name not in ignored_os_meta)
+    if stale:
+        raise FileExistsError(
+            f"Backup output directory {output_dir} already contains backup artifacts ({stale[:6]}); "
+            "use a fresh empty directory for a new backup or pass --reuse-backup."
+        )
+
+
+def verify_backup_dir(
+    backup_dir: Path,
+    *,
+    require_complete_table: bool = True,
+    require_existing_manifest: bool = False,
+) -> dict[str, Any]:
+    """Verify full BROM backup completeness, exact byte sizes, misc BCAB CRC, and SHA256SUMS.txt integrity."""
     xml_path = backup_dir / "partition_list.xml"
     errors: list[str] = []
     warnings: list[str] = []
+    sums_path = backup_dir / "SHA256SUMS.txt"
+
+    def _write_fail_report(errs: list[str], mode_label: str = "failed") -> None:
+        if backup_dir.is_dir():
+            write_json(
+                backup_dir / "verification_report.json",
+                {
+                    "checks_passed": False,
+                    "backup_dir": str(backup_dir),
+                    "sha256sums_mode": mode_label,
+                    "checked_files": 0,
+                    "checked_bytes": 0,
+                    "recovery_channel": "SPRD4:AutoD (U-Boot autodloader; requires functional SPL + U-Boot)",
+                    "bare_metal_sprd3_ready": False,
+                    "splloader_bak_present": False,
+                    "misc": None,
+                    "empty_b_slots": {},
+                    "network_downloads": [],
+                    "device_read_ops": [],
+                    "device_mutations": [],
+                    "device_rebooted": False,
+                    "errors": errs,
+                    "warnings": warnings,
+                },
+            )
+
     if not xml_path.is_file():
+        _write_fail_report([f"Missing {xml_path}"])
         raise FileNotFoundError(f"Missing {xml_path}")
 
-    table = parse_partition_xml(xml_path)
+    existing_sums: dict[str, str] | None = None
+    if sums_path.is_file():
+        try:
+            existing_sums = _parse_sha256sums(sums_path)
+            if not existing_sums:
+                errors.append("Existing SHA256SUMS.txt is empty")
+        except ValueError as exc:
+            errors.append(str(exc))
+            existing_sums = {}
+    elif require_existing_manifest:
+        errors.append(f"Missing required backup integrity manifest: {sums_path}")
+
+    table: dict[str, int] = {}
+    try:
+        table = parse_partition_xml(xml_path)
+    except Exception as exc:
+        errors.append(f"Failed to parse partition_list.xml: {exc}")
     missing_core = sorted(p for p in CORE_PARTITIONS if p not in table)
     if missing_core:
         errors.append(f"Missing core partitions in table: {missing_core}")
@@ -301,6 +406,7 @@ def verify_backup_dir(backup_dir: Path, *, require_complete_table: bool = True) 
     # Zero-byte or virtual/userdata partitions normally omitted by 'r all'
     optional_excluded = {"userdata", "cache", "blackbox", "splloader_bak"}
     sums_lines: list[str] = []
+    actual_sums: dict[str, str] = {}
     checked_bytes = 0
     checked_files = 0
     empty_b_slots: dict[str, bool] = {}
@@ -322,6 +428,7 @@ def verify_backup_dir(backup_dir: Path, *, require_complete_table: bool = True) 
         elif actual_sz != expected_sz and expected_sz > 0:
             errors.append(f"{part} byte count {actual_sz} != table {expected_sz}")
         digest = sha256_file(fpath)
+        actual_sums[part] = digest
         sums_lines.append(f"{digest}  {part}")
         checked_bytes += actual_sz
         checked_files += 1
@@ -333,7 +440,9 @@ def verify_backup_dir(backup_dir: Path, *, require_complete_table: bool = True) 
     spl_path = backup_dir / "splloader"
     if "splloader" not in table:
         if spl_path.is_file() and spl_path.stat().st_size > 0:
-            sums_lines.append(f"{sha256_file(spl_path)}  splloader")
+            spl_digest = sha256_file(spl_path)
+            actual_sums["splloader"] = spl_digest
+            sums_lines.append(f"{spl_digest}  splloader")
             checked_bytes += spl_path.stat().st_size
             checked_files += 1
         elif require_complete_table:
@@ -341,20 +450,58 @@ def verify_backup_dir(backup_dir: Path, *, require_complete_table: bool = True) 
 
     spl_bak_path = backup_dir / "splloader_bak"
     spl_bak_present = spl_bak_path.is_file() and spl_bak_path.stat().st_size > 0
-    if not spl_bak_present:
+    if spl_bak_present and "splloader_bak" not in actual_sums:
+        spl_bak_digest = sha256_file(spl_bak_path)
+        actual_sums["splloader_bak"] = spl_bak_digest
+        sums_lines.append(f"{spl_bak_digest}  splloader_bak")
+        checked_bytes += spl_bak_path.stat().st_size
+        checked_files += 1
+    elif not spl_bak_present:
         warnings.append(
             "splloader_bak (eMMC boot1) not captured by 'r all'; bare-metal SPRD3 recovery is NOT bundled (requires external signed UMS9632 FDL1/FDL2)"
         )
 
+    xml_digest = sha256_file(xml_path)
+    fresh_sums_lines = [*sums_lines, f"{xml_digest}  partition_list.xml"]
+
+    if existing_sums is not None:
+        root_resolved = backup_dir.resolve()
+        for name, exp_digest in existing_sums.items():
+            target_f = (backup_dir / name).resolve()
+            try:
+                target_f.relative_to(root_resolved)
+            except ValueError:
+                errors.append(f"SHA256SUMS.txt entry escapes backup directory: {name}")
+                continue
+            if not target_f.is_file():
+                errors.append(f"SHA256SUMS.txt entry missing on disk: {name}")
+                continue
+            got_digest = actual_sums.get(name) or (xml_digest if name == "partition_list.xml" else sha256_file(target_f))
+            if got_digest != exp_digest:
+                errors.append(
+                    f"Backup integrity mismatch on {name}: live={got_digest} != SHA256SUMS.txt={exp_digest}"
+                )
+        for name in actual_sums:
+            if name not in existing_sums:
+                errors.append(f"Partition file {name} is missing from existing SHA256SUMS.txt")
+        if require_existing_manifest and "partition_list.xml" not in existing_sums:
+            errors.append("partition_list.xml is missing from existing SHA256SUMS.txt")
+
     misc_info = None
     misc_path = backup_dir / "misc"
     if misc_path.is_file():
-        misc_info = parse_boot_control(misc_path.read_bytes())
+        try:
+            misc_info = parse_boot_control(misc_path.read_bytes())
+        except Exception as exc:
+            errors.append(f"Invalid misc bootloader_control (BCAB): {exc}")
 
-    (backup_dir / "SHA256SUMS.txt").write_text("\n".join(sums_lines) + "\n", encoding="utf-8")
+    # Only generate SHA256SUMS.txt on first verification of a fresh backup; never overwrite existing manifest.
+    if existing_sums is None and not errors and not require_existing_manifest:
+        sums_path.write_text("\n".join(fresh_sums_lines) + "\n", encoding="utf-8")
     report = {
         "checks_passed": not errors,
         "backup_dir": str(backup_dir),
+        "sha256sums_mode": "verified_existing" if existing_sums is not None else "generated_fresh",
         "checked_files": checked_files,
         "checked_bytes": checked_bytes,
         "recovery_channel": "SPRD4:AutoD (U-Boot autodloader; requires functional SPL + U-Boot)",
@@ -578,7 +725,9 @@ class SpdSession:
         self.log = actual_log.open(log_mode, encoding="utf-8")
         self.tail: list[str] = []
         self.handshake_seen = False
-        threading.Thread(target=self._reader, daemon=True).start()
+        self._reset_written = False
+        self._reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self._reader_thread.start()
 
     def _reader(self) -> None:
         assert self.proc.stdout
@@ -726,25 +875,52 @@ class SpdSession:
 
     def table(self, fname: str) -> list[tuple[str, int]]:
         p = self.work_dir / fname
+        self.safe_unlink(fname)
         self.cmd(["partition_list", str(p)], "userdata", timeout=60)
-        return list(parse_partition_xml(p).items())
+        deadline = time.monotonic() + 5.0
+        last_exc: Exception | None = None
+        while True:
+            try:
+                return list(parse_partition_xml(p).items())
+            except (FileNotFoundError, PermissionError, ET.ParseError) as exc:
+                last_exc = exc
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Failed to read partition table {p}: {last_exc}") from last_exc
+                time.sleep(0.05)
 
     def close(self, reboot: bool = True) -> None:
-        if self.proc.poll() is None:
-            if reboot and self.proc.stdin:
-                try:
-                    self.proc.stdin.write('"reset"\n')
-                    self.proc.stdin.flush()
-                except OSError:
-                    pass
-                try:
-                    self.proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
+        self._reset_written = False
+        try:
+            if self.proc.poll() is None:
+                if reboot and self.proc.stdin:
+                    try:
+                        self.proc.stdin.write('"reset"\n')
+                        self.proc.stdin.flush()
+                        self._reset_written = True
+                    except OSError:
+                        pass
+                    try:
+                        self.proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        self.proc.terminate()
+                else:
                     self.proc.terminate()
-            else:
-                self.proc.terminate()
-            self.proc.wait(timeout=15)
-        self.log.close()
+                if self.proc.poll() is None:
+                    try:
+                        self.proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        kill_fn = getattr(self.proc, "kill", None)
+                        if callable(kill_fn):
+                            kill_fn()
+                            self.proc.wait(timeout=5)
+                        else:
+                            raise
+        finally:
+            reader = getattr(self, "_reader_thread", None)
+            if reader is not None and reader.is_alive():
+                reader.join(timeout=2.0)
+            if not self.log.closed:
+                self.log.close()
 
 
 def open_sprd4_session(
@@ -840,6 +1016,7 @@ def run_brom_backup_session(
             "Live BROM backup enters SPRD4:AutoD (optional WebUI/SSH/ADB reboot) and reads full flash; "
             "pass authorize_device_reboot=True / --authorize-device-reboot."
         )
+    _ensure_clean_backup_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     flash_run_dir.mkdir(parents=True, exist_ok=True)
     prefer_var = "termux-usb" if spd_mode == "termux-usb" else ("su" if spd_mode == "su" else None)
@@ -905,6 +1082,7 @@ def run_brom_backup(
             "Live BROM backup enters SPRD4:AutoD (optional WebUI REBOOT_DEVICE) and issues 'reset'; "
             "pass authorize_device_reboot=True / --authorize-device-reboot (or --verify-only for offline check)."
         )
+    _ensure_clean_backup_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "spd_dump_backup.log"
 
@@ -957,53 +1135,65 @@ def run_brom_backup(
         last_probe_ts: float | None = None
         deadline = time.monotonic() + wait_sec + 900
         tail = []
-        while time.monotonic() < deadline:
-            try:
-                item = lines.get(timeout=0.5)
-            except queue.Empty:
-                if proc.poll() is not None:
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    item = lines.get(timeout=0.5)
+                except queue.Empty:
+                    if proc.poll() is not None:
+                        break
+                    now = time.monotonic()
+                    if (
+                        boot_diag_seen
+                        and not autod_seen
+                        and not handshake_seen
+                        and reboot_info is None
+                        and reboot_deadline is not None
+                        and now <= reboot_deadline
+                        and (last_probe_ts is None or now - last_probe_ts >= 1.5)
+                    ):
+                        last_probe_ts = now
+                        reboot_info = trigger_online_reboot_once(
+                            webui_password=webui_password,
+                            webui_host=webui_host,
+                            openwrt_host=openwrt_host,
+                            auth_context=auth_context,
+                            adb_serial=adb_serial,
+                            tools_dir=tools_dir,
+                            webui_trigger_fn=trigger_zte_webui_reboot,
+                        )
+                    continue
+                if item is None:
                     break
-                now = time.monotonic()
-                if (
-                    boot_diag_seen
-                    and not autod_seen
-                    and not handshake_seen
-                    and reboot_info is None
-                    and reboot_deadline is not None
-                    and now <= reboot_deadline
-                    and (last_probe_ts is None or now - last_probe_ts >= 1.5)
-                ):
-                    last_probe_ts = now
-                    reboot_info = trigger_online_reboot_once(
-                        webui_password=webui_password,
-                        webui_host=webui_host,
-                        openwrt_host=openwrt_host,
-                        auth_context=auth_context,
-                        adb_serial=adb_serial,
-                        tools_dir=tools_dir,
-                        webui_trigger_fn=trigger_zte_webui_reboot,
-                    )
-                continue
-            if item is None:
-                break
-            tail.append(item.strip())
-            if len(tail) > 25:
-                tail.pop(0)
-            if "Waiting for dl_diag" in item:
-                autod_seen = True
-            if any(m in item for m in ("BSL_REP_VER:", "save dir is", "Read Part Done")):
-                handshake_seen = True
-            if not boot_diag_seen and "Waiting for boot_diag" in item:
-                boot_diag_seen = True
-                if reboot_deadline is None:
-                    reboot_deadline = time.monotonic() + 90.0
-            if FATAL_SPD_RE.search(item) and "Waiting" not in item:
-                proc.terminate()
-                reader_thread.join(timeout=2)
-                raise RuntimeError(f"spd_dump fatal error: {_explain_libusb_error(item.strip(), launch_meta)}")
+                tail.append(item.strip())
+                if len(tail) > 25:
+                    tail.pop(0)
+                if "Waiting for dl_diag" in item:
+                    autod_seen = True
+                if any(m in item for m in ("BSL_REP_VER:", "save dir is", "Read Part Done")):
+                    handshake_seen = True
+                if not boot_diag_seen and "Waiting for boot_diag" in item:
+                    boot_diag_seen = True
+                    if reboot_deadline is None:
+                        reboot_deadline = time.monotonic() + 90.0
+                if FATAL_SPD_RE.search(item) and "Waiting" not in item:
+                    raise RuntimeError(f"spd_dump fatal error: {_explain_libusb_error(item.strip(), launch_meta)}")
+            else:
+                if proc.poll() is None:
+                    raise TimeoutError(f"spd_dump backup timed out after {wait_sec + 900}s; tail={tail[-10:]}")
 
-        rc = proc.wait(timeout=30)
-        reader_thread.join(timeout=2)
+            rc = proc.wait(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    kill_fn = getattr(proc, "kill", None)
+                    if callable(kill_fn):
+                        kill_fn()
+                        proc.wait(timeout=5)
+            reader_thread.join(timeout=2)
         if rc == 0:
             break
         pre_race = (not handshake_seen) and any(

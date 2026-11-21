@@ -56,9 +56,9 @@ python3 scripts/kit.py fetch-assets --packs host_tools_macos host_tools_linux_x6
    # 仅 Linux ARM64 需执行：
    sudo apt-get install -y android-tools-adb
    ```
-2. **一键引导与按需下载（建议固定 Release Tag）**：
+2. **一键引导与按需下载（默认克隆 `main` 最新修复版；如需固定版本可加 `--branch <tag>`）**：
    ```bash
-   git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+   git clone --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
    cd f50pro-dualboot-kit
    bash scripts/bootstrap.sh            # 自动识别 linux-x64 或 linux-arm64
    ```
@@ -81,9 +81,9 @@ python3 scripts/kit.py fetch-assets --packs host_tools_macos host_tools_linux_x6
 ## 3. macOS (Apple Silicon M 系列 / Intel Universal) 部署步骤
 
 1. **前置依赖**：系统需有 Python 3.11+（`brew install python@3.11` 或 Xcode Command Line Tools 自带 Python3；`bin/spd_dump` 与 `platform-tools/adb` 均已自带原生 **Universal arm64 + x86_64** 通用二进制）。
-2. **一键引导与按需下载（建议固定 Release Tag）**：
+2. **一键引导与按需下载（默认克隆 `main` 最新修复版；如需固定版本可加 `--branch <tag>`）**：
    ```bash
-   git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+   git clone --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
    cd f50pro-dualboot-kit
    bash scripts/bootstrap.sh --platform macos
    ```
@@ -118,8 +118,8 @@ python3 scripts/kit.py fetch-assets --packs host_tools_macos host_tools_linux_x6
 pkg update && pkg upgrade -y
 pkg install -y git python python-cryptography python-pip clang rust libffi openssl android-tools termux-api openssh
 
-# 2. 克隆（建议固定 Tag）并部署（仅下载 android-arm64 工具链及所需固件包）
-git clone --branch v1.1.0 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+# 2. 克隆最新 main 并部署（如需固定版本可加 --branch <tag>；仅下载 android-arm64 工具链及所需固件包）
+git clone --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 bash scripts/bootstrap.sh --platform android-arm64
 

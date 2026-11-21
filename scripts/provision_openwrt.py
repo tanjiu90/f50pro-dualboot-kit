@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
+import gzip
+import hashlib
 import io
 import json
 import posixpath
@@ -21,14 +24,20 @@ from common import (
     DEFAULT_TOOLS_DIR,
     PROFILES,
     REPO_ROOT,
+    AuthContext,
+    compute_unit_identity_digest,
     detect_host_platform,
+    is_link_or_reparse,
     parse_boot_control,
     read_json,
+    resolve_auth_context,
     sha256_bytes,
+    sha256_file,
     win_no_window_kwargs,
     write_json,
 )
 from host_network import (
+    audit_default_routes,
     bind_inbox_rndis_driver,
     clear_negative_usbflags_rndis,
     isolate_usb_rndis_adapter,
@@ -73,6 +82,7 @@ def connect_ssh(
                 look_for_keys=False,
                 allow_agent=False,
             )
+            setattr(client, "_f50pro_auth_password", pw)
             return client
         except Exception as exc:
             last_exc = exc
@@ -89,7 +99,28 @@ def connect_ssh(
     raise RuntimeError(f"Unable to connect SSH to {username}@{host}: {last_exc}")
 
 
-def ssh_run(ssh, cmd: str, *, check: bool = True, timeout: float = 60.0) -> tuple[int, str, str]:
+def _redact_text(text: str, secrets_seq: tuple[str, ...] = ()) -> str:
+    out = text
+    for sec in secrets_seq:
+        if sec:
+            for variant in (
+                _shq(sec),
+                sec.replace("'", "'\"'\"'"),
+                repr(sec)[1:-1],
+                sec,
+            ):
+                if variant:
+                    out = out.replace(variant, "***REDACTED***")
+    return out
+
+
+def ssh_run(
+    ssh,
+    cmd: str,
+    *,
+    check: bool = True,
+    timeout: float = 60.0,
+) -> tuple[int, str, str]:
     """Execute a shell command over SSH and capture (exit_code, stdout, stderr)."""
     _, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
     out = stdout.read().decode("utf-8", "replace")
@@ -276,6 +307,7 @@ def _prepare_host_rndis(
     *,
     target_iface: str | None = None,
     usb_topology: dict[str, Any] | None = None,
+    snapshot_path: Path | None = None,
 ) -> dict[str, Any]:
     res: dict[str, Any] = {}
     res["usbflags_cleared"] = clear_negative_usbflags_rndis()
@@ -287,6 +319,7 @@ def _prepare_host_rndis(
         static_ip=static_ip,
         target_iface=target_iface,
         usb_topology=usb_topology,
+        snapshot_path=snapshot_path,
     )
     return res
 
@@ -370,6 +403,8 @@ def _recover_broken_ncm_via_serial(
     com_port: str,
     *,
     passwords: tuple[str, ...] = ("", "root"),
+    expected_plan: dict[str, Any] | None = None,
+    confirm_weak_identity: bool = False,
 ) -> dict[str, Any]:
     """Switch broken Win10 CDC NCM device to RNDIS over MI_02 serial console and commit _b boot."""
     import serial  # type: ignore
@@ -408,40 +443,58 @@ def _recover_broken_ncm_via_serial(
                 if "#" in resp or "root@" in resp:
                     break
 
-        def _exec(cmd: str, wait_sec: float = 3.0) -> str:
+        def _exec(cmd: str, wait_sec: float = 3.0) -> tuple[int | None, str]:
             tag = f"__F50SER_{secrets.token_hex(4)}__"
             ser.reset_input_buffer()
             ser.write(f"echo {tag}_B; {cmd}; echo {tag}_E:$?\r\n".encode("utf-8"))
             ser.flush()
             end = time.monotonic() + wait_sec
             buf = ""
+            m_end = None
             while time.monotonic() < end:
                 n = ser.in_waiting
                 data = ser.read(n if n > 0 else 1)
                 if data:
                     buf += data.decode("utf-8", "replace")
-                    if re.search(rf"{tag}_E:\d+", buf):
+                    m_end = re.search(rf"{tag}_E:(\d+)", buf)
+                    if m_end:
                         break
                 else:
                     time.sleep(0.05)
+            rc_val = int(m_end.group(1)) if m_end else None
             m_body = re.search(rf"{tag}_B\s*(.*?)\s*{tag}_E:\d+", buf, re.DOTALL)
-            return m_body.group(1) if m_body else buf
+            return rc_val, (m_body.group(1) if m_body else buf)
 
-        model_out = _exec("cat /etc/mu300/model 2>/dev/null || echo unknown", wait_sec=2.5)
+        _, model_out = _exec("cat /etc/mu300/model 2>/dev/null || echo unknown", wait_sec=2.5)
         if not any(ln.strip() == "f50pro" for ln in model_out.splitlines()):
             raise RuntimeError(f"Serial port {com_port} did not identify as f50pro: {model_out!r}")
 
-        _exec("/opt/mu300/bin/mu300-next-boot linux", wait_sec=3.0)
-        _exec(
-            "uci set u30pro.usb=usb && uci set u30pro.usb.mode=rndis && uci commit u30pro && "
-            "/usr/libexec/unisoc-modem/device-usb set-net rndis permanent 1",
-            wait_sec=4.0,
+        if expected_plan is not None:
+            verify_target_identity_with_runner(
+                lambda cmd: _exec(cmd, wait_sec=10.0)[1],
+                expected_plan,
+                confirm_weak_identity=confirm_weak_identity,
+                context_label="OpenWrt serial recovery",
+            )
+
+        rc_boot, boot_out = _exec("/opt/mu300/bin/mu300-next-boot linux", wait_sec=3.0)
+        if rc_boot not in (0, None):
+            raise RuntimeError(f"mu300-next-boot linux failed over serial rc={rc_boot}: {boot_out!r}")
+        rc_usb, usb_out = _exec(
+            "/usr/libexec/unisoc-modem/device-usb set-net rndis permanent 1 && "
+            "uci set u30pro.usb=usb && uci set u30pro.usb.mode=rndis && uci commit u30pro",
+            wait_sec=6.0,
         )
-        ser.write(
-            b"setsid sh -c 'sleep 0.5; /usr/sbin/u30pro-usb stop; sleep 1; /usr/sbin/u30pro-usb start rndis' "
-            b"</dev/null >/dev/null 2>&1 &\r\n"
-        )
-        ser.flush()
+        if rc_usb not in (0, None):
+            raise RuntimeError(f"Failed to persist RNDIS mode over serial rc={rc_usb}: {usb_out!r}")
+        # Never invoke `u30pro-usb stop` while /dev/ttyGS0 is actively held open by askfirst/this serial shell;
+        # doing so deadlocks in kernel gserial_free_port. Persist RNDIS and trigger a clean reboot instead.
+        try:
+            ser.write(b"setsid sh -c 'sleep 1; sync; reboot' </dev/null >/dev/null 2>&1 &\r\n")
+            ser.flush()
+        except OSError:
+            # Composite USB/ttyGS0 may already be re-enumerating after device-usb set-net.
+            pass
         time.sleep(0.5)
         return {"recovered": True, "com_port": com_port, "target_mode": "rndis"}
     finally:
@@ -460,33 +513,100 @@ def wait_for_openwrt_ssh(
     static_ip: str = "192.168.77.12",
     target_iface: str | None = None,
     usb_topology: dict[str, Any] | None = None,
+    snapshot_path: Path | None = None,
     auto_recover_broken_ncm_serial: bool = True,
+    expected_plan: dict[str, Any] | None = None,
+    confirm_weak_identity: bool = False,
 ):
     """Poll until target F50 Pro USB interface is isolated and OpenWrt SSH responds cleanly."""
     deadline = time.monotonic() + timeout
     first_poll_at = time.monotonic()
     iso_done = False
+    route_audit_ok = not isolate_host
     ncm_serial_attempted = False
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        if isolate_host:
+        if isolate_host and not iso_done:
+            route_audit_ok = False
             try:
-                _prepare_host_rndis(static_ip=static_ip, target_iface=target_iface, usb_topology=usb_topology)
-                iso_done = True
-            except Exception:
-                pass
-        try:
-            ssh = connect_ssh(host, passwords=passwords, timeout=5.0)
-            rc, out, _ = ssh_run(ssh, "cat /etc/mu300/model 2>/dev/null", check=False, timeout=5.0)
-            if rc == 0 and out.strip() == "f50pro":
-                if isolate_host and not iso_done:
-                    _prepare_host_rndis(static_ip=static_ip, target_iface=target_iface, usb_topology=usb_topology)
-                return ssh
-            ssh.close()
-        except Exception as exc:
-            last_err = exc
+                iso_res = _prepare_host_rndis(
+                    static_ip=static_ip,
+                    target_iface=target_iface,
+                    usb_topology=usb_topology,
+                    snapshot_path=snapshot_path,
+                )
+                net_iso = iso_res.get("network_isolation") if isinstance(iso_res, dict) else None
+                net_audit = net_iso.get("audit") if isinstance(net_iso, dict) else None
+                if isinstance(net_iso, dict) and net_iso.get("skipped") == "android-host":
+                    iso_done = True
+                    route_audit_ok = True
+                elif isinstance(net_iso, dict) and net_iso.get("status") == "no_target_matched":
+                    # Immediately audit default routes BEFORE SSH or Windows serial recovery so a stale
+                    # --target-iface or active F50 Pro route leak / broken route query is caught early.
+                    no_match_audit = audit_default_routes(target_iface=target_iface, usb_topology=usb_topology)
+                    if no_match_audit.get("usb_default_route_leak") or no_match_audit.get("audit_incomplete"):
+                        raise RuntimeError(
+                            f"Host route isolation incomplete or leaking (no_target_matched): {no_match_audit}"
+                        )
+                    route_audit_ok = True
+                else:
+                    if not isinstance(net_audit, dict):
+                        net_audit = audit_default_routes(target_iface=target_iface, usb_topology=usb_topology)
+                    if net_audit.get("usb_default_route_leak") or net_audit.get("audit_incomplete"):
+                        raise RuntimeError(f"Host route isolation incomplete or leaking: {net_audit}")
+                    iso_done = True
+                    route_audit_ok = True
+            except Exception as exc_iso:
+                last_err = exc_iso
+                route_audit_ok = False
+        ssh = None
+        if not isolate_host or route_audit_ok:
+            try:
+                ssh = connect_ssh(host, passwords=passwords, timeout=5.0)
+                rc, out, _ = ssh_run(ssh, "cat /etc/mu300/model 2>/dev/null", check=False, timeout=5.0)
+                if rc == 0 and out.strip() == "f50pro":
+                    if isolate_host and not iso_done:
+                        iso_res2 = _prepare_host_rndis(
+                            static_ip=static_ip,
+                            target_iface=target_iface,
+                            usb_topology=usb_topology,
+                            snapshot_path=snapshot_path,
+                        )
+                        net_iso2 = iso_res2.get("network_isolation") if isinstance(iso_res2, dict) else None
+                        net_audit2 = net_iso2.get("audit") if isinstance(net_iso2, dict) else None
+                        if isinstance(net_iso2, dict) and net_iso2.get("skipped") == "android-host":
+                            iso_done = True
+                        elif isinstance(net_iso2, dict) and net_iso2.get("status") == "no_target_matched":
+                            audit_res = audit_default_routes(target_iface=target_iface, usb_topology=usb_topology)
+                            if audit_res.get("usb_default_route_leak") or audit_res.get("audit_incomplete"):
+                                route_audit_ok = False
+                                ssh.close()
+                                raise RuntimeError(
+                                    f"Refusing un-isolated OpenWrt SSH session (leak or incomplete route audit): {audit_res}"
+                                )
+                        else:
+                            if not isinstance(net_audit2, dict):
+                                net_audit2 = audit_default_routes(target_iface=target_iface, usb_topology=usb_topology)
+                            if net_audit2.get("usb_default_route_leak") or net_audit2.get("audit_incomplete"):
+                                route_audit_ok = False
+                                ssh.close()
+                                raise RuntimeError(
+                                    f"Refusing OpenWrt SSH session with incomplete or leaking host route audit: {net_audit2}"
+                                )
+                            iso_done = True
+                    return ssh
+                ssh.close()
+                ssh = None
+            except Exception as exc:
+                last_err = exc
+                if ssh is not None:
+                    try:
+                        ssh.close()
+                    except Exception:
+                        pass
         if (
             auto_recover_broken_ncm_serial
+            and (not isolate_host or route_audit_ok)
             and not ncm_serial_attempted
             and detect_host_platform() == "win64"
             and (time.monotonic() - first_poll_at) >= 5.0
@@ -495,8 +615,17 @@ def wait_for_openwrt_ssh(
             if com_port:
                 ncm_serial_attempted = True
                 try:
-                    _recover_broken_ncm_via_serial(com_port, passwords=passwords)
-                    time.sleep(4.0)
+                    if expected_plan is not None:
+                        _recover_broken_ncm_via_serial(
+                            com_port,
+                            passwords=passwords,
+                            expected_plan=expected_plan,
+                            confirm_weak_identity=confirm_weak_identity,
+                        )
+                    else:
+                        _recover_broken_ncm_via_serial(com_port, passwords=passwords)
+                    iso_done = False
+                    time.sleep(6.0)
                     continue
                 except Exception as exc_ser:
                     last_err = exc_ser
@@ -559,21 +688,50 @@ def _ensure_capacity_ui(sftp) -> dict[str, str]:
     return results
 
 
+def _merge_rc_local_hook(existing_txt: str, hook_script_txt: str) -> bytes:
+    """Insert the F50 Pro cache-switch hook into /etc/rc.local without erasing user commands."""
+    norm_existing = existing_txt.replace("\r\n", "\n")
+    cur_lines = norm_existing.splitlines()
+    has_active_hook = "# BEGIN f50pro-switch-linux" in norm_existing or any(
+        ".f50pro-switch-linux" in ln and not ln.lstrip().startswith("#") for ln in cur_lines
+    )
+    if has_active_hook:
+        return (norm_existing.rstrip("\n") + "\n").encode("utf-8") if norm_existing else b""
+    hook_lines = [
+        ln
+        for ln in hook_script_txt.replace("\r\n", "\n").splitlines()
+        if not ln.startswith("# Put your custom commands")
+        and not ln.startswith("# the system init finished")
+        and not re.match(r"^\s*exit\s+0(?:\s*(?:#.*)?)?$", ln)
+    ]
+    hook_body = "\n".join(hook_lines).strip()
+    managed_block = f"# BEGIN f50pro-switch-linux\n{hook_body}\n# END f50pro-switch-linux\n"
+    if not cur_lines:
+        return (managed_block + "\nexit 0\n").encode("utf-8")
+    # Insert right before the final `exit 0` (even if followed by an inline comment) if present.
+    insert_at = len(cur_lines)
+    for idx in range(len(cur_lines) - 1, -1, -1):
+        if re.match(r"^\s*exit\s+0(?:\s*(?:#.*)?)?$", cur_lines[idx]):
+            insert_at = idx
+            break
+    merged = cur_lines[:insert_at] + ["", managed_block.rstrip("\n"), ""] + cur_lines[insert_at:]
+    if insert_at == len(cur_lines):
+        merged.append("exit 0")
+    return ("\n".join(merged).rstrip("\n") + "\n").encode("utf-8")
+
+
 def _ensure_5s_buttons(ssh, sftp, *, tools_dir: Path) -> dict[str, Any]:
     btn_dir = ASSETS_DIR / "openwrt-patch" / "buttons"
     keys_bin = tools_dir / "openwrt-base" / "mu300-keys"
     if not keys_bin.is_file():
         raise FileNotFoundError(f"Missing {keys_bin}; run fetch_assets.py first.")
-    sftp_put_bytes(sftp, keys_bin.read_bytes(), "/usr/sbin/mu300-keys", mode=0o755)
-    sftp_put_bytes(sftp, (btn_dir / "f50pro-key-action").read_bytes().replace(b"\r\n", b"\n"), "/opt/mu300/bin/f50pro-key-action", mode=0o755)
-    sftp_put_bytes(sftp, (btn_dir / "buttons").read_bytes().replace(b"\r\n", b"\n"), "/usr/libexec/unisoc-modem/buttons", mode=0o755)
-    sftp_put_bytes(sftp, (btn_dir / "buttons.js").read_bytes().replace(b"\r\n", b"\n"), "/www/luci-static/resources/mu300/buttons.js", mode=0o644)
-    sftp_put_bytes(sftp, (btn_dir / "rc.local").read_bytes().replace(b"\r\n", b"\n"), "/etc/rc.local", mode=0o755)
 
+    # Validate mu300-sysd revision BEFORE mutating any remote files (especially /etc/rc.local).
     meta = read_json(btn_dir / "mu300-sysd-5s-meta.json")
     sysd_path = "/opt/mu300/bin/mu300-sysd"
     sysd_raw = sftp_get_bytes(sftp, sysd_path)
     sysd_txt = sysd_raw.decode("utf-8")
+    patched_sysd: bytes | None = None
     if "MU300_KEYS_LONG_MS" in sysd_txt:
         sysd_state = "already_patched"
     else:
@@ -581,9 +739,30 @@ def _ensure_5s_buttons(ssh, sftp, *, tools_dir: Path) -> dict[str, Any]:
             raise ValueError(f"Unexpected {sysd_path} SHA-256: {sha256_bytes(sysd_raw)}")
         if sysd_txt.count(meta["target"]) != 1:
             raise ValueError("5s timeout hook marker not unique in mu300-sysd")
-        patched = sysd_txt.replace(meta["target"], meta["replacement"]).encode("utf-8")
-        sftp_put_bytes(sftp, patched, sysd_path, mode=0o755)
+        patched_sysd = sysd_txt.replace(meta["target"], meta["replacement"]).encode("utf-8")
         sysd_state = "patched"
+
+    sftp_put_bytes(sftp, keys_bin.read_bytes(), "/usr/sbin/mu300-keys", mode=0o755)
+    sftp_put_bytes(sftp, (btn_dir / "f50pro-key-action").read_bytes().replace(b"\r\n", b"\n"), "/opt/mu300/bin/f50pro-key-action", mode=0o755)
+    sftp_put_bytes(sftp, (btn_dir / "buttons").read_bytes().replace(b"\r\n", b"\n"), "/usr/libexec/unisoc-modem/buttons", mode=0o755)
+    sftp_put_bytes(sftp, (btn_dir / "buttons.js").read_bytes().replace(b"\r\n", b"\n"), "/www/luci-static/resources/mu300/buttons.js", mode=0o644)
+
+    try:
+        existing_rc = sftp_get_bytes(sftp, "/etc/rc.local").decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        existing_rc = ""
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ENOENT:
+            existing_rc = ""
+        else:
+            raise
+    hook_txt = (btn_dir / "rc.local").read_text(encoding="utf-8")
+    merged_rc = _merge_rc_local_hook(existing_rc, hook_txt)
+    if merged_rc != existing_rc.encode("utf-8"):
+        sftp_put_bytes(sftp, merged_rc, "/etc/rc.local", mode=0o755)
+
+    if patched_sysd is not None:
+        sftp_put_bytes(sftp, patched_sysd, sysd_path, mode=0o755)
 
     ssh_run(
         ssh,
@@ -592,10 +771,66 @@ def _ensure_5s_buttons(ssh, sftp, *, tools_dir: Path) -> dict[str, Any]:
     return {"mu300_sysd": sysd_state, "long_action": "system-switch"}
 
 
-def _install_openclash_offline(ssh, sftp, *, cache_dir: Path, tools_dir: Path) -> dict[str, Any]:
+def _build_builtin_kmods_apk_v2(kver: str, provides: list[str]) -> bytes:
+    """Build a deterministic APK v2 (.tar.gz) providing verified built-in kernel modules for apk-tools v3."""
+    data_buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=data_buf, mode="wb", mtime=0) as gz_data:
+        with tarfile.open(fileobj=gz_data, mode="w", format=tarfile.USTAR_FORMAT):
+            pass
+    data_gz = data_buf.getvalue()
+    datahash = hashlib.sha256(data_gz).hexdigest()
+
+    # Alpine apk-tools version parser rejects arbitrary localversion suffixes like '-u30pro-p1';
+    # keep the strict numeric upstream kernel version (e.g. '6.12.94-u30pro-p1' -> '6.12.94-r1').
+    m_ver = re.match(r"^(\d+(?:\.\d+)*)", kver.strip())
+    clean_kver = m_ver.group(1) if m_ver else "6.12.94"
+    pkgver = f"{clean_kver}-r1"
+    pkginfo_lines = [
+        "pkgname = f50pro-builtin-kmods",
+        f"pkgver = {pkgver}",
+        "pkgdesc = Virtual provides for verified F50 Pro built-in kernel modules",
+        "url = https://github.com/tanjiu90/f50pro-dualboot-kit",
+        "builddate = 1735689600",
+        "packager = f50pro-dualboot-kit",
+        "size = 0",
+        "arch = noarch",
+        "origin = f50pro-builtin-kmods",
+        "license = GPL-2.0-only",
+        *[f"provides = {p}={pkgver}" for p in provides],
+        f"datahash = {datahash}",
+    ]
+    pkginfo_bytes = ("\n".join(pkginfo_lines) + "\n").encode("utf-8")
+
+    ctrl_buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=ctrl_buf, mode="wb", mtime=0) as gz_ctrl:
+        with tarfile.open(fileobj=gz_ctrl, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+            ti = tarfile.TarInfo(name=".PKGINFO")
+            ti.size = len(pkginfo_bytes)
+            ti.mode = 0o644
+            ti.uid = 0
+            ti.gid = 0
+            ti.uname = "root"
+            ti.gname = "root"
+            ti.mtime = 0
+            tf.addfile(ti, io.BytesIO(pkginfo_bytes))
+    return ctrl_buf.getvalue() + data_gz
+
+
+def _install_openclash_offline(
+    ssh,
+    sftp,
+    *,
+    cache_dir: Path | None = None,
+    tools_dir: Path = DEFAULT_TOOLS_DIR,
+) -> dict[str, Any]:
+    del cache_dir  # retained in signature for backward compatibility
     oc_dir = tools_dir / "openclash-offline"
+    if is_link_or_reparse(oc_dir):
+        raise ValueError(f"Refusing symlinked/junction OpenClash offline directory {oc_dir}")
     if not oc_dir.is_dir():
         raise FileNotFoundError(f"Missing OpenClash offline directory {oc_dir}; run fetch_assets.py without --no-openclash.")
+    if any(is_link_or_reparse(p) for p in oc_dir.rglob("*")):
+        raise ValueError(f"Refusing symlinked/junction entry inside OpenClash offline directory {oc_dir}")
     ipks = sorted(oc_dir.glob("**/*.apk")) or sorted(oc_dir.glob("**/*.ipk"))
     cores = sorted(oc_dir.glob("**/mihomo-linux-arm64*.gz"))
     geosite = next(oc_dir.glob("**/GeoSite.dat"), None)
@@ -603,25 +838,108 @@ def _install_openclash_offline(ssh, sftp, *, cache_dir: Path, tools_dir: Path) -
     if not cores or not geosite or not mmdb:
         raise FileNotFoundError(f"Incomplete OpenClash offline pack in {oc_dir}")
 
-    ssh_run(ssh, "mkdir -p /tmp/oc-pkgs /etc/openclash/core /etc/openclash/config")
-    pkg_paths = []
+    ssh_run(ssh, "rm -rf /tmp/oc-pkgs && mkdir -p /tmp/oc-pkgs /etc/openclash/core /etc/openclash/config")
+    pkg_paths: list[str] = []
     for p in ipks:
         dst = f"/tmp/oc-pkgs/{p.name}"
         sftp_put_bytes(sftp, p.read_bytes(), dst, mode=0o644)
         pkg_paths.append(_shq(dst))
 
+    synthesized_provides: list[str] = []
     if pkg_paths:
-        # Handle either apk (OpenWrt 25.12+) or opkg cleanly
-        ssh_run(
+        # Handle either apk (OpenWrt 25.12+) or opkg cleanly.
+        _, probe_out, _ = ssh_run(
             ssh,
-            f"if command -v apk >/dev/null 2>&1; then apk add --no-network --allow-untrusted {' '.join(pkg_paths)}; "
-            f"else opkg install {' '.join(pkg_paths)}; fi",
-            timeout=180,
+            "KREL=\"$(uname -r 2>/dev/null || echo 6.12.94)\"; "
+            "MB=\"/lib/modules/$KREL/modules.builtin\"; "
+            "printf 'has_apk=%s\\nkver=%s\\nhas_dnsmasq=%s\\nhas_kmod_tun=%s\\nhas_kmod_ct=%s\\n"
+            "builtin_tun=%s\\nbuiltin_ct=%s\\n' "
+            "\"$(command -v apk >/dev/null 2>&1 && echo 1 || echo 0)\" "
+            "\"$KREL\" "
+            "\"$(apk info -e dnsmasq >/dev/null 2>&1 && echo 1 || echo 0)\" "
+            "\"$(apk info -e kmod-tun >/dev/null 2>&1 && echo 1 || echo 0)\" "
+            "\"$(apk info -e kmod-nf-conntrack-netlink >/dev/null 2>&1 && echo 1 || echo 0)\" "
+            "\"$(grep -Eq '(^|/)tun\\.ko(\\.|$)' \"$MB\" 2>/dev/null && echo 1 || echo 0)\" "
+            "\"$(grep -Eq '(^|/)nf_conntrack_netlink\\.ko(\\.|$)' \"$MB\" 2>/dev/null && echo 1 || echo 0)\"",
+            check=False,
         )
+        pinfo: dict[str, str] = {}
+        for ln in probe_out.splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                pinfo[k.strip()] = v.strip()
 
-    import gzip
+        if pinfo.get("has_apk") == "1":
+            # Satisfy kmod-tun / kmod-nf-conntrack-netlink ONLY when verified built into kernel modules.builtin.
+            # Note: luci-app-openclash depends on kmod-tun; dnsmasq-full -> libnetfilter-conntrack3 depends on kmod-nf-conntrack-netlink.
+            required_builtins = [
+                ("kmod-tun", "has_kmod_tun", "builtin_tun"),
+                ("kmod-nf-conntrack-netlink", "has_kmod_ct", "builtin_ct"),
+            ]
+            for pkg_name, has_key, builtin_key in required_builtins:
+                if pinfo.get(has_key) != "1" and not any(pkg_name in p.name for p in ipks):
+                    if pinfo.get(builtin_key) != "1":
+                        raise RuntimeError(
+                            f"OpenClash offline dependency '{pkg_name}' is neither packaged nor built into kernel {pinfo.get('kver')}"
+                        )
+                    synthesized_provides.append(pkg_name)
 
-    core_bin = gzip.decompress(cores[0].read_bytes())
+            if synthesized_provides:
+                kver = pinfo.get("kver") or "6.12.94"
+                m_ver = re.match(r"^(\d+(?:\.\d+)*)", kver.strip())
+                safe_ver = m_ver.group(1) if m_ver else "6.12.94"
+                virt_bytes = _build_builtin_kmods_apk_v2(kver, synthesized_provides)
+                virt_dst = f"/tmp/oc-pkgs/f50pro-builtin-kmods-{safe_ver}-r1.apk"
+                sftp_put_bytes(sftp, virt_bytes, virt_dst, mode=0o644)
+                pkg_paths.insert(0, _shq(virt_dst))
+
+            # dnsmasq-full provides `dnsmasq`, so bare `!dnsmasq` would exclude dnsmasq-full itself.
+            # Before removing stock dnsmasq on the live root, pre-validate the full swap+install against a
+            # cloned apk DB (/tmp/oc-sim) with `--simulate`, and keep a rollback tarball restoring stock
+            # dnsmasq + apk DB + service if live `apk add` fails mid-commit.
+            joined_pkgs = " ".join(pkg_paths)
+            if pinfo.get("has_dnsmasq") == "1" and any("dnsmasq-full" in p.name for p in ipks):
+                ssh_run(
+                    ssh,
+                    "rm -rf /tmp/oc-sim && mkdir -p /tmp/oc-sim/etc /tmp/oc-sim/lib && "
+                    "cp -a /etc/apk /tmp/oc-sim/etc/ && cp -a /lib/apk /tmp/oc-sim/lib/ && "
+                    "apk --root /tmp/oc-sim --no-network --no-scripts del dnsmasq && "
+                    f"apk --root /tmp/oc-sim --no-network --no-scripts --allow-untrusted --simulate add {joined_pkgs}; "
+                    "sim_rc=$?; rm -rf /tmp/oc-sim; exit $sim_rc",
+                    timeout=120,
+                )
+                ssh_run(
+                    ssh,
+                    "( ([ -s /tmp/oc-dnsmasq-bak.tar ] && tar -tf /tmp/oc-dnsmasq-bak.tar >/dev/null 2>&1) || "
+                    "(rm -f /tmp/oc-dnsmasq-bak.tar.tmp && tar -cf /tmp/oc-dnsmasq-bak.tar.tmp -C / "
+                    "etc/apk lib/apk usr/sbin/dnsmasq etc/init.d/dnsmasq etc/dnsmasq.conf etc/config/dhcp && "
+                    "[ -s /tmp/oc-dnsmasq-bak.tar.tmp ] && tar -tf /tmp/oc-dnsmasq-bak.tar.tmp >/dev/null && "
+                    "mv -f /tmp/oc-dnsmasq-bak.tar.tmp /tmp/oc-dnsmasq-bak.tar) ) && "
+                    f"( (apk del --no-network dnsmasq && apk add --no-network --allow-untrusted {joined_pkgs} && "
+                    "apk info -e luci-app-openclash dnsmasq-full >/dev/null && rm -f /tmp/oc-dnsmasq-bak.tar) || "
+                    "{ if tar -xf /tmp/oc-dnsmasq-bak.tar -C / && /etc/init.d/dnsmasq start; then "
+                    "rm -f /tmp/oc-dnsmasq-bak.tar; "
+                    "else echo 'ERROR: dnsmasq rollback failed; archive preserved at /tmp/oc-dnsmasq-bak.tar' >&2; fi; exit 1; } )",
+                    timeout=180,
+                )
+            else:
+                ssh_run(
+                    ssh,
+                    f"apk add --no-network --allow-untrusted {joined_pkgs} && "
+                    "apk info -e luci-app-openclash dnsmasq-full >/dev/null && rm -f /tmp/oc-dnsmasq-bak.tar",
+                    timeout=180,
+                )
+        else:
+            ssh_run(
+                ssh,
+                f"if command -v apk >/dev/null 2>&1; then apk add --no-network --allow-untrusted {' '.join(pkg_paths)}; "
+                f"else opkg install {' '.join(pkg_paths)}; fi",
+                timeout=180,
+            )
+
+    import gzip as _gzip  # alias kept clear; gzip already imported at module level
+
+    core_bin = _gzip.decompress(cores[0].read_bytes())
     sftp_put_bytes(sftp, core_bin, "/etc/openclash/core/clash_meta", mode=0o755)
     sftp_put_bytes(sftp, geosite.read_bytes(), "/etc/openclash/GeoSite.dat", mode=0o644)
     sftp_put_bytes(sftp, mmdb.read_bytes(), "/etc/openclash/Country.mmdb", mode=0o644)
@@ -636,7 +954,12 @@ def _install_openclash_offline(ssh, sftp, *, cache_dir: Path, tools_dir: Path) -
     apply_sh = (tpl_dir / "openclash-uci-apply.sh").read_bytes().replace(b"\r\n", b"\n")
     sftp_put_bytes(sftp, apply_sh, "/tmp/openclash-uci-apply.sh", mode=0o755)
     ssh_run(ssh, "/bin/sh /tmp/openclash-uci-apply.sh && rm -rf /tmp/oc-pkgs /tmp/openclash-uci-apply.sh", timeout=120)
-    return {"packages": len(pkg_paths), "core_bytes": len(core_bin), "template": "/etc/openclash/config/template.yaml"}
+    return {
+        "packages": len(pkg_paths),
+        "builtin_kmod_provides": synthesized_provides,
+        "core_bytes": len(core_bin),
+        "template": "/etc/openclash/config/template.yaml",
+    }
 
 
 def generate_strong_password(length: int = 16) -> str:
@@ -652,7 +975,7 @@ def _probe_remote_identity_and_usb_mode(ssh) -> dict[str, str]:
         "\"$(cat /proc/driver/board_id 2>/dev/null || echo unknown)\" "
         "\"$(tr '\\r\\n' '  ' </proc/cmdline 2>/dev/null || true)\" "
         "\"$(/usr/libexec/unisoc-modem/device-usb get 2>/dev/null || true)\" "
-        "\"$(uci -q get u30pro.usb.mode || sed -n 's/^mode=//p' /etc/unisoc-modem/usb-boot.conf 2>/dev/null | head -n 1 || echo unknown)\" "
+        "\"$(m=$(sed -n 's/^mode=//p' /etc/unisoc-modem/usb-boot.conf 2>/dev/null | head -n 1); [ -n \"$m\" ] && printf '%s' \"$m\" || uci -q get u30pro.usb.mode || echo unknown)\" "
         "\"$(sha256sum /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null | cut -d' ' -f1 || cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)\"",
         check=False,
     )
@@ -677,12 +1000,23 @@ def _probe_remote_identity_and_usb_mode(ssh) -> dict[str, str]:
     if usb_get_raw.startswith("{"):
         try:
             ujson = json.loads(usb_get_raw)
-            mode_val = str(ujson.get("net_current") or ujson.get("net_mode") or "").strip().lower()
-            if mode_val and mode_val != "unknown":
-                res["usb_mode"] = mode_val
+            live_cur = str(ujson.get("net_current") or "").strip().lower()
+            if live_cur:
+                res["usb_mode"] = live_cur
+            else:
+                mode_val = str(ujson.get("net_mode") or "").strip().lower()
+                if mode_val:
+                    res["usb_mode"] = mode_val
         except json.JSONDecodeError:
             pass
     return res
+
+
+def _is_ssh_transport_drop(exc: BaseException) -> bool:
+    if isinstance(exc, (EOFError, OSError)):
+        return True
+    cls_names = {c.__name__ for c in type(exc).__mro__}
+    return "SSHException" in cls_names
 
 
 def _apply_usb_net_mode_transition(
@@ -696,9 +1030,12 @@ def _apply_usb_net_mode_transition(
     target_iface: str | None,
     usb_topology: dict[str, Any] | None,
     out_dir: Path | None,
-    reconnect_timeout: int = 90,
+    snapshot_path: Path | None = None,
+    reconnect_timeout: int = 120,
+    expected_plan: dict[str, Any] | None = None,
+    confirm_weak_identity: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
-    """Apply an explicit USB gadget mode change cleanly, handling expected disconnect and re-enumeration."""
+    """Apply an explicit USB gadget mode change cleanly, handling expected disconnect, reboot, and post-mode verification."""
     target_mode = plan["final_usb_net_mode"]
     scope = "permanent" if plan["permanent"] else "once"
     intent = {
@@ -715,33 +1052,50 @@ def _apply_usb_net_mode_transition(
     if out_dir is not None:
         write_json(out_dir / "usb_net_transition.json", intent)
 
-    cfg_cmd = (
-        f"uci set u30pro.usb=usb && uci set u30pro.usb.mode={_shq(target_mode)} && uci commit u30pro && "
-        f"/usr/libexec/unisoc-modem/device-usb set-net {_shq(target_mode)} {scope} 1 >/dev/null"
-    )
-    if plan["expected_disconnect"]:
-        # device-usb set-net updates persistent/once config only; detach gadget restart so SSH tears down cleanly.
-        cfg_cmd += (
-            f" && setsid sh -c 'sleep 0.5; /usr/sbin/u30pro-usb stop; sleep 1; "
-            f"/usr/sbin/u30pro-usb start \"$1\"' _ {_shq(target_mode)} </dev/null >/dev/null 2>&1 &"
-        )
+    # Step 1: Apply device-usb set-net synchronously first; persist u30pro.usb.mode ONLY for permanent changes.
+    cfg_cmd = f"/usr/libexec/unisoc-modem/device-usb set-net {_shq(target_mode)} {scope} 1 >/dev/null"
+    if plan["permanent"]:
+        cfg_cmd += f" && uci set u30pro.usb=usb && uci set u30pro.usb.mode={_shq(target_mode)} && uci commit u30pro"
     try:
-        ssh_run(ssh, cfg_cmd, timeout=25)
-    except (EOFError, OSError, RuntimeError):
-        # USB gadget mode switch tears down CDC-NCM/ECM/RNDIS immediately; disconnect is expected, NOT flash failure!
-        intent["expected_disconnect_observed"] = True
+        rc_cfg, out_cfg, err_cfg = ssh_run(ssh, cfg_cmd, check=False, timeout=25)
+        if rc_cfg == -1:
+            # Paramiko returns -1 when the SSH channel closes abruptly during live USB re-enumeration.
+            intent["expected_disconnect_observed"] = True
+        elif rc_cfg != 0:
+            raise RuntimeError(f"USB mode config command failed rc={rc_cfg}: {cfg_cmd}\nstdout={out_cfg}\nstderr={err_cfg}")
+    except Exception as exc:
+        if _is_ssh_transport_drop(exc):
+            intent["expected_disconnect_observed"] = True
+        else:
+            raise
 
-    if not plan["expected_disconnect"]:
+    if not plan["expected_disconnect"] and not intent["expected_disconnect_observed"]:
         intent["reconnected"] = True
         if out_dir is not None:
             write_json(out_dir / "usb_net_transition.json", intent)
         return ssh, intent
 
+    # Step 2: If transport is still up, trigger a clean detached reboot instead of calling
+    # `u30pro-usb stop` (which deadlocks in kernel gserial_free_port while ttyGS0 is open).
+    if not intent["expected_disconnect_observed"]:
+        try:
+            ssh_run(
+                ssh,
+                "setsid sh -c 'sleep 1; sync; reboot' </dev/null >/dev/null 2>&1 &",
+                check=False,
+                timeout=15,
+            )
+        except Exception as exc:
+            if _is_ssh_transport_drop(exc) or isinstance(exc, RuntimeError):
+                intent["expected_disconnect_observed"] = True
+            else:
+                raise
+
     try:
         ssh.close()
     except Exception:
         pass
-    time.sleep(2.0)
+    time.sleep(3.0)
 
     try:
         ssh2 = wait_for_openwrt_ssh(
@@ -751,6 +1105,9 @@ def _apply_usb_net_mode_transition(
             isolate_host=isolate_host,
             target_iface=target_iface,
             usb_topology=usb_topology,
+            snapshot_path=snapshot_path,
+            expected_plan=expected_plan,
+            confirm_weak_identity=confirm_weak_identity,
         )
     except TimeoutError as exc:
         if out_dir is not None:
@@ -760,38 +1117,68 @@ def _apply_usb_net_mode_transition(
             f"Timed out waiting for F50 Pro USB re-enumeration after {intent['from_mode']} -> {target_mode} switch: {exc}"
         ) from exc
 
+    if expected_plan is not None:
+        try:
+            verify_openwrt_target_identity(ssh2, expected_plan, confirm_weak_identity=confirm_weak_identity)
+        except Exception:
+            ssh2.close()
+            raise
     post_identity = _probe_remote_identity_and_usb_mode(ssh2)
     if (
-        pre_identity["board_id"] != "unknown"
-        and post_identity["board_id"] != "unknown"
-        and pre_identity["board_id"] != post_identity["board_id"]
-    ) or (
-        pre_identity["host_hash"] != "unknown"
-        and post_identity["host_hash"] != "unknown"
-        and pre_identity["host_hash"] != post_identity["host_hash"]
+        (pre_identity["board_id"] != "unknown" and post_identity["board_id"] == "unknown")
+        or (pre_identity["host_hash"] != "unknown" and post_identity["host_hash"] == "unknown")
+        or (
+            pre_identity["board_id"] != "unknown"
+            and post_identity["board_id"] != "unknown"
+            and pre_identity["board_id"] != post_identity["board_id"]
+        )
+        or (
+            pre_identity["host_hash"] != "unknown"
+            and post_identity["host_hash"] != "unknown"
+            and pre_identity["host_hash"] != post_identity["host_hash"]
+        )
     ):
         ssh2.close()
         raise RuntimeError(
-            f"Target device swapped during USB network mode re-enumeration: "
+            f"Target device swapped or identity unreadable during USB network mode re-enumeration: "
             f"expected board={pre_identity['board_id']}/host={pre_identity['host_hash'][:12]} "
             f"got board={post_identity['board_id']}/host={post_identity['host_hash'][:12]}"
         )
+
+    post_mode = (post_identity.get("usb_mode") or "unknown").strip().lower()
     intent["reconnected"] = True
-    intent["post_usb_mode"] = post_identity["usb_mode"]
+    intent["post_usb_mode"] = post_mode
+    if post_mode != target_mode:
+        intent["mode_mismatch"] = True
+        if out_dir is not None:
+            write_json(out_dir / "usb_net_transition.json", intent)
+        ssh2.close()
+        raise RuntimeError(
+            f"USB network mode transition did not take effect: requested {target_mode!r}, live device reports {post_mode!r}"
+        )
+
     if out_dir is not None:
         write_json(out_dir / "usb_net_transition.json", intent)
     return ssh2, intent
 
 
 def _set_root_password_ssh(ssh, applied_pw: str) -> None:
-    """Set OpenWrt root password reliably with interactive PTY fallback for picky BusyBox/Dropbear builds."""
+    """Set OpenWrt root password reliably with interactive PTY fallback and strict secret redaction."""
     cmd = f"printf '%s\\n%s\\n' {_shq(applied_pw)} {_shq(applied_pw)} | passwd root >/dev/null"
+    pipe_err: str | None = None
     try:
         ssh_run(ssh, cmd, check=True, timeout=30.0)
+        return
     except Exception as exc:
-        exec_fn = getattr(ssh, "exec_command", None)
-        if not callable(exec_fn):
-            raise
+        pipe_err = _redact_text(str(exc), (applied_pw,))
+
+    # Execute PTY fallback OUTSIDE the `except` block so Python never attaches the unredacted initial
+    # exception as `__context__` if PTY setup or I/O raises.
+    exec_fn = getattr(ssh, "exec_command", None)
+    if not callable(exec_fn):
+        raise RuntimeError(pipe_err or "passwd root failed")
+    pty_err: str | None = None
+    try:
         stdin, stdout, stderr = exec_fn("passwd root", timeout=30.0, get_pty=True)
         stdin.write(f"{applied_pw}\n")
         stdin.flush()
@@ -802,11 +1189,111 @@ def _set_root_password_ssh(ssh, applied_pw: str) -> None:
             stdin.channel.shutdown_write()
         rc = stdout.channel.recv_exit_status()
         if rc != 0:
-            raw_out = stdout.read()
-            raw_err = stderr.read()
+            dec_out = _redact_text(stdout.read().decode("utf-8", "replace"), (applied_pw,))
+            dec_err = _redact_text(stderr.read().decode("utf-8", "replace"), (applied_pw,))
+            pty_err = f"passwd root PTY fallback failed rc={rc}: out={dec_out!r} err={dec_err!r}"
+    except Exception as pty_exc:
+        pty_err = _redact_text(str(pty_exc), (applied_pw,))
+    if pty_err is not None:
+        raise RuntimeError(pty_err)
+
+
+def verify_target_identity_with_runner(
+    exec_cmd,
+    plan: dict[str, Any],
+    *,
+    confirm_weak_identity: bool = False,
+    context_label: str = "OpenWrt",
+) -> dict[str, Any]:
+    """Verify live hardware identity against flash_plan.json via a command runner (SSH, serial, or ADB root)."""
+    identity = plan.get("device_identity")
+    if not identity or not isinstance(identity, dict):
+        raise RuntimeError(f"Flash plan missing target device_identity binding; refusing to mutate {context_label} target")
+
+    unit_specs = identity.get("unit_identity_partitions") or {}
+    if identity.get("identity_strength") != "strong" or not unit_specs or not identity.get("unit_identity_sha256"):
+        if not confirm_weak_identity:
             raise RuntimeError(
-                f"passwd root PTY fallback failed rc={rc}: out={raw_out!r} err={raw_err!r}"
-            ) from exc
+                f"Target device identity is weak/insufficient; refusing automatic {context_label} mutation."
+            )
+
+    def _extract_hex64(out: str) -> str:
+        for ln in reversed(out.splitlines()):
+            tok = ln.strip().split()[0].lower() if ln.strip() else ""
+            if re.fullmatch(r"[0-9a-f]{64}", tok):
+                return tok
+        return ""
+
+    if identity.get("board_id"):
+        bid_out = str(
+            exec_cmd(
+                "cat /proc/driver/board_id 2>/dev/null || "
+                "sed -n 's/.*zteboot\\.zte_boardid=\\([0-9]*\\).*/\\1/p' /proc/cmdline 2>/dev/null || true"
+            )
+            or ""
+        )
+        bid_lines = [ln.strip() for ln in bid_out.splitlines() if re.fullmatch(r"\d+", ln.strip())]
+        live_bid = bid_lines[-1] if bid_lines else bid_out.strip()
+        if not live_bid or str(live_bid) != str(identity["board_id"]):
+            raise RuntimeError(
+                f"Target board_id mismatch or unreadable on {context_label}: plan={identity['board_id']} vs live={live_bid!r}"
+            )
+
+    live_part_records: dict[str, dict[str, Any]] = {}
+    for pname, spec in sorted(unit_specs.items()):
+        if not re.fullmatch(r"[A-Za-z0-9_]+", pname):
+            raise ValueError(f"Unsafe identity partition name: {pname!r}")
+        sz = int(spec["size_bytes"])
+        dev = f"/dev/block/by-name/{pname}"
+        sha_out = str(exec_cmd(f"head -c {sz} {dev} | sha256sum | cut -d' ' -f1") or "")
+        digest = _extract_hex64(sha_out)
+        if not digest or digest != str(spec["sha256"]).lower():
+            raise RuntimeError(
+                f"Target device identity mismatch on {context_label} '{pname}': connected unit does NOT match flash_plan.json"
+            )
+        live_part_records[pname] = {"size_bytes": sz, "sha256": digest}
+
+    if unit_specs:
+        live_unit = compute_unit_identity_digest(live_part_records)
+        if live_unit["unit_identity_sha256"] != identity["unit_identity_sha256"]:
+            raise RuntimeError(f"Target unit_identity_sha256 mismatch on {context_label}")
+
+    fw = identity.get("firmware_build") or {}
+    expected_vb_sha = fw.get("vendor_boot_a_sha256")
+    if expected_vb_sha:
+        bdir = plan.get("backup_dir")
+        vb_file = (Path(bdir) / "vendor_boot_a") if bdir else None
+        vb_sz = int(fw["vendor_boot_a_size_bytes"]) if fw.get("vendor_boot_a_size_bytes") else (
+            vb_file.stat().st_size if (vb_file and vb_file.is_file()) else 0
+        )
+        if vb_sz <= 0:
+            raise RuntimeError(
+                "Unable to verify target vendor_boot_a firmware build digest: missing vendor_boot_a size in plan/backup_dir"
+            )
+        vb_out = str(exec_cmd(f"head -c {vb_sz} /dev/block/by-name/vendor_boot_a | sha256sum | cut -d' ' -f1") or "")
+        if _extract_hex64(vb_out) != str(expected_vb_sha).lower():
+            raise RuntimeError(f"Target vendor_boot_a firmware build digest mismatch on {context_label}")
+
+    return {
+        "verified": True,
+        "verified_sources": sorted(live_part_records.keys()),
+        "unit_identity_sha256": identity.get("unit_identity_sha256"),
+    }
+
+
+def verify_openwrt_target_identity(
+    ssh,
+    plan: dict[str, Any],
+    *,
+    confirm_weak_identity: bool = False,
+) -> dict[str, Any]:
+    """Verify the running OpenWrt device matches flash_plan.json device_identity before mutating the target."""
+    return verify_target_identity_with_runner(
+        lambda cmd: ssh_run(ssh, cmd, check=False)[1],
+        plan,
+        confirm_weak_identity=confirm_weak_identity,
+        context_label="OpenWrt",
+    )
 
 
 def provision_openwrt(
@@ -829,30 +1316,108 @@ def provision_openwrt(
     isolate_host: bool = True,
     out_dir: Path | None = None,
     reboot_after: bool = True,
+    auth_context: AuthContext | None = None,
+    credentials_file: Path | None = None,
+    plan_path: Path | None = None,
+    expected_plan: dict[str, Any] | None = None,
+    confirm_weak_identity: bool = False,
 ) -> dict[str, Any]:
     """Configure OpenWrt _b after flashing without forcing permanent RNDIS across all host OSes."""
     if profile_id not in PROFILES or not PROFILES[profile_id]["openwrt"]:
         raise ValueError(f"Profile {profile_id} does not include OpenWrt")
+    if generate_password and not root_password and out_dir is None and credentials_file is None:
+        raise ValueError(
+            "--generate-password requires --out-dir or --credentials-file so the generated OpenWrt root password can be persisted"
+        )
 
     host_plat = detect_host_platform()
-    pw_candidates: tuple[str, ...] = ("", "root")
-    if root_password:
-        pw_candidates = (root_password, "", "root")
+    cred_file = credentials_file or ((out_dir / "openwrt-credentials.json") if out_dir is not None else None)
+    saved_pw: str | None = None
+    pending_pw: str | None = None
+    if cred_file is not None:
+        if cred_file.is_file():
+            try:
+                saved_rec = read_json(cred_file)
+                if isinstance(saved_rec, dict) and isinstance(saved_rec.get("password"), str) and saved_rec["password"]:
+                    saved_pw = saved_rec["password"]
+            except Exception:
+                saved_pw = None
+        pend_file = cred_file.with_suffix(".pending.json")
+        if pend_file.is_file():
+            try:
+                pend_rec = read_json(pend_file)
+                if isinstance(pend_rec, dict) and isinstance(pend_rec.get("password"), str) and pend_rec["password"]:
+                    pending_pw = pend_rec["password"]
+            except Exception:
+                pending_pw = None
 
+    # Order: explicit root_password -> saved credentials_file password -> staged pending password ->
+    #        non-default auth_context passwords -> defaults ("", "root")
+    raw_cands: list[str] = []
+    if root_password:
+        raw_cands.append(root_password)
+    if saved_pw:
+        raw_cands.append(saved_pw)
+    if pending_pw:
+        raw_cands.append(pending_pw)
+    if auth_context is not None:
+        for pw in auth_context.candidate_passwords():
+            if pw not in ("", "root"):
+                raw_cands.append(pw)
+    raw_cands.extend(["", "root"])
+    pw_candidates = tuple(dict.fromkeys(raw_cands))
+
+    plan_supplied = expected_plan is not None or plan_path is not None
+    plan_obj: dict[str, Any] | None = expected_plan
+    if plan_obj is None and plan_path is not None:
+        plan_obj = read_json(plan_path)
+    if plan_supplied:
+        if not isinstance(plan_obj, dict):
+            raise ValueError("Flash plan must be a JSON object (dict); refusing null/invalid flash_plan.json")
+        if plan_obj.get("profile") != profile_id:
+            raise ValueError(
+                f"Flash plan profile mismatch: plan={plan_obj.get('profile')!r} != requested={profile_id!r}"
+            )
+        # Enforce full backup manifest integrity whenever provisioning with a flash plan.
+        bdir_raw = plan_obj.get("backup_dir")
+        exp_sums = plan_obj.get("backup_sha256sums_sha256")
+        if not bdir_raw or not exp_sums:
+            raise ValueError(
+                "Flash plan missing backup_dir or backup_sha256sums_sha256; rebuild flash_plan.json from a verified backup."
+            )
+        bdir = Path(bdir_raw)
+        from brom_backup import verify_backup_dir
+
+        verify_backup_dir(bdir, require_complete_table=True, require_existing_manifest=True)
+        if sha256_file(bdir / "SHA256SUMS.txt") != exp_sums:
+            raise ValueError("Backup SHA256SUMS.txt digest changed after flash_plan.json was built")
+
+    snap_path = (out_dir / "host_network_snapshot.json") if out_dir is not None else None
     ssh = wait_for_openwrt_ssh(
         openwrt_host,
         passwords=pw_candidates,
         isolate_host=isolate_host,
         target_iface=target_iface,
         usb_topology=usb_topology,
+        snapshot_path=snap_path,
+        expected_plan=plan_obj,
+        confirm_weak_identity=confirm_weak_identity,
     )
     applied_pw = root_password
     if not applied_pw and generate_password:
-        applied_pw = generate_strong_password()
+        # On retries after a previous password rotation, reuse the persisted generated password idempotently.
+        applied_pw = saved_pw or generate_strong_password()
 
     transition_meta: dict[str, Any] | None = None
+    device_identity_verified: dict[str, Any] | None = None
     try:
         remote_pre = _probe_remote_identity_and_usb_mode(ssh)
+        if plan_obj is not None:
+            device_identity_verified = verify_openwrt_target_identity(
+                ssh,
+                plan_obj,
+                confirm_weak_identity=confirm_weak_identity,
+            )
         board_id = remote_pre["board_id"]
         usb_plan = resolve_host_usb_net_plan(
             host_platform=host_plat,
@@ -861,7 +1426,7 @@ def provision_openwrt(
             persist_mode=usb_net_persist,
         )
 
-        # Commit permanent boot to OpenWrt _b immediately so misc tries=3 trial budget cannot roll back mid-run.
+        # Commit permanent boot to OpenWrt _b immediately (only AFTER per-unit identity check when plan provided).
         ssh_run(ssh, "/opt/mu300/bin/mu300-next-boot linux")
 
         sftp = open_remote_fs(ssh)
@@ -903,7 +1468,16 @@ def provision_openwrt(
             "/etc/init.d/uhttpd restart >/dev/null 2>&1 || true",
             "wifi reload >/dev/null 2>&1 || true",
         ])
-        ssh_run(ssh, " && ".join(cmds), timeout=90)
+        wifi_err: str | None = None
+        try:
+            ssh_run(ssh, " && ".join(cmds), timeout=90)
+        except Exception as exc:
+            if wifi_password:
+                wifi_err = _redact_text(str(exc), (wifi_password,))
+            else:
+                raise
+        if wifi_err is not None:
+            raise RuntimeError(wifi_err)
 
         if usb_plan["switch_required"]:
             ssh, transition_meta = _apply_usb_net_mode_transition(
@@ -916,6 +1490,9 @@ def provision_openwrt(
                 target_iface=target_iface,
                 usb_topology=usb_topology,
                 out_dir=out_dir,
+                snapshot_path=snap_path,
+                expected_plan=plan_obj,
+                confirm_weak_identity=confirm_weak_identity,
             )
             sftp = open_remote_fs(ssh)
 
@@ -923,8 +1500,40 @@ def provision_openwrt(
         if include_openclash:
             oc_res = _install_openclash_offline(ssh, sftp, cache_dir=cache_dir, tools_dir=tools_dir)
 
+        cred_path: str | None = None
         if applied_pw:
+            # Stage new credentials to *.pending.json BEFORE mutating the remote password so:
+            #  - if remote passwd fails, the existing working credentials file is NOT overwritten/erased;
+            #  - if the link drops right after remote passwd succeeds, *.pending.json still holds the new secret
+            #    and retries automatically try both the existing and pending credentials.
+            cred_payload = {"host": openwrt_host, "username": "root", "password": applied_pw}
+            cred_targets: list[Path] = []
+            if credentials_file is not None:
+                cred_targets.append(credentials_file)
+            if out_dir is not None:
+                default_cfile = out_dir / "openwrt-credentials.json"
+                if all(t.resolve() != default_cfile.resolve() for t in cred_targets):
+                    cred_targets.append(default_cfile)
+            pending_targets: list[Path] = []
+            # If this session authenticated using a leftover *.pending.json password from an interrupted prior rotation,
+            # promote that verified working password to the primary credentials file(s) BEFORE overwriting *.pending.json.
+            authed_pw = getattr(ssh, "_f50pro_auth_password", None)
+            if pending_pw and authed_pw == pending_pw:
+                promoted_payload = {"host": openwrt_host, "username": "root", "password": pending_pw}
+                for ct in cred_targets:
+                    ct.parent.mkdir(parents=True, exist_ok=True)
+                    write_json(ct, promoted_payload)
+            for ct in cred_targets:
+                ct.parent.mkdir(parents=True, exist_ok=True)
+                pt = ct.with_suffix(".pending.json")
+                write_json(pt, cred_payload)
+                pending_targets.append(pt)
             _set_root_password_ssh(ssh, applied_pw)
+            for ct, pt in zip(cred_targets, pending_targets):
+                write_json(ct, cred_payload)
+                pt.unlink(missing_ok=True)
+            if cred_targets:
+                cred_path = str(cred_targets[0])
             pw_candidates = (applied_pw,)
 
         # Confirm permanent boot to OpenWrt _b and snapshot exact verified BCAB block
@@ -935,23 +1544,16 @@ def provision_openwrt(
         if bc_info["suffix"] != "_b":
             raise RuntimeError(f"Expected suffix=_b after mu300-next-boot linux, got {bc_info}")
 
-        cred_path: str | None = None
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "known-good-b-bcab.bin").write_bytes(bc_bytes)
-            if applied_pw:
-                cfile = out_dir / "openwrt-credentials.json"
-                write_json(
-                    cfile,
-                    {"host": openwrt_host, "username": "root", "password": applied_pw},
-                )
-                cred_path = str(cfile)
 
         if reboot_after:
             ssh_run(ssh, "sync && reboot", check=False, timeout=5)
     finally:
         ssh.close()
 
+    final_live_usb_mode = usb_plan["final_usb_net_mode"]
     if reboot_after:
         time.sleep(10)
         ssh2 = wait_for_openwrt_ssh(
@@ -961,12 +1563,24 @@ def provision_openwrt(
             isolate_host=isolate_host,
             target_iface=target_iface,
             usb_topology=usb_topology,
+            snapshot_path=snap_path,
+            expected_plan=plan_obj,
+            confirm_weak_identity=confirm_weak_identity,
         )
-        ssh2.close()
+        try:
+            if plan_obj is not None:
+                verify_openwrt_target_identity(ssh2, plan_obj, confirm_weak_identity=confirm_weak_identity)
+            post_reboot_id = _probe_remote_identity_and_usb_mode(ssh2)
+            live_after = (post_reboot_id.get("usb_mode") or "").strip().lower()
+            if live_after in ("ncm", "ecm", "rndis"):
+                final_live_usb_mode = live_after
+        finally:
+            ssh2.close()
 
     result = {
         "status": "OPENWRT_PROVISIONED",
         "board_id": board_id,
+        "device_identity_verified": device_identity_verified,
         "rootfs_grow": grow_res,
         "board6_card_sha256": board6_sha,
         "ui_patches": ui_res,
@@ -976,8 +1590,8 @@ def provision_openwrt(
         "zonename": zonename,
         "timezone": timezone,
         "install_usb_net_mode": usb_plan["install_usb_net_mode"],
-        "final_usb_net_mode": usb_plan["final_usb_net_mode"],
-        "usb_mode": usb_plan["final_usb_net_mode"],
+        "final_usb_net_mode": final_live_usb_mode,
+        "usb_mode": final_live_usb_mode,
         "usb_net_plan": usb_plan,
         "usb_net_transition": transition_meta,
         "openclash": oc_res,
@@ -1009,11 +1623,19 @@ def main() -> int:
     parser.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--out-dir", type=Path)
+    parser.add_argument("--plan", type=Path, required=True, help="Verified flash_plan.json to bind backup manifest and target unit identity")
+    parser.add_argument("--credentials-file", type=Path, help="Optional openwrt-credentials.json for retries after password rotation")
     args = parser.parse_args()
 
     out = None
     if args.out_dir:
         out = args.out_dir if args.out_dir.is_absolute() else (REPO_ROOT / args.out_dir)
+    plan_p = None
+    if args.plan:
+        plan_p = args.plan if args.plan.is_absolute() else (REPO_ROOT / args.plan)
+    cred_p = None
+    if args.credentials_file:
+        cred_p = args.credentials_file if args.credentials_file.is_absolute() else (REPO_ROOT / args.credentials_file)
     res = provision_openwrt(
         profile_id=args.profile,
         openwrt_host=args.host,
@@ -1032,6 +1654,8 @@ def main() -> int:
         isolate_host=not args.no_host_isolate,
         out_dir=out,
         reboot_after=not args.no_reboot,
+        credentials_file=cred_p,
+        plan_path=plan_p,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0

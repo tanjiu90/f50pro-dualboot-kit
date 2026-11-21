@@ -206,6 +206,11 @@ def synthetic_env(tmp_path: Path) -> dict[str, Path]:
     xml_lines.append("</Partitions>")
     (backup_dir / "partition_list.xml").write_text("\n".join(xml_lines), encoding="utf-8")
 
+    # Anchor synthetic backup with authentic SHA256SUMS.txt + verification_report.json
+    from brom_backup import verify_backup_dir
+
+    verify_backup_dir(backup_dir, require_complete_table=True)
+
     # 3. Synthetic tools directory (Magisk APK + OpenWrt base payloads)
     apk_dir = tools_dir / "android-pkgs"
     apk_dir.mkdir(parents=True)

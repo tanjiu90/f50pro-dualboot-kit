@@ -6,9 +6,27 @@ import json
 import re
 import shlex
 import subprocess
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+_ORIG_URLOPEN = urllib.request.urlopen
+
+
+class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow redirects only within the same target router host (never off-device)."""
+
+    def __init__(self, expected_host: str) -> None:
+        super().__init__()
+        self._expected_host = expected_host.lower()
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlparse(newurl)
+        if target.hostname and target.hostname.lower() != self._expected_host:
+            raise urllib.error.URLError(f"Refused off-host redirect to {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 from common import (
     DEFAULT_TOOLS_DIR,
@@ -44,6 +62,7 @@ def _parse_openwrt_boot_evidence(out: str) -> dict[str, Any]:
             "bootargs",
             "openwrt_id",
             "button_long",
+            "usb_get",
             "usb_mode",
         ):
             k, v = line.split("=", 1)
@@ -60,6 +79,16 @@ def _parse_openwrt_boot_evidence(out: str) -> dict[str, Any]:
         if m_board:
             board_id = m_board.group(1)
     active_os = "openwrt" if fields.get("model") == "f50pro" and fields.get("openwrt_id") else "UNKNOWN"
+    usb_mode = fields.get("usb_mode") or ""
+    usb_get_raw = fields.get("usb_get") or ""
+    if usb_get_raw.startswith("{"):
+        try:
+            ujson = json.loads(usb_get_raw)
+            live_mode = str(ujson.get("net_current") or ujson.get("net_mode") or "").strip().lower()
+            if live_mode and live_mode != "unknown":
+                usb_mode = live_mode
+        except json.JSONDecodeError:
+            pass
     out_info = {
         "model": fields.get("model") or "UNKNOWN",
         "board_id": board_id or "UNKNOWN",
@@ -70,8 +99,8 @@ def _parse_openwrt_boot_evidence(out: str) -> dict[str, Any]:
         "button_long": fields.get("button_long") or "",
         "rootfs_df": df_line,
     }
-    if fields.get("usb_mode"):
-        out_info["usb_mode"] = fields["usb_mode"]
+    if usb_mode:
+        out_info["usb_mode"] = usb_mode
     return out_info
 
 
@@ -94,7 +123,7 @@ def _probe_openwrt(host: str, auth_ctx: AuthContext, check_openclash: bool) -> d
     try:
         _, out, _ = ssh_run(
             ssh,
-            "printf 'model=%s\\nboard_id=%s\\nwifi_device=%s\\nopenwrt_id=%s\\ncmdline=%s\\nbootargs=%s\\nbutton_long=%s\\nusb_mode=%s\\n' "
+            "printf 'model=%s\\nboard_id=%s\\nwifi_device=%s\\nopenwrt_id=%s\\ncmdline=%s\\nbootargs=%s\\nbutton_long=%s\\nusb_get=%s\\nusb_mode=%s\\n' "
             "\"$(cat /etc/mu300/model 2>/dev/null)\" "
             "\"$(cat /proc/driver/board_id 2>/dev/null)\" "
             "\"$(uci -q get unisoc_modem.main.wifi_device 2>/dev/null)\" "
@@ -102,7 +131,8 @@ def _probe_openwrt(host: str, auth_ctx: AuthContext, check_openclash: bool) -> d
             "\"$(tr '\\r\\n' '  ' </proc/cmdline 2>/dev/null)\" "
             "\"$(tr '\\0\\r\\n' '   ' </proc/device-tree/chosen/bootargs 2>/dev/null)\" "
             "\"$(uci -q get unisoc_modem.main.f50pro_button_long 2>/dev/null)\" "
-            "\"$(sed -n 's/^mode=//p' /etc/unisoc-modem/usb-boot.conf 2>/dev/null | head -n 1)\" && "
+            "\"$(/usr/libexec/unisoc-modem/device-usb get 2>/dev/null || true)\" "
+            "\"$(m=$(sed -n 's/^mode=//p' /etc/unisoc-modem/usb-boot.conf 2>/dev/null | head -n 1); [ -n \"$m\" ] && printf '%s' \"$m\" || uci -q get u30pro.usb.mode || true)\" && "
             "(df -k / /mnt/mu300-disk 2>/dev/null || df /) | tail -n 1",
             check=False,
         )
@@ -110,18 +140,57 @@ def _probe_openwrt(host: str, auth_ctx: AuthContext, check_openclash: bool) -> d
         report["reachable"] = True
         report.update(parsed)
         if check_openclash:
-            _, oc_out, _ = ssh_run(
+            oc_rc, oc_out, _ = ssh_run(
                 ssh,
-                "(command -v ss >/dev/null 2>&1 && ss -tln || netstat -ltn) | grep -E '(:|:::)9090([[:space:]]|$)' || true",
+                "L_SOCK=\"$( (command -v ss >/dev/null 2>&1 && ss -tuln || netstat -lunt) 2>/dev/null || true )\"; "
+                "printf 'p9090=%s\\np7874=%s\\ndns_srv=%s\\ncfg=%s\\n' "
+                "\"$(printf '%s\\n' \"$L_SOCK\" | grep -E '(:|:::)9090([[:space:]]|$)' | head -n 1)\" "
+                "\"$(printf '%s\\n' \"$L_SOCK\" | grep -E '(:|:::)7874([[:space:]]|$)' | head -n 1)\" "
+                "\"$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null || true)\" "
+                "\"$(uci -q get openclash.config.config_path 2>/dev/null || true)\"",
                 check=False,
             )
-            report["openclash_9090_listening"] = ":9090" in oc_out
+            oc_fields: dict[str, str] = {}
+            for ln in oc_out.splitlines():
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    oc_fields[k.strip()] = v.strip()
+            has_structured = "p9090" in oc_fields or "dns_srv" in oc_fields
+            has_9090 = (":9090" in oc_fields.get("p9090", "")) or (":9090" in oc_out and not has_structured)
+            has_7874 = ":7874" in oc_fields.get("p7874", "")
+            dns_srv = oc_fields.get("dns_srv", "")
+            dns_points_7874 = "#7874" in dns_srv
+            report["openclash_9090_listening"] = has_9090
+            report["openclash_dns_7874_listening"] = has_7874
+            report["openclash_dnsmasq_servers"] = dns_srv
+            report["openclash_config_path"] = oc_fields.get("cfg", "")
+            if oc_rc != 0 or not oc_out.strip():
+                report["openclash_dns_ok"] = False
+            else:
+                report["openclash_dns_ok"] = (not dns_points_7874) or has_7874
     finally:
         ssh.close()
 
     try:
-        with urllib.request.urlopen(f"http://{host}/", timeout=5) as resp:
-            report["luci_http_status"] = resp.status
+        url = f"http://{host}/"
+        if urllib.request.urlopen is _ORIG_URLOPEN:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                _SameHostRedirectHandler(host),
+            )
+            with opener.open(url, timeout=5) as resp:
+                report["luci_http_status"] = resp.status
+        else:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                report["luci_http_status"] = resp.status
+    except urllib.error.HTTPError as exc:
+        report["luci_http_status"] = exc.code
+        if exc.code == 403:
+            try:
+                body = exc.read(4096).decode("utf-8", errors="replace").lower()
+            except Exception:
+                body = ""
+            report["luci_login_detected"] = any(tok in body for tok in ("luci", "sysauth", "openwrt"))
     except Exception as exc:
         report["luci_http_error"] = str(exc)
     return report
@@ -182,14 +251,24 @@ def evaluate_e2e_checks(
     def _rec(status: str, detail: str = "") -> dict[str, Any]:
         return {"status": status, "detail": detail}
 
-    checks["host_route_isolation"] = _rec(
-        "FAIL" if host_routes.get("usb_default_route_leak") else "PASS",
-        "USB default gateway leak detected" if host_routes.get("usb_default_route_leak") else "No host route leak",
-    )
-
     prof = PROFILES.get(profile_id) if profile_id else None
     need_ow = prof["openwrt"] if prof else True
     need_and = prof["android_root"] if prof else True
+
+    if host_routes.get("usb_default_route_leak"):
+        checks["host_route_isolation"] = _rec("FAIL", "USB default gateway leak detected")
+    elif prof and not need_ow:
+        checks["host_route_isolation"] = _rec(
+            "NOT_APPLICABLE",
+            "Profile does not configure or isolate OpenWrt USB host interface (no leak observed)",
+        )
+    elif host_routes.get("audit_incomplete") or "missing" in str(host_routes.get("warning", "")).lower():
+        checks["host_route_isolation"] = _rec(
+            "FAIL",
+            f"Host route audit incomplete: {host_routes.get('warning') or 'missing route inspection tool'}",
+        )
+    else:
+        checks["host_route_isolation"] = _rec("PASS", "No host route leak")
 
     if expected_active_os not in ("auto", "openwrt", "android"):
         raise ValueError(f"Invalid expected_active_os={expected_active_os!r}")
@@ -232,20 +311,37 @@ def evaluate_e2e_checks(
             checks["openwrt_luci"] = _rec("FAIL", "OpenWrt unreachable")
             checks["openclash_9090"] = _rec("FAIL" if check_openclash else "NOT_APPLICABLE", "OpenWrt unreachable")
         else:
-            checks["openwrt_ssh"] = _rec("PASS", f"active_os={openwrt.get('active_os')}")
+            model_val = openwrt.get("model")
+            model_ok = (model_val == "f50pro") if ("model" in openwrt) else (openwrt.get("active_os") == "openwrt")
+            checks["openwrt_ssh"] = _rec(
+                "PASS" if model_ok else "FAIL",
+                f"active_os={openwrt.get('active_os')} model={model_val}" if "model" in openwrt else f"active_os={openwrt.get('active_os')}",
+            )
             slot_b_ok = openwrt.get("slot_suffix") == "_b"
             checks["openwrt_slot_b"] = _rec(
                 "PASS" if slot_b_ok else "FAIL",
                 f"slot_suffix={openwrt.get('slot_suffix', 'UNKNOWN')}",
             )
-            luci_ok = openwrt.get("luci_http_status") == 200
+            luci_status = openwrt.get("luci_http_status")
+            luci_login = openwrt.get("luci_login_detected")
+            luci_ok = luci_status in (200, 302) or (luci_status == 403 and luci_login is True)
+            luci_detail = f"http_status={luci_status or openwrt.get('luci_http_error')}"
+            if luci_status == 403:
+                luci_detail += " (luci_login_detected=true)" if luci_login is True else " (403 without LuCI login page)"
             checks["openwrt_luci"] = _rec(
                 "PASS" if luci_ok else "FAIL",
-                f"http_status={openwrt.get('luci_http_status') or openwrt.get('luci_http_error')}",
+                luci_detail,
             )
             if check_openclash:
-                oc_ok = bool(openwrt.get("openclash_9090_listening"))
-                checks["openclash_9090"] = _rec("PASS" if oc_ok else "FAIL", "Port 9090 listening" if oc_ok else "Port 9090 NOT listening")
+                oc_9090 = bool(openwrt.get("openclash_9090_listening"))
+                oc_dns_ok = openwrt.get("openclash_dns_ok", True) is not False
+                oc_ok = oc_9090 and oc_dns_ok
+                detail = "Port 9090 listening and DNS consistent"
+                if not oc_9090:
+                    detail = "Port 9090 NOT listening"
+                elif not oc_dns_ok:
+                    detail = "dnsmasq forwards to OpenClash DNS #7874 which is NOT listening"
+                checks["openclash_9090"] = _rec("PASS" if oc_ok else "FAIL", detail)
             else:
                 checks["openclash_9090"] = _rec("NOT_APPLICABLE", "OpenClash check not requested")
 
@@ -309,7 +405,8 @@ def verify_environment(
     except FileNotFoundError:
         adb_exe = None
 
-    host_routes = audit_default_routes()
+    include_android_usb = bool(profile_id and PROFILES.get(profile_id, {}).get("android_root"))
+    host_routes = audit_default_routes(include_zte_android=include_android_usb)
     ow = _probe_openwrt(openwrt_host, ctx, check_openclash)
     an = _probe_android(adb_exe, serial=serial)
     verdict = evaluate_e2e_checks(

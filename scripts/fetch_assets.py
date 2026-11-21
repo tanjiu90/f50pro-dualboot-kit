@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import stat
 import sys
 import tarfile
@@ -20,6 +21,7 @@ from common import (
     REPO_ROOT,
     detect_host_platform,
     ensure_executable,
+    is_link_or_reparse,
     read_json,
     sha256_file,
 )
@@ -231,13 +233,111 @@ def _safe_extract_tar(archive: Path, target_dir: Path) -> list[str]:
     names = []
     with tarfile.open(archive, "r:*") as tf:
         for member in tf.getmembers():
+            if member.isdev() or member.isfifo() or not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+                raise ValueError(f"Refusing to extract special device/FIFO/unsupported tar entry: {member.name}")
+            if Path(member.name).is_absolute():
+                raise ValueError(f"Refusing to extract absolute tar path: {member.name}")
             dest = (root / member.name).resolve()
             dest.relative_to(root)
-            tf.extract(member, root)
+            if member.issym():
+                link_target = (dest.parent / member.linkname).resolve()
+                link_target.relative_to(root)
+            elif member.islnk():
+                link_target = (root / member.linkname).resolve()
+                link_target.relative_to(root)
+            member.mode &= 0o777
+            try:
+                tf.extract(member, root, filter="data")
+            except TypeError:
+                tf.extract(member, root)
             if os.name != "nt" and member.isfile() and (member.mode & 0o111):
                 ensure_executable(dest)
             names.append(member.name)
     return names
+
+
+def _build_extracted_manifest(sub_out: Path, archive_sha256: str) -> dict[str, Any]:
+    """Record size and SHA-256 of every extracted file under sub_out to detect deleted/corrupt/extra cache trees."""
+    files_meta: dict[str, dict[str, Any]] = {}
+    for p in sorted(sub_out.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.name in (".verified.sha256", ".verified.manifest.json"):
+            continue
+        rel = p.relative_to(sub_out).as_posix()
+        files_meta[rel] = {"size": p.stat().st_size, "sha256": sha256_file(p)}
+    return {"archive_sha256": archive_sha256, "files": files_meta}
+
+
+def _is_extracted_cache_valid(sub_out: Path, expected_archive_sha: str) -> bool:
+    """Return True only if marker AND exact set of extracted files exist with intact size & SHA-256 (zero extras/links/junctions)."""
+    marker = sub_out / ".verified.sha256"
+    manifest_f = sub_out / ".verified.manifest.json"
+    try:
+        if is_link_or_reparse(sub_out) or not sub_out.is_dir():
+            return False
+        if is_link_or_reparse(marker) or is_link_or_reparse(manifest_f):
+            return False
+        if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != expected_archive_sha:
+            return False
+        if not manifest_f.is_file():
+            return False
+        rec = read_json(manifest_f)
+        if not isinstance(rec, dict) or rec.get("archive_sha256") != expected_archive_sha:
+            return False
+        files_map = rec.get("files")
+        if not isinstance(files_map, dict) or not files_map:
+            return False
+        root = sub_out.resolve()
+        expected_rels: set[str] = set()
+        for rel, spec in files_map.items():
+            if not isinstance(rel, str) or not isinstance(spec, dict):
+                return False
+            rel_parts = Path(rel).parts
+            if not rel_parts or Path(rel).is_absolute():
+                return False
+            cur = sub_out
+            for part in rel_parts:
+                if part in ("", ".", ".."):
+                    return False
+                cur = cur / part
+                if is_link_or_reparse(cur):
+                    return False
+            raw_cand = cur
+            cand = raw_cand.resolve()
+            cand.relative_to(root)
+            if not cand.is_file():
+                return False
+            exp_sz = int(spec["size"])
+            exp_sha = spec.get("sha256")
+            if not isinstance(exp_sha, str) or len(exp_sha) != 64:
+                return False
+            if cand.stat().st_size != exp_sz or sha256_file(cand) != exp_sha:
+                return False
+            expected_rels.add(raw_cand.relative_to(sub_out).as_posix())
+        # Reject ANY unexpected/unverified extra file, symlink, or NTFS junction dropped into the extracted directory.
+        actual_rels: set[str] = set()
+        for p in sub_out.rglob("*"):
+            if is_link_or_reparse(p):
+                return False
+            if p.name in (".verified.sha256", ".verified.manifest.json") and p.parent == sub_out:
+                continue
+            if p.is_file():
+                actual_rels.add(p.relative_to(sub_out).as_posix())
+        return actual_rels == expected_rels
+    except Exception:
+        return False
+
+
+def _clean_dir_contents(target_dir: Path) -> None:
+    if is_link_or_reparse(target_dir):
+        try:
+            target_dir.unlink()
+        except OSError:
+            os.rmdir(target_dir)
+    elif target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
 
 
 def fetch_and_extract(
@@ -281,9 +381,11 @@ def fetch_and_extract(
             network_downloads.append(downloaded_url)
         sub_out = tools_dir / key.replace("_", "-")
         marker = sub_out / ".verified.sha256"
-        if marker.is_file() and marker.read_text(encoding="utf-8").strip() == meta["sha256"]:
+        manifest_f = sub_out / ".verified.manifest.json"
+        if _is_extracted_cache_valid(sub_out, meta["sha256"]):
             extracted[key] = {"archive": str(arc), "dir": str(sub_out), "status": "cached"}
             continue
+        _clean_dir_contents(sub_out)
         files = (
             _safe_extract_zip(arc, sub_out)
             if arc.suffix == ".zip"
@@ -296,6 +398,8 @@ def fetch_and_extract(
                     got = sha256_file(sub_out / apk_name)
                     if got != apk_sha:
                         raise ValueError(f"{apk_name} SHA-256 mismatch: {got} != {apk_sha}")
+        ext_manifest = _build_extracted_manifest(sub_out, meta["sha256"])
+        manifest_f.write_text(json.dumps(ext_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         marker.write_text(meta["sha256"] + "\n", encoding="utf-8")
         extracted[key] = {
             "archive": str(arc),

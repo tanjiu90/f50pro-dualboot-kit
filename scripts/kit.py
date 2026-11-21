@@ -75,16 +75,18 @@ def run_preflight(
             tools["spd_dump_termux_usb"] = None
 
     need_android = profile is None or PROFILES.get(profile, {}).get("android_root", False)
-    req_mods: tuple[str, ...] = ("paramiko",)
+    need_openwrt = profile is None or PROFILES.get(profile, {}).get("openwrt", False)
+    win_serial = ("serial",) if (plat == "win64" and need_openwrt) else ()
+    req_mods: tuple[str, ...] = ("paramiko", *win_serial)
     req_tools: tuple[str, ...] = ("spd_dump", "adb") if need_android else ("spd_dump",)
     if operation in ("backup", "flash"):
         req_mods = ()
         req_tools = ("spd_dump",)
     elif operation == "provision-openwrt":
-        req_mods = ("paramiko",)
+        req_mods = ("paramiko", *win_serial)
         req_tools = ()
     elif operation == "provision-android":
-        req_mods = ("paramiko",) if profile == "3-dual-full" else ()
+        req_mods = ("paramiko", *win_serial) if profile == "3-dual-full" else ()
         req_tools = ("adb",)
     elif operation in ("verify", "probe"):
         req_mods = ("paramiko",)
@@ -99,6 +101,11 @@ def run_preflight(
         blocking_reasons.append(f"Missing required host tools for {operation}: {missing_tools}")
 
     key_path = adb_pubkey or (Path.home() / ".android" / "adbkey.pub")
+    if operation in ("auto", "build") and need_android and not key_path.is_file():
+        blocking_reasons.append(
+            f"Missing ADB RSA public key required for Android root profile: {key_path} "
+            "(run bootstrap script or `adb keygen ~/.android/adbkey`)"
+        )
     report: dict[str, Any] = {
         "python": sys.version.split()[0],
         "platform": sys.platform,
@@ -302,16 +309,32 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
         return run_offline_plan(args)
 
     work_dir = _rel(args.work_dir)
-    backup_dir = work_dir / "backup"
+    backup_dir = _rel(args.backup_dir) if getattr(args, "backup_dir", None) else (work_dir / "backup")
     out_dir = work_dir / "build"
+    tools_dir = _rel(args.tools_dir)
+    cache_dir = _rel(args.cache_dir)
+
+    if args.reuse_backup:
+        if not (backup_dir / "partition_list.xml").is_file() or not (backup_dir / "SHA256SUMS.txt").is_file():
+            raise FileNotFoundError(
+                f"--reuse-backup requested, but no integrity-anchored backup (partition_list.xml + SHA256SUMS.txt) "
+                f"was found in {backup_dir}. Refusing to fall back to live BROM reboot/backup or re-stamp missing checksums."
+            )
 
     fetch_res = fetch_and_extract(
         include_openclash=args.openclash,
         host_platform=args.host_platform,
         profile=args.profile,
-        cache_dir=args.cache_dir,
-        tools_dir=args.tools_dir,
+        cache_dir=cache_dir,
+        tools_dir=tools_dir,
         local_release_dir=_rel(args.local_release_dir) if getattr(args, "local_release_dir", None) else None,
+    )
+    # Run strict preflight AFTER fetch_and_extract so fresh checkouts can download spd_dump/adb first.
+    assert_preflight_ready(
+        operation="auto",
+        tools_dir=tools_dir,
+        profile=args.profile,
+        adb_pubkey=args.adb_pubkey,
     )
     steps: dict[str, Any] = {
         "mode": "live_execute",
@@ -331,41 +354,75 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
         host=args.openwrt_host,
     )
 
-    if args.reuse_backup and (backup_dir / "verification_report.json").is_file():
+    if args.reuse_backup:
         steps["brom_session_mode"] = "reused_backup"
-        steps["backup"] = verify_backup_dir(backup_dir, require_complete_table=True)
+        steps["backup"] = verify_backup_dir(backup_dir, require_complete_table=True, require_existing_manifest=True)
         steps["inspect"] = inspect_backup_dir(backup_dir, out_dir / "hardware_facts.json")
         plan = build_profile(
             backup_dir=backup_dir,
             profile_id=args.profile,
             out_dir=out_dir,
-            tools_dir=args.tools_dir,
+            tools_dir=tools_dir,
             adb_pubkey_path=args.adb_pubkey,
             usb_mode=args.usb_mode,
         )
+        plan_path = out_dir / "flash_plan.json"
         steps["build"] = {
             "profile": plan["profile"],
             "total_brom_write_bytes": plan["total_brom_write_bytes"],
-            "flash_plan": str(out_dir / "flash_plan.json"),
+            "flash_plan": str(plan_path),
         }
-        steps["flash"] = execute_flash(
-            out_dir / "flash_plan.json",
-            tools_dir=args.tools_dir,
-            webui_password=args.webui_password,
-            webui_host=args.webui_host,
-            openwrt_host=args.openwrt_host,
-            auth_context=pre_auth_ctx,
-            adb_serial=args.adb_serial,
-            execute=True,
-            spd_mode=args.spd_mode,
-            usb_dev=args.usb_dev,
-        )
+        prev_flash_path = out_dir / "flash-run" / "flash_result.json"
+        prev_state_path = out_dir / "flash-run" / "flash_state.json"
+        resumed_flash: dict[str, Any] | None = None
+        if getattr(args, "resume", False) and prev_flash_path.is_file() and prev_state_path.is_file():
+            try:
+                prev_res = read_json(prev_flash_path)
+                prev_state = read_json(prev_state_path)
+                from common import sha256_file as _sha256_file
+
+                cur_plan_sha = _sha256_file(plan_path)
+                if (
+                    isinstance(prev_res, dict)
+                    and isinstance(prev_state, dict)
+                    and prev_res.get("status") == "FLASH_AND_READBACK_VERIFIED"
+                    and prev_state.get("status") == "FLASH_AND_READBACK_VERIFIED"
+                    and prev_res.get("reset_sent") is True
+                    and prev_state.get("reset_sent") is True
+                    and prev_res.get("profile") == plan["profile"]
+                    and prev_state.get("profile") == plan["profile"]
+                    and prev_res.get("backup_sha256sums_sha256") == plan.get("backup_sha256sums_sha256")
+                    and prev_state.get("backup_sha256sums_sha256") == plan.get("backup_sha256sums_sha256")
+                    and prev_res.get("plan_sha256") == cur_plan_sha
+                    and prev_state.get("plan_sha256") == cur_plan_sha
+                ):
+                    resumed_flash = {**prev_res, "resumed_from_verified_flash": True}
+            except Exception:
+                resumed_flash = None
+
+        if resumed_flash is not None:
+            steps["brom_session_mode"] = "resumed_after_verified_flash"
+            steps["flash"] = resumed_flash
+        else:
+            steps["flash"] = execute_flash(
+                plan_path,
+                tools_dir=tools_dir,
+                webui_password=args.webui_password,
+                webui_host=args.webui_host,
+                openwrt_host=args.openwrt_host,
+                auth_context=pre_auth_ctx,
+                adb_serial=args.adb_serial,
+                execute=True,
+                spd_mode=args.spd_mode,
+                usb_dev=args.usb_dev,
+                allow_dirty_target=bool(getattr(args, "allow_dirty_target", False)),
+            )
     else:
         steps["brom_session_mode"] = "single_session_no_mid_reboot"
         backup_rep, brom_sess = run_brom_backup_session(
             backup_dir,
             out_dir / "flash-run",
-            tools_dir=args.tools_dir,
+            tools_dir=tools_dir,
             webui_password=args.webui_password,
             webui_host=args.webui_host,
             openwrt_host=args.openwrt_host,
@@ -385,7 +442,7 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
                 backup_dir=backup_dir,
                 profile_id=args.profile,
                 out_dir=out_dir,
-                tools_dir=args.tools_dir,
+                tools_dir=tools_dir,
                 adb_pubkey_path=args.adb_pubkey,
                 usb_mode=args.usb_mode,
             )
@@ -396,7 +453,7 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
             }
             steps["flash"] = execute_flash(
                 out_dir / "flash_plan.json",
-                tools_dir=args.tools_dir,
+                tools_dir=tools_dir,
                 webui_password=args.webui_password,
                 webui_host=args.webui_host,
                 openwrt_host=args.openwrt_host,
@@ -406,14 +463,21 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
                 spd_mode=args.spd_mode,
                 usb_dev=args.usb_dev,
                 active_session=brom_sess,
+                allow_dirty_target=bool(getattr(args, "allow_dirty_target", False)),
             )
         except Exception:
             brom_sess.close(reboot=False)
             raise
 
     steps["device_mutated"] = bool(steps["flash"].get("device_mutated", True))
-    steps["device_rebooted"] = True
-    steps["device_mutations"].append("brom_flash_and_reset")
+    reset_sent = bool(steps["flash"].get("reset_sent", True))
+    steps["device_rebooted"] = reset_sent
+    steps["device_mutations"].append("brom_flash_and_reset" if reset_sent else "brom_flash_without_confirmed_reset")
+    if not reset_sent:
+        raise RuntimeError(
+            "Flash writes and readback succeeded, but BROM reset was not confirmed sent "
+            f"(close_warning={steps['flash'].get('close_warning')!r}); power-cycle/reset the device before provisioning."
+        )
 
     profile = PROFILES[args.profile]
     if profile["openwrt"]:
@@ -426,14 +490,17 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
             generate_password=args.generate_password,
             zonename=getattr(args, "zonename", "Asia/Shanghai"),
             timezone=getattr(args, "timezone", "CST-8"),
-            tools_dir=args.tools_dir,
-            cache_dir=args.cache_dir,
+            tools_dir=tools_dir,
+            cache_dir=cache_dir,
             include_openclash=args.openclash,
             isolate_host=not args.no_host_isolate,
             out_dir=out_dir,
             usb_net_mode=getattr(args, "usb_net_mode", "auto"),
             usb_net_persist=getattr(args, "usb_net_persist", False),
             target_iface=getattr(args, "target_iface", None),
+            auth_context=pre_auth_ctx,
+            credentials_file=cred_file,
+            plan_path=out_dir / "flash_plan.json",
         )
         steps["device_mutations"].append("provision_openwrt_ssh")
         if not args.no_host_isolate:
@@ -448,13 +515,14 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
     if profile["android_root"]:
         steps["provision_android"] = provision_android(
             plan_path=out_dir / "flash_plan.json",
-            tools_dir=args.tools_dir,
+            tools_dir=tools_dir,
             openwrt_host=args.openwrt_host,
             auth_context=auth_ctx,
             credentials_file=cred_file,
             isolate_host=not args.no_host_isolate,
             return_to_openwrt=not args.stay_android,
             serial=args.adb_serial,
+            target_iface=getattr(args, "target_iface", None),
         )
         steps["device_mutations"].append("provision_android_adb")
         if not args.no_host_isolate:
@@ -473,7 +541,7 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
         credentials_file=cred_file,
         profile_id=args.profile,
         expected_active_os=expected_os,
-        tools_dir=args.tools_dir,
+        tools_dir=tools_dir,
         check_openclash=args.openclash,
         serial=args.adb_serial,
         out_path=work_dir / "final_verify_report.json",
@@ -562,6 +630,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fl.add_argument("--adb-serial")
     p_fl.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     p_fl.add_argument("--usb-dev")
+    p_fl.add_argument("--allow-dirty-target", action="store_true", help="Allow flashing over partitions that differ from backup baseline")
     p_fl.add_argument("--execute", action="store_true")
 
     p_ow = sub.add_parser("provision-openwrt", help="Provision OpenWrt _b after flashing")
@@ -577,7 +646,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ow.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_ow.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     p_ow.add_argument("--out-dir", type=Path)
-    p_ow.add_argument("--usb-net-mode", default="auto", choices=["auto", *sorted(VALID_USB_NET_MODES)])
+    p_ow.add_argument("--plan", type=Path, required=True, help="Verified flash_plan.json to bind backup manifest and target unit identity")
+    p_ow.add_argument("--credentials-file", type=Path, help="Optional openwrt-credentials.json for retries after password rotation")
+    p_ow.add_argument("--usb-net-mode", default="auto", choices=list(VALID_USB_NET_MODES))
     p_ow.add_argument("--usb-net-persist", action="store_true")
     p_ow.add_argument("--target-iface")
     p_ow.add_argument("--zonename", default="Asia/Shanghai")
@@ -607,7 +678,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_au = sub.add_parser("auto", help="Full turnkey workflow (safe dry-run unless --execute is passed)")
     p_au.add_argument("--profile", required=True, choices=list(PROFILES))
     p_au.add_argument("--work-dir", type=Path, default=Path("build/device-session"))
+    p_au.add_argument("--backup-dir", type=Path)
     p_au.add_argument("--reuse-backup", action="store_true")
+    p_au.add_argument("--resume", action="store_true", help="With --reuse-backup, skip BROM flash when flash_result.json already verified this exact plan")
+    p_au.add_argument("--allow-dirty-target", action="store_true", help="Allow BROM flashing over partitions that differ from backup baseline")
     p_au.add_argument("--host-platform", default="auto")
     p_au.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     p_au.add_argument("--usb-dev")
@@ -624,7 +698,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_au.add_argument("--usb-mode")
     p_au.add_argument("--no-host-isolate", action="store_true")
     p_au.add_argument("--stay-android", action="store_true")
-    p_au.add_argument("--usb-net-mode", default="auto", choices=["auto", *sorted(VALID_USB_NET_MODES)])
+    p_au.add_argument("--usb-net-mode", default="auto", choices=list(VALID_USB_NET_MODES))
     p_au.add_argument("--usb-net-persist", action="store_true")
     p_au.add_argument("--target-iface")
     p_au.add_argument("--zonename", default="Asia/Shanghai")
@@ -642,6 +716,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cmd = args.command
     exit_code = 0
+    if hasattr(args, "tools_dir") and args.tools_dir is not None:
+        args.tools_dir = _rel(args.tools_dir)
+    if hasattr(args, "cache_dir") and args.cache_dir is not None:
+        args.cache_dir = _rel(args.cache_dir)
     if cmd == "preflight":
         out = run_preflight(
             tools_dir=args.tools_dir,
@@ -724,6 +802,7 @@ def main(argv: list[str] | None = None) -> int:
             execute=args.execute,
             spd_mode=args.spd_mode,
             usb_dev=args.usb_dev,
+            allow_dirty_target=bool(getattr(args, "allow_dirty_target", False)),
         )
     elif cmd == "provision-openwrt":
         assert_preflight_ready(operation="provision-openwrt", tools_dir=args.tools_dir, profile=args.profile)
@@ -745,6 +824,8 @@ def main(argv: list[str] | None = None) -> int:
             usb_net_mode=args.usb_net_mode,
             usb_net_persist=args.usb_net_persist,
             target_iface=args.target_iface,
+            plan_path=_rel(args.plan) if getattr(args, "plan", None) else None,
+            credentials_file=_rel(args.credentials_file) if getattr(args, "credentials_file", None) else None,
         )
     elif cmd == "provision-android":
         plan_path = _rel(args.plan)
@@ -783,13 +864,6 @@ def main(argv: list[str] | None = None) -> int:
         if out.get("overall_status") != "PASS":
             exit_code = 1
     elif cmd == "auto":
-        if args.execute:
-            assert_preflight_ready(
-                operation="auto",
-                tools_dir=args.tools_dir,
-                profile=args.profile,
-                adb_pubkey=args.adb_pubkey,
-            )
         out = run_auto(args)
         if "verify" in out and out["verify"].get("overall_status") != "PASS":
             exit_code = 1

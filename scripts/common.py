@@ -44,16 +44,6 @@ FORBIDDEN_PARTITIONS = frozenset({
     "l_cali",
 })
 
-BSP_SLOT_SYNC_PAIRS: tuple[tuple[str, str], ...] = (
-    ("uboot_a", "uboot_b"),
-    ("sml_a", "sml_b"),
-    ("teecfg_a", "teecfg_b"),
-    ("dtbo_a", "dtbo_b"),
-    ("vbmeta_a", "vbmeta_b"),
-    ("vbmeta_system_a", "vbmeta_system_b"),
-    ("vbmeta_vendor_a", "vbmeta_vendor_b"),
-    ("vbmeta_system_ext_a", "vbmeta_system_b_ext_placeholder"),
-)
 # Exact 12 A->B stock BSP pairs mirrored to slot _b for F50 Pro MU3356:
 BSP_SYNC_PAIRS_F50PRO: tuple[tuple[str, str], ...] = (
     ("uboot_a", "uboot_b"),
@@ -151,6 +141,24 @@ PROFILE_ALLOWED_BROM_OPS: dict[str, dict[str, dict[str, Any]]] = {
 PROFILE_ALLOWED_OPENWRT_STAGE_OPS: frozenset[str] = frozenset({"trustos_a", "init_boot_a"})
 
 
+def is_link_or_reparse(path: Path) -> bool:
+    """Return True if path is a symlink, Windows NTFS directory junction, or reparse point."""
+    try:
+        if path.is_symlink():
+            return True
+        isjunc = getattr(os.path, "isjunction", None)
+        if callable(isjunc) and isjunc(path):
+            return True
+        if os.name == "nt":
+            st = os.lstat(path)
+            attrs = getattr(st, "st_file_attributes", 0)
+            if attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def compute_unit_identity_digest(part_records: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Derive a one-way cryptographic unit fingerprint strictly from non-zero read-only partitions."""
     sources = sorted(part_records.keys())
@@ -188,11 +196,12 @@ def build_backup_identity_record(
     xml_path = backup_dir / "partition_list.xml"
     sums_path = backup_dir / "SHA256SUMS.txt"
 
-    fw_hashes: dict[str, str] = {}
+    fw_hashes: dict[str, Any] = {}
     for fw_part in ("trustos_a", "vendor_boot_a", "init_boot_a", "boot_a"):
         fp = backup_dir / fw_part
         if fp.is_file():
             fw_hashes[f"{fw_part}_sha256"] = sha256_file(fp)
+            fw_hashes[f"{fw_part}_size_bytes"] = fp.stat().st_size
 
     combined_fw = dict(firmware_build or {})
     combined_fw.update(fw_hashes)
@@ -594,7 +603,7 @@ def repack_vendor_boot_v4(
         raise ValueError("Missing VNDRBOOT magic")
     header_ver, page, _k_addr, _r_addr, v_ram_sz = struct.unpack_from("<5I", template, 8)
     if header_ver != 4:
-        raise ValueError(f"Expected vendor_boot v4, got {hdr_ver}")
+        raise ValueError(f"Expected vendor_boot v4, got {header_ver}")
     hdr_sz, dtb_sz, _dtb_addr = struct.unpack_from("<IIQ", template, 2096)
     tbl_sz, tbl_num, tbl_ent_sz, bc_sz = struct.unpack_from("<4I", template, 2112)
     footer = parse_avb_footer(template)
@@ -608,10 +617,13 @@ def repack_vendor_boot_v4(
     dtb_bytes = template[off_dtb : off_dtb + dtb_sz]
     if sha256_bytes(dtb_bytes) != expected_dtb_sha256:
         raise ValueError("vendor_boot_a DTB digest mismatch")
-    old_tbl = bytearray(template[off_tbl : off_tbl + tbl_sz])
-    if len(old_tbl) < 4:
-        old_tbl = bytearray(tbl_ent_sz)
-    struct.pack_into("<I", old_tbl, 0, len(ramdisk))
+    # Repacking replaces vendor_ramdisk with a single generic platform ramdisk buffer, so emit one clean
+    # VENDOR_RAMDISK_TYPE_PLATFORM (1) table entry with zeroed board_id/name (never copying fragment filters).
+    if tbl_ent_sz < 16:
+        raise ValueError(f"Invalid vendor_boot v4 ramdisk table entry size: {tbl_ent_sz} (expected >= 16)")
+    ent_sz = tbl_ent_sz
+    single_tbl = bytearray(ent_sz)
+    struct.pack_into("<III", single_tbl, 0, len(ramdisk), 0, 1)
     old_bc_raw = template[off_bc : off_bc + bc_sz]
 
     cur_cmd = template[28:2076].split(b"\x00", 1)[0].decode("ascii", errors="strict")
@@ -627,12 +639,12 @@ def repack_vendor_boot_v4(
     hdr = bytearray(template[:off_ram])
     hdr[28:2076] = cmd_bytes.ljust(2048, b"\x00")
     struct.pack_into("<I", hdr, 24, len(ramdisk))
-    struct.pack_into("<4I", hdr, 2112, len(old_tbl), 1, tbl_ent_sz, len(old_bc_raw))
+    struct.pack_into("<4I", hdr, 2112, len(single_tbl), 1, ent_sz, len(old_bc_raw))
 
     payload = bytearray(hdr)
     payload.extend(ramdisk.ljust(align_up(len(ramdisk), page), b"\x00"))
     payload.extend(dtb_bytes.ljust(align_up(len(dtb_bytes), page), b"\x00"))
-    payload.extend(bytes(old_tbl).ljust(align_up(len(old_tbl), page), b"\x00"))
+    payload.extend(bytes(single_tbl).ljust(align_up(len(single_tbl), page), b"\x00"))
     payload.extend(old_bc_raw.ljust(align_up(len(old_bc_raw), page), b"\x00"))
 
     new_vbmeta_off = len(payload)

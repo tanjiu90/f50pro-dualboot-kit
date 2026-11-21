@@ -126,6 +126,7 @@ Confirm output reports `"status": "FLASH_AND_READBACK_VERIFIED"`. Every written 
 ```powershell
 .\.venv\Scripts\python.exe scripts\kit.py provision-openwrt `
   --profile <PROFILE_ID> `
+  --plan build\device-session\build\flash_plan.json `
   --wifi-ssid F50Pro-OpenWrt `
   --generate-password `
   --out-dir build\device-session\build `

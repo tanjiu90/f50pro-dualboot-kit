@@ -63,7 +63,9 @@ def test_p0_1_flash_failure_never_reboots_or_switches_slot(
             return (synthetic_env["backup_dir"] / part).read_bytes()[:sz]
         if part == "trustos_a":
             return tos_bytes  # already verified!
-        return b"\xaa" * sz  # init_boot_a differs pre & fails readback
+        if "_pre" in fname:
+            return (synthetic_env["backup_dir"] / part).read_bytes()[:sz]
+        return b"\xaa" * sz  # init_boot_a fails post-write readback
 
     sess1.read_part.side_effect = _read_sc1
     with patch("flash_images.resolve_tool", return_value=tmp_path / "spd_dump"), patch(
@@ -240,6 +242,10 @@ def test_p0_2_swapped_identical_model_device_rejected(
     mib = 1 << 20
     (dev_a_backup / "ztecfg").write_bytes(b"\x00" * mib)
     (dev_a_backup / "persist").write_bytes(b"\x00" * mib)
+    (dev_a_backup / "SHA256SUMS.txt").unlink(missing_ok=True)
+    from brom_backup import verify_backup_dir as _verify_bak
+
+    _verify_bak(dev_a_backup, require_complete_table=True)
     out_weak = synthetic_env["out_dir"] / "p0_2_weak"
     weak_plan = build_profile(
         backup_dir=dev_a_backup,
@@ -384,8 +390,12 @@ def test_p0_3_targeted_nic_selection_ignores_phone_tether_usb_dock_and_wifi_192_
     assert rest["results"][0]["status"] == "skipped_user_modified"
     priv_spy2.assert_not_called()
 
-    # 6. Explicit internet-exit mode must not strip default gateway
-    res_inet = isolate_usb_rndis_adapter(mode="internet-exit")
+    # 6. Explicit internet-exit mode must not strip default gateway (mock host probes so tests have zero live NIC side effects)
+    with (
+        patch("host_network.detect_host_platform", return_value="linux-x64"),
+        patch("host_network._detect_linux_net_candidates", return_value=[]),
+    ):
+        res_inet = isolate_usb_rndis_adapter(mode="internet-exit")
     assert res_inet["mode"] == "internet-exit" and res_inet["isolated"] == []
 
 
@@ -1499,7 +1509,8 @@ def test_win10_broken_ncm_serial_recovery_and_detached_usb_switch(tmp_path: Path
     joined = "".join(written_cmds)
     assert "/opt/mu300/bin/mu300-next-boot linux" in joined
     assert "/usr/libexec/unisoc-modem/device-usb set-net rndis permanent 1" in joined
-    assert "setsid sh -c 'sleep 0.5; /usr/sbin/u30pro-usb stop; sleep 1; /usr/sbin/u30pro-usb start rndis'" in joined
+    assert "setsid sh -c 'sleep 1; sync; reboot'" in joined
+    assert "/usr/sbin/u30pro-usb stop" not in joined
 
     # Non-f50pro serial banner must abort before running any mutation command
     bad_cmds: list[str] = []
@@ -1535,7 +1546,7 @@ def test_win10_broken_ncm_serial_recovery_and_detached_usb_switch(tmp_path: Path
 
     with (
         patch("provision_openwrt.detect_host_platform", return_value="win64"),
-        patch("provision_openwrt._prepare_host_rndis", return_value={}),
+        patch("provision_openwrt._prepare_host_rndis", return_value={"network_isolation": {"audit": {"usb_default_route_leak": False}}}),
         patch("provision_openwrt.connect_ssh", side_effect=_conn_after_recover),
         patch("provision_openwrt.ssh_run", return_value=(0, "f50pro\n", "")),
         patch("provision_openwrt._find_win_broken_ncm_serial_port", return_value="COM7") as mock_find,
@@ -1593,13 +1604,9 @@ def test_win10_broken_ncm_serial_recovery_and_detached_usb_switch(tmp_path: Path
             out_dir=tmp_path,
         )
     assert meta_sw["reconnected"] is True
-    assert any(
-        "device-usb set-net 'rndis' permanent 1" in c
-        and "setsid sh -c" in c
-        and "/usr/sbin/u30pro-usb stop" in c
-        and '/usr/sbin/u30pro-usb start "$1"' in c
-        for c in sw_cmds
-    )
+    assert any("device-usb set-net 'rndis' permanent 1" in c and not c.rstrip().endswith("&") for c in sw_cmds)
+    assert any("setsid sh -c 'sleep 1; sync; reboot'" in c for c in sw_cmds)
+    assert not any("/usr/sbin/u30pro-usb stop" in c for c in sw_cmds)
 
 
 def test_provision_openwrt_early_next_boot_timezone_and_pty_passwd_fallback(

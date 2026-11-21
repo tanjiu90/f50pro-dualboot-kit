@@ -27,6 +27,8 @@ __pycache__/
 *.key
 *.pem
 *password*.json
+*credentials*.json
+openwrt-credentials.json
 *secret*
 .DS_Store
 Thumbs.db
