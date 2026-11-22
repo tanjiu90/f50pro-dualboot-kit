@@ -43,8 +43,8 @@ See [docs/P0_REMEDIATION_REPORT_v1.1.1-rc.1.md](docs/P0_REMEDIATION_REPORT_v1.1.
 | Profile ID | Android Slot `_a` | OpenWrt Slot `_b` (`25.12.5`) | Switching & Highlights |
 | :--- | :--- | :--- | :--- |
 | **`1-android-ufi`** | Rooted (`Magisk 28103`) + **UFI-TOOLS** (`:2333`, `ttyd` `:1146`) | Untouched | Single-slot root + advanced management console |
-| **`2-dual-stock-openwrt`** | **100% Untouched Stock Android** | OpenWrt `25.12.5` (`Linux 6.12.94`, `2 GiB` rootfs on `fulldumpdb`, capacity UI, Wi-Fi LED fix, `rndis+acm`, optional OpenClash) | Zero risk to stock Android; 5s physical key switches `OpenWrt -> Android` |
-| **`3-dual-full`** | Rooted (`Magisk 28103`) + **UFI-TOOLS** + USB `charging,adb` isolation | Full OpenWrt `25.12.5` (`2 GiB`, capacity UI, Wi-Fi LED fix, `rndis+acm`, optional OpenClash) | **Bidirectional 5s physical button switching (`OpenWrt <-> Android`)** + Windows host RNDIS gateway isolation |
+| **`2-dual-stock-openwrt`** | **100% Untouched Stock Android** | OpenWrt `25.12.5` (`Linux 6.12.94`, `2 GiB` rootfs on `fulldumpdb`, capacity UI, Wi-Fi LED fix, concurrent AP+STA Wi-Fi Repeater UI w/ 25s fail-safe AP fallback, `rndis+acm`, optional OpenClash) | Zero risk to stock Android; 5s physical key switches `OpenWrt -> Android` |
+| **`3-dual-full`** | Rooted (`Magisk 28103`) + **UFI-TOOLS** + USB `charging,adb` isolation | Full OpenWrt `25.12.5` (`2 GiB`, capacity UI, Wi-Fi LED fix, concurrent AP+STA Wi-Fi Repeater UI w/ 25s fail-safe AP fallback, `rndis+acm`, optional OpenClash) | **Bidirectional 5s physical button switching (`OpenWrt <-> Android`)** + Windows host RNDIS gateway isolation |
 
 See [docs/profiles.md](docs/profiles.md) for full details and flag customization.
 

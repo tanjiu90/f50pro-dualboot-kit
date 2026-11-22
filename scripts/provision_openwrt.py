@@ -1,4 +1,4 @@
-"""OpenWrt provisioning over SSH: 2 GiB rootfs grow, board_id=6, capacity UI, LEDs, 5s button, optional OpenClash."""
+"""OpenWrt provisioning over SSH: 2 GiB rootfs grow, board_id=6, capacity UI, LEDs, 5s button, Wi-Fi repeater UI, optional OpenClash."""
 from __future__ import annotations
 
 import argparse
@@ -771,6 +771,46 @@ def _ensure_5s_buttons(ssh, sftp, *, tools_dir: Path) -> dict[str, Any]:
     return {"mu300_sysd": sysd_state, "long_action": "system-switch"}
 
 
+WIFI_REPEATER_FILES: tuple[tuple[str, str, int], ...] = (
+    ("f50pro-wifi-repeater.sh", "/usr/libexec/f50pro-wifi-repeater.sh", 0o755),
+    ("95-f50pro-wwan-ap", "/etc/hotplug.d/iface/95-f50pro-wwan-ap", 0o755),
+    ("f50pro-repeater.init", "/etc/init.d/f50pro-repeater", 0o755),
+    ("f50pro-repeater.rpcd", "/usr/libexec/rpcd/f50pro-repeater", 0o755),
+    ("luci-app-f50pro-repeater.menu.json", "/usr/share/luci/menu.d/luci-app-f50pro-repeater.json", 0o644),
+    ("luci-app-f50pro-repeater.acl.json", "/usr/share/rpcd/acl.d/luci-app-f50pro-repeater.json", 0o644),
+    ("wifi-repeater.js", "/www/luci-static/resources/view/network/wifi-repeater.js", 0o644),
+)
+
+
+def _ensure_wifi_repeater(ssh, sftp) -> dict[str, Any]:
+    """Install F50 Pro concurrent AP+STA Wi-Fi repeater daemon, hotplug hook, rpcd backend, and mobile-friendly LuCI UI."""
+    rep_dir = ASSETS_DIR / "openwrt-patch" / "wifi-repeater"
+    uploaded: list[str] = []
+    for local_name, remote_path, mode in WIFI_REPEATER_FILES:
+        src = rep_dir / local_name
+        if not src.is_file():
+            raise FileNotFoundError(f"Missing Wi-Fi repeater asset {src}")
+        data = src.read_bytes().replace(b"\r\n", b"\n")
+        sftp_put_bytes(sftp, data, remote_path, mode=mode)
+        uploaded.append(remote_path)
+
+    ssh_run(
+        ssh,
+        "sh -n /usr/libexec/f50pro-wifi-repeater.sh && "
+        "sh -n /etc/hotplug.d/iface/95-f50pro-wwan-ap && "
+        "sh -n /etc/init.d/f50pro-repeater && "
+        "rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache && "
+        "(/etc/init.d/f50pro-repeater enable >/dev/null 2>&1 || true) && "
+        "(/etc/init.d/f50pro-repeater restart >/dev/null 2>&1 || true)",
+        timeout=30,
+    )
+    return {
+        "installed": True,
+        "files": uploaded,
+        "luci_path": "admin/network/wifi-repeater",
+    }
+
+
 def _build_builtin_kmods_apk_v2(kver: str, provides: list[str]) -> bytes:
     """Build a deterministic APK v2 (.tar.gz) providing verified built-in kernel modules for apk-tools v3."""
     data_buf = io.BytesIO()
@@ -1443,6 +1483,7 @@ def provision_openwrt(
         board6_sha = _ensure_board6_card_patch(ssh, sftp)
         ui_res = _ensure_capacity_ui(sftp)
         btn_res = _ensure_5s_buttons(ssh, sftp, tools_dir=tools_dir)
+        repeater_res = _ensure_wifi_repeater(ssh, sftp)
 
         cmds = [
             "uci set system.@system[0].hostname='F50Pro'",
@@ -1594,6 +1635,7 @@ def provision_openwrt(
         "board6_card_sha256": board6_sha,
         "ui_patches": ui_res,
         "buttons": btn_res,
+        "wifi_repeater": repeater_res,
         "wifi_ssid": wifi_ssid,
         "wifi_device": "phy0-ap0",
         "zonename": zonename,

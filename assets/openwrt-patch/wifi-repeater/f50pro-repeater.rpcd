@@ -1,0 +1,622 @@
+#!/usr/bin/ucode
+'use strict';
+
+import * as fs from 'fs';
+import * as ubus from 'ubus';
+import * as uci from 'uci';
+
+function read_cmd(cmd) {
+    let p = fs.popen(cmd, 'r');
+    if (!p) return '';
+    let out = p.read('all') || '';
+    p.close();
+    return out;
+}
+
+function get_macs() {
+    let raw = trim(fs.readfile('/sys/class/ieee80211/phy0/macaddress') || '');
+    let sta_mac = length(raw) == 17 ? lc(raw) : '02:f5:00:00:00:01';
+    let parts = split(sta_mac, ':');
+    let last = hex(parts[5]) ^ 1;
+    parts[5] = sprintf('%02x', last);
+    return { sta: sta_mac, ap: join(':', parts) };
+}
+
+function unesc_ssid(s) {
+    return replace(s, /\\x([0-9a-fA-F]{2})/g, (m, h) => chr(hex(h)));
+}
+
+function read_state_file() {
+    let res = {};
+    let txt = fs.readfile('/tmp/run/f50pro-repeater.state') || '';
+    for (let line in split(txt, '\n')) {
+        let idx = index(line, '=');
+        if (idx > 0) {
+            res[substr(line, 0, idx)] = trim(substr(line, idx + 1));
+        }
+    }
+    return res;
+}
+
+function parse_iw_dev() {
+    let out = read_cmd('iw dev 2>/dev/null');
+    let ifaces = [];
+    let cur = null;
+    for (let line in split(out, '\n')) {
+        let m = match(line, /^\s*Interface\s+(\S+)/);
+        if (m) {
+            cur = { name: m[1], type: '', ssid: '', channel: 0, freq: 0, mac: '' };
+            push(ifaces, cur);
+            continue;
+        }
+        if (!cur) continue;
+        if ((m = match(line, /^\s*type\s+(\S+)/))) cur.type = m[1];
+        else if ((m = match(line, /^\s*ssid\s+(.*)$/))) cur.ssid = unesc_ssid(trim(m[1]));
+        else if ((m = match(line, /^\s*addr\s+(\S+)/))) cur.mac = m[1];
+        else if ((m = match(line, /^\s*channel\s+(\d+)\s+\((\d+)\s+MHz\)/))) {
+            cur.channel = int(m[1]);
+            cur.freq = int(m[2]);
+        }
+    }
+    return ifaces;
+}
+
+function parse_sta_link(dev) {
+    let info = { connected: false, bssid: '', ssid: '', signal: null, freq: 0, rx_bytes: 0, tx_bytes: 0 };
+    if (!dev) return info;
+    let out = read_cmd('iw dev ' + dev + ' link 2>/dev/null');
+    let m = match(out, /Connected to ([0-9a-fA-F:]{17})/);
+    if (!m) return info;
+    info.connected = true;
+    info.bssid = lc(m[1]);
+    if ((m = match(out, /SSID:\s*([^\r\n]+)/))) info.ssid = unesc_ssid(trim(m[1]));
+    if ((m = match(out, /signal:\s*(-?\d+)\s*dBm/))) info.signal = int(m[1]);
+    if ((m = match(out, /freq:\s*(\d+)/))) info.freq = int(m[1]);
+    if ((m = match(out, /RX:\s*(\d+)\s+bytes/))) info.rx_bytes = int(m[1]);
+    if ((m = match(out, /TX:\s*(\d+)\s+bytes/))) info.tx_bytes = int(m[1]);
+    return info;
+}
+
+function count_ap_clients(dev) {
+    if (!dev) return 0;
+    let out = read_cmd('iw dev ' + dev + ' station dump 2>/dev/null');
+    let cnt = 0;
+    for (let line in split(out, '\n')) {
+        if (match(line, /^Station\s+/)) cnt++;
+    }
+    return cnt;
+}
+
+function parse_default_route() {
+    let out = read_cmd('ip route show default 2>/dev/null');
+    let best = { dev: '', via: '', metric: 999999 };
+    for (let line in split(out, '\n')) {
+        if (!match(line, /^default\s+/)) continue;
+        let mdev = match(line, /\bdev\s+(\S+)/);
+        if (!mdev) continue;
+        let mvia = match(line, /\bvia\s+(\S+)/);
+        let mmet = match(line, /\bmetric\s+(\d+)/);
+        let met = mmet ? int(mmet[1]) : 0;
+        if (met < best.metric) {
+            best = { dev: mdev[1], via: mvia ? mvia[1] : '', metric: met };
+        }
+    }
+    return best;
+}
+
+function find_uci_sections(c) {
+    let sta_sec = null, ap_sec = null;
+    c.foreach('wireless', 'wifi-iface', (s) => {
+        if (s.device != 'radio0') return;
+        if (s.mode == 'sta') {
+            if (!sta_sec || s['.name'] == 'wwan_sta' || s.disabled != '1')
+                sta_sec = s;
+        } else if (s.mode == 'ap') {
+            if (!ap_sec || s['.name'] == 'default_radio0')
+                ap_sec = s;
+        }
+    });
+    return { sta: sta_sec, ap: ap_sec };
+}
+
+function get_iface_status(conn, name) {
+    let st = conn.call('network.interface.' + name, 'status', {}) || {};
+    let ip = '';
+    if (type(st['ipv4-address']) == 'array' && length(st['ipv4-address']) > 0)
+        ip = st['ipv4-address'][0].address || '';
+    let gw = '';
+    if (type(st.route) == 'array') {
+        for (let r in st.route) {
+            if (r.target == '0.0.0.0' && r.mask == 0 && r.nexthop && r.nexthop != '0.0.0.0') {
+                gw = r.nexthop;
+                break;
+            }
+        }
+    }
+    return { up: !!st.up, ip: ip, gateway: gw, l3_device: st.l3_device || '' };
+}
+
+function do_status() {
+    let c = uci.cursor();
+    let conn = ubus.connect();
+    let secs = find_uci_sections(c);
+    let ifaces = parse_iw_dev();
+    let state = read_state_file();
+
+    let sta_if = null, ap_if = null;
+    for (let x in ifaces) {
+        if (x.type == 'managed') sta_if = x;
+        else if (x.type == 'AP' && x.channel > 0 && length(x.ssid) > 0 && x.name != 'phy0-sta0') ap_if = x;
+    }
+
+    let sta_enabled = !!(secs.sta && secs.sta.disabled != '1');
+    let sta_net = (secs.sta && secs.sta.network) ? secs.sta.network : 'wwan';
+    let link = parse_sta_link(sta_if ? sta_if.name : '');
+    let wwan_st = get_iface_status(conn, sta_net);
+    let wan_st = get_iface_status(conn, 'wan');
+
+    let wan_disabled = (c.get('network', 'wan', 'disabled') == '1');
+    let wan_metric = int(c.get('network', 'wan', 'metric') || '0');
+    let wwan_metric = int(c.get('network', sta_net, 'metric') || '40');
+
+    let route_mode = 'cell_first';
+    if (wan_disabled) route_mode = 'wifi_only';
+    else if (wwan_metric < wan_metric) route_mode = 'wifi_first';
+
+    let repeater_mode = 'disabled';
+    if (sta_enabled) {
+        if (link.connected && wwan_st.up) repeater_mode = 'connected';
+        else if (link.connected) repeater_mode = 'connecting';
+        else if (state.MODE == 'fallback_ap' && ap_if) repeater_mode = 'fallback_ap';
+        else repeater_mode = 'connecting';
+    }
+
+    let radio_band = c.get('wireless', 'radio0', 'band') || '2g';
+    let radio_ch = c.get('wireless', 'radio0', 'channel') || 'auto';
+    let def_rt = parse_default_route();
+
+    let sta_ch = sta_if ? sta_if.channel : 0;
+    let sta_band = sta_ch > 14 ? '5g' : (sta_ch > 0 ? '2g' : radio_band);
+    let ap_ch = ap_if ? ap_if.channel : 0;
+    let ap_band = ap_ch > 14 ? '5g' : (ap_ch > 0 ? '2g' : radio_band);
+
+    conn.disconnect();
+    return {
+        ok: 1,
+        repeater_mode: repeater_mode,
+        reason: state.REASON || '',
+        radio: { band: radio_band, channel: radio_ch },
+        sta: {
+            enabled: sta_enabled,
+            network: sta_net,
+            ssid: link.connected && link.ssid ? link.ssid : (secs.sta ? (secs.sta.ssid || '') : ''),
+            encryption: secs.sta ? (secs.sta.encryption || 'psk2') : 'psk2',
+            has_key: !!(secs.sta && length(secs.sta.key || '') > 0),
+            connected: link.connected,
+            bssid: link.bssid,
+            signal: link.signal,
+            channel: sta_ch,
+            band: sta_band,
+            ip: wwan_st.ip,
+            gateway: wwan_st.gateway,
+            rx_bytes: link.rx_bytes,
+            tx_bytes: link.tx_bytes
+        },
+        ap: {
+            enabled: !!(secs.ap && secs.ap.disabled != '1'),
+            active: !!ap_if,
+            ssid: ap_if && ap_if.ssid ? ap_if.ssid : (secs.ap ? (secs.ap.ssid || 'F50Pro-OpenWrt') : 'F50Pro-OpenWrt'),
+            encryption: secs.ap ? (secs.ap.encryption || 'psk2') : 'psk2',
+            has_key: !!(secs.ap && length(secs.ap.key || '') > 0),
+            channel: ap_ch,
+            band: ap_band,
+            clients: count_ap_clients(ap_if ? ap_if.name : '')
+        },
+        wan: {
+            disabled: wan_disabled,
+            up: wan_st.up,
+            ip: wan_st.ip,
+            metric: wan_metric
+        },
+        wwan: {
+            up: wwan_st.up,
+            ip: wwan_st.ip,
+            gateway: wwan_st.gateway,
+            metric: wwan_metric
+        },
+        route_mode: route_mode,
+        default_route: def_rt
+    };
+}
+
+function enc_from_iwinfo(enc) {
+    if (!enc || !enc.enabled) return { enc: 'none', label: '开放 (无密码)' };
+    let auth = enc.authentication || [];
+    let wpa = enc.wpa || [];
+    let has_sae = index(auth, 'sae') >= 0;
+    let has_psk = index(auth, 'psk') >= 0;
+    if (has_sae && has_psk) return { enc: 'sae-mixed', label: 'WPA2/WPA3' };
+    if (has_sae) return { enc: 'sae', label: 'WPA3' };
+    if (index(wpa, 2) >= 0) return { enc: 'psk2', label: 'WPA2' };
+    if (index(wpa, 1) >= 0) return { enc: 'psk-mixed', label: 'WPA/WPA2' };
+    return { enc: 'psk2', label: 'WPA2' };
+}
+
+function freq_to_ch(f) {
+    f = int(f);
+    if (f == 2484) return 14;
+    if (f >= 2412 && f <= 2472) return int((f - 2407) / 5);
+    if (f >= 5180 && f <= 5885) return int((f - 5000) / 5);
+    return 0;
+}
+
+function scan_fallback_iw() {
+    let ifaces = parse_iw_dev();
+    let dev = '', ap_flag = '';
+    for (let x in ifaces) {
+        if (x.type == 'managed') { dev = x.name; break; }
+    }
+    if (!dev) {
+        for (let x in ifaces) {
+            if (x.type == 'AP') { dev = x.name; ap_flag = ' ap-force'; break; }
+        }
+    }
+    if (!dev) return [];
+    let out = read_cmd('iw dev ' + dev + ' scan' + ap_flag + ' 2>/dev/null');
+    let list = [], cur = null;
+    for (let line in split(out, '\n')) {
+        let m = match(line, /^BSS\s+([0-9a-fA-F:]{17})/);
+        if (m) {
+            if (cur && length(cur.ssid) > 0) push(list, cur);
+            cur = { bssid: uc(m[1]), ssid: '', freq: 0, channel: 0, band: '2g', signal: -100, enc: 'none', enc_label: '开放 (无密码)', privacy: false, rsn: false, sae: false, psk: false };
+            continue;
+        }
+        if (!cur) continue;
+        if ((m = match(line, /^\s*freq:\s*(\d+)/))) {
+            cur.freq = int(m[1]);
+            cur.channel = freq_to_ch(cur.freq);
+            cur.band = cur.freq > 4000 ? '5g' : '2g';
+        } else if ((m = match(line, /^\s*signal:\s*(-?\d+)/))) {
+            cur.signal = int(m[1]);
+        } else if ((m = match(line, /^\s*SSID:\s*(.*)$/))) {
+            cur.ssid = unesc_ssid(trim(m[1]));
+        } else if (match(line, /capability:.*Privacy/)) {
+            cur.privacy = true;
+        } else if (match(line, /^\s*RSN:/)) {
+            cur.rsn = true;
+        } else if (match(line, /Authentication suites:.*SAE/)) {
+            cur.sae = true;
+            if (match(line, /PSK/)) cur.psk = true;
+        } else if (match(line, /Authentication suites:.*PSK/)) {
+            cur.psk = true;
+        }
+    }
+    if (cur && length(cur.ssid) > 0) push(list, cur);
+
+    for (let x in list) {
+        if (!x.privacy && !x.rsn) {
+            x.enc = 'none'; x.enc_label = '开放 (无密码)';
+        } else if (x.sae && x.psk) {
+            x.enc = 'sae-mixed'; x.enc_label = 'WPA2/WPA3';
+        } else if (x.sae) {
+            x.enc = 'sae'; x.enc_label = 'WPA3';
+        } else {
+            x.enc = 'psk2'; x.enc_label = 'WPA2';
+        }
+    }
+    return list;
+}
+
+function do_scan() {
+    let conn = ubus.connect();
+    let raw = conn.call('iwinfo', 'scan', { device: 'radio0' });
+    conn.disconnect();
+
+    let items = [];
+    if (raw && type(raw.results) == 'array' && length(raw.results) > 0) {
+        for (let r in raw.results) {
+            if (!r.ssid || length(r.ssid) == 0) continue;
+            let band = (r.band == 5 || int(r.channel || 0) > 14) ? '5g' : '2g';
+            let ei = enc_from_iwinfo(r.encryption);
+            push(items, {
+                ssid: r.ssid,
+                bssid: r.bssid || '',
+                band: band,
+                channel: int(r.channel || 0),
+                signal: int(r.signal || -100),
+                encryption: ei.enc,
+                enc_label: ei.label
+            });
+        }
+    }
+
+    if (length(items) == 0) {
+        for (let r in scan_fallback_iw()) {
+            push(items, {
+                ssid: r.ssid,
+                bssid: r.bssid,
+                band: r.band,
+                channel: r.channel,
+                signal: r.signal,
+                encryption: r.enc,
+                enc_label: r.enc_label
+            });
+        }
+    }
+
+    // Deduplicate by (ssid, band), keeping strongest signal
+    let best = {};
+    for (let it in items) {
+        let k = it.ssid + '|||' + it.band;
+        if (!best[k] || it.signal > best[k].signal)
+            best[k] = it;
+    }
+    let out = [];
+    for (let k in best) push(out, best[k]);
+    sort(out, (a, b) => b.signal - a.signal);
+    return { ok: 1, results: out };
+}
+
+function ensure_wwan_network_and_fw(c) {
+    if (!c.get('network', 'wwan')) {
+        c.set('network', 'wwan', 'interface');
+        c.set('network', 'wwan', 'proto', 'dhcp');
+        c.set('network', 'wwan', 'metric', '40');
+        c.commit('network');
+    }
+    let fw_changed = false;
+    c.foreach('firewall', 'zone', (z) => {
+        if (z.name != 'wan') return;
+        let nets = z.network;
+        if (type(nets) == 'string') nets = [nets];
+        if (type(nets) != 'array') nets = [];
+        if (index(nets, 'wwan') < 0) {
+            push(nets, 'wwan');
+            c.set('firewall', z['.name'], 'network', nets);
+            fw_changed = true;
+        }
+    });
+    if (fw_changed) c.commit('firewall');
+}
+
+function async_trigger_reload() {
+    system('(sleep 1; /usr/libexec/f50pro-wifi-repeater.sh trigger_reload) >/dev/null 2>&1 &');
+}
+
+function has_ctrl(s) {
+    return (index(s, '\n') >= 0 || index(s, '\r') >= 0 || index(s, chr(0)) >= 0);
+}
+
+function do_connect(args) {
+    let ssid = args.ssid || '';
+    if (length(ssid) < 1 || length(ssid) > 32)
+        return { ok: 0, error: 'Wi-Fi 名称不能为空且不超过 32 字节' };
+    if (has_ctrl(ssid))
+        return { ok: 0, error: 'Wi-Fi 名称不能包含换行符' };
+
+    let enc = args.encryption || 'psk2';
+    let allowed_enc = ['none', 'psk', 'psk2', 'psk-mixed', 'sae', 'sae-mixed'];
+    if (index(allowed_enc, enc) < 0)
+        return { ok: 0, error: '不支持的加密方式' };
+
+    let c = uci.cursor();
+    let secs = find_uci_sections(c);
+    let key = args.key || '';
+    if (has_ctrl(key))
+        return { ok: 0, error: '密码不能包含换行符' };
+    if (enc != 'none') {
+        if (length(key) == 0 && secs.sta && secs.sta.ssid == ssid && length(secs.sta.key || '') >= 8) {
+            key = secs.sta.key;
+        }
+        if (length(key) < 8 || length(key) > 63)
+            return { ok: 0, error: '密码长度需为 8 ~ 63 位' };
+    }
+
+    let ch_raw = trim(sprintf('%s', args.channel || 'auto'));
+    let ch_num = match(ch_raw, /^\d+$/) ? int(ch_raw) : 0;
+    let band = (args.band == '5g' || ch_num > 14) ? '5g' : '2g';
+    let htmode = (band == '5g') ? 'VHT20' : 'HT20';
+    let ch_set = (ch_num > 0) ? sprintf('%d', ch_num) : 'auto';
+
+    let macs = get_macs();
+    ensure_wwan_network_and_fw(c);
+
+    // Ensure AP section exists and has distinct MAC
+    let ap_name = secs.ap ? secs.ap['.name'] : 'default_radio0';
+    if (!c.get('wireless', ap_name)) {
+        c.set('wireless', ap_name, 'wifi-iface');
+        c.set('wireless', ap_name, 'device', 'radio0');
+        c.set('wireless', ap_name, 'mode', 'ap');
+        c.set('wireless', ap_name, 'network', 'lan');
+        c.set('wireless', ap_name, 'ssid', 'F50Pro-OpenWrt');
+        c.set('wireless', ap_name, 'encryption', 'psk2');
+        c.set('wireless', ap_name, 'key', 'openwrt1234');
+    }
+    c.set('wireless', ap_name, 'disabled', '0');
+    c.set('wireless', ap_name, 'macaddr', macs.ap);
+
+    // Remove duplicate STA sections except wwan_sta
+    let stale = [];
+    c.foreach('wireless', 'wifi-iface', (s) => {
+        if (s.device == 'radio0' && s.mode == 'sta' && s['.name'] != 'wwan_sta')
+            push(stale, s['.name']);
+    });
+    for (let st in stale) c.delete('wireless', st);
+
+    // Configure radio0
+    c.set('wireless', 'radio0', 'disabled', '0');
+    c.set('wireless', 'radio0', 'band', band);
+    c.set('wireless', 'radio0', 'channel', ch_set);
+    c.set('wireless', 'radio0', 'htmode', htmode);
+
+    // Configure wwan_sta
+    c.set('wireless', 'wwan_sta', 'wifi-iface');
+    c.set('wireless', 'wwan_sta', 'device', 'radio0');
+    c.set('wireless', 'wwan_sta', 'mode', 'sta');
+    c.set('wireless', 'wwan_sta', 'network', 'wwan');
+    c.set('wireless', 'wwan_sta', 'ssid', ssid);
+    c.set('wireless', 'wwan_sta', 'encryption', enc);
+    c.set('wireless', 'wwan_sta', 'f50pro_band', band);
+    if (enc == 'none') c.delete('wireless', 'wwan_sta', 'key');
+    else c.set('wireless', 'wwan_sta', 'key', key);
+    c.set('wireless', 'wwan_sta', 'macaddr', macs.sta);
+    c.set('wireless', 'wwan_sta', 'disabled', '0');
+
+    c.commit('wireless');
+    async_trigger_reload();
+    return { ok: 1, band: band, channel: ch_set };
+}
+
+function do_disconnect(args) {
+    let ap_band = (args.ap_band == '2g') ? '2g' : '5g';
+    let c = uci.cursor();
+    let macs = get_macs();
+
+    c.foreach('wireless', 'wifi-iface', (s) => {
+        if (s.device == 'radio0' && s.mode == 'sta')
+            c.set('wireless', s['.name'], 'disabled', '1');
+    });
+
+    let secs = find_uci_sections(c);
+    let ap_name = secs.ap ? secs.ap['.name'] : 'default_radio0';
+    c.set('wireless', ap_name, 'disabled', '0');
+    c.set('wireless', ap_name, 'macaddr', macs.ap);
+
+    c.set('wireless', 'radio0', 'disabled', '0');
+    if (ap_band == '5g') {
+        c.set('wireless', 'radio0', 'band', '5g');
+        c.set('wireless', 'radio0', 'channel', '36');
+        c.set('wireless', 'radio0', 'htmode', 'HE80');
+    } else {
+        c.set('wireless', 'radio0', 'band', '2g');
+        c.set('wireless', 'radio0', 'channel', '11');
+        c.set('wireless', 'radio0', 'htmode', 'HT20');
+    }
+
+    c.commit('wireless');
+    async_trigger_reload();
+    return { ok: 1, ap_band: ap_band };
+}
+
+function do_route_mode(args) {
+    let mode = args.mode || '';
+    let c = uci.cursor();
+    ensure_wwan_network_and_fw(c);
+    let secs = find_uci_sections(c);
+    let sta_net = (secs.sta && secs.sta.network) ? secs.sta.network : 'wwan';
+
+    if (mode == 'cell_first') {
+        c.set('network', 'wan', 'disabled', '0');
+        c.set('network', 'wan', 'metric', '10');
+        c.set('network', sta_net, 'metric', '40');
+    } else if (mode == 'wifi_first') {
+        c.set('network', 'wan', 'disabled', '0');
+        c.set('network', 'wan', 'metric', '50');
+        c.set('network', sta_net, 'metric', '10');
+    } else if (mode == 'wifi_only') {
+        c.set('network', 'wan', 'disabled', '1');
+        c.set('network', sta_net, 'metric', '10');
+    } else {
+        return { ok: 0, error: '无效的出口模式' };
+    }
+
+    c.commit('network');
+    let conn = ubus.connect();
+    conn.call('network', 'reload', {});
+    conn.disconnect();
+    return { ok: 1, mode: mode };
+}
+
+function do_ap_config(args) {
+    let ssid = args.ssid || '';
+    if (length(ssid) < 1 || length(ssid) > 32)
+        return { ok: 0, error: '热点名称不能为空且不超过 32 字节' };
+    if (has_ctrl(ssid))
+        return { ok: 0, error: '热点名称不能包含换行符' };
+
+    let enc = args.encryption || 'psk2';
+    let allowed_enc = ['none', 'psk2', 'sae-mixed'];
+    if (index(allowed_enc, enc) < 0)
+        return { ok: 0, error: '不支持的热点加密方式' };
+
+    let c = uci.cursor();
+    let secs = find_uci_sections(c);
+    let ap_name = secs.ap ? secs.ap['.name'] : 'default_radio0';
+    let key = args.key || '';
+    if (has_ctrl(key))
+        return { ok: 0, error: '热点密码不能包含换行符' };
+
+    if (enc != 'none') {
+        if (length(key) == 0 && secs.ap && length(secs.ap.key || '') >= 8) {
+            key = secs.ap.key;
+        }
+        if (length(key) < 8 || length(key) > 63)
+            return { ok: 0, error: '热点密码长度需为 8 ~ 63 位' };
+    }
+
+    let macs = get_macs();
+    c.set('wireless', ap_name, 'ssid', ssid);
+    c.set('wireless', ap_name, 'encryption', enc);
+    if (enc == 'none') c.delete('wireless', ap_name, 'key');
+    else c.set('wireless', ap_name, 'key', key);
+    c.set('wireless', ap_name, 'macaddr', macs.ap);
+    c.set('wireless', ap_name, 'disabled', '0');
+    c.commit('wireless');
+
+    async_trigger_reload();
+    return { ok: 1 };
+}
+
+function do_retry() {
+    let c = uci.cursor();
+    let secs = find_uci_sections(c);
+    if (!secs.sta || length(secs.sta.ssid || '') == 0)
+        return { ok: 0, error: '尚未配置上级 Wi-Fi' };
+    let macs = get_macs();
+    let saved_band = (secs.sta.f50pro_band == '5g') ? '5g' : '2g';
+    c.set('wireless', 'radio0', 'disabled', '0');
+    c.set('wireless', 'radio0', 'band', saved_band);
+    c.set('wireless', 'radio0', 'channel', 'auto');
+    c.set('wireless', 'radio0', 'htmode', saved_band == '5g' ? 'VHT20' : 'HT20');
+    c.set('wireless', secs.sta['.name'], 'macaddr', macs.sta);
+    c.set('wireless', secs.sta['.name'], 'disabled', '0');
+    c.commit('wireless');
+    async_trigger_reload();
+    return { ok: 1, band: saved_band };
+}
+
+let action = ARGV[0] || '';
+if (action == 'list') {
+    print(sprintf('%J\n', {
+        status: {},
+        scan: {},
+        connect: { ssid: 'String', key: 'String', encryption: 'String', band: 'String', channel: 'String' },
+        disconnect: { ap_band: 'String' },
+        route_mode: { mode: 'String' },
+        ap_config: { ssid: 'String', key: 'String', encryption: 'String' },
+        retry: {}
+    }));
+    exit(0);
+}
+
+if (action == 'call') {
+    let method = ARGV[1] || '';
+    let input_raw = fs.stdin.read('all') || '{}';
+    let args = {};
+    try { args = json(input_raw) || {}; } catch (e) { args = {}; }
+
+    let res;
+    if (method == 'status') res = do_status();
+    else if (method == 'scan') res = do_scan();
+    else if (method == 'connect') res = do_connect(args);
+    else if (method == 'disconnect') res = do_disconnect(args);
+    else if (method == 'route_mode') res = do_route_mode(args);
+    else if (method == 'ap_config') res = do_ap_config(args);
+    else if (method == 'retry') res = do_retry();
+    else res = { ok: 0, error: 'unknown_method' };
+
+    print(sprintf('%J\n', res));
+    exit(0);
+}
+
+print('{"ok":0,"error":"invalid_action"}\n');

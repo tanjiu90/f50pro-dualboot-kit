@@ -1,0 +1,20 @@
+#!/bin/sh
+# Trigger concurrent AP bring-up as soon as the STA upstream interface comes up.
+[ "$ACTION" = "ifup" ] || exit 0
+[ -n "$INTERFACE" ] || exit 0
+
+STA_NET="$(ucode -e '
+import * as uci from "uci";
+let c = uci.cursor();
+let net = "";
+c.foreach("wireless", "wifi-iface", (s) => {
+    if (s.device == "radio0" && s.mode == "sta" && s.disabled != "1")
+        net = s.network || "wwan";
+});
+print(net);
+' 2>/dev/null)"
+
+[ -n "$STA_NET" ] || exit 0
+[ "$INTERFACE" = "$STA_NET" ] || exit 0
+
+/usr/libexec/f50pro-wifi-repeater.sh ensure_ap &

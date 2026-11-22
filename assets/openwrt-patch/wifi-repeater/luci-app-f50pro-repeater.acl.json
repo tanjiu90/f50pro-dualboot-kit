@@ -1,0 +1,24 @@
+{
+	"luci-app-f50pro-repeater": {
+		"description": "F50 Pro Wi-Fi 中继与防失联热点管理",
+		"read": {
+			"ubus": {
+				"f50pro-repeater": [
+					"status",
+					"scan"
+				]
+			}
+		},
+		"write": {
+			"ubus": {
+				"f50pro-repeater": [
+					"connect",
+					"disconnect",
+					"route_mode",
+					"ap_config",
+					"retry"
+				]
+			}
+		}
+	}
+}

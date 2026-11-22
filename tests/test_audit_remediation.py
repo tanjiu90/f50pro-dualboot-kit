@@ -1722,6 +1722,80 @@ def test_round2_hardening_gates(synthetic_env: dict[str, Path], tmp_path: Path) 
     assert "kit.py provision-openwrt" in agent_doc and "--plan build\\device-session\\build\\flash_plan.json" in agent_doc
 
 
+def test_wifi_repeater_assets_hardening_and_provision_upload() -> None:
+    """Wi-Fi repeater assets satisfy driver/ujail/awk/ucode invariants and upload cleanly in provision_openwrt."""
+    from provision_openwrt import WIFI_REPEATER_FILES, _ensure_wifi_repeater
+
+    rep_dir = ASSETS_DIR / "openwrt-patch" / "wifi-repeater"
+    assert len(WIFI_REPEATER_FILES) == 7
+    for local_name, _remote_path, _mode in WIFI_REPEATER_FILES:
+        p = rep_dir / local_name
+        assert p.is_file(), f"Missing repeater asset {p}"
+        raw = p.read_bytes()
+        assert b"\r\n" not in raw, f"CRLF found in {local_name}"
+
+    # Validate JSON assets (menu + ACL)
+    menu = json.loads((rep_dir / "luci-app-f50pro-repeater.menu.json").read_text(encoding="utf-8"))
+    acl = json.loads((rep_dir / "luci-app-f50pro-repeater.acl.json").read_text(encoding="utf-8"))
+    assert "admin/network/wifi-repeater" in menu
+    assert "luci-app-f50pro-repeater" in acl
+    assert "f50pro-repeater" in acl["luci-app-f50pro-repeater"]["read"]["ubus"]
+    assert "connect" in acl["luci-app-f50pro-repeater"]["write"]["ubus"]["f50pro-repeater"]
+
+    # Validate shell daemon/hotplug hardening invariants discovered on live B28 hardware
+    sh_txt = (rep_dir / "f50pro-wifi-repeater.sh").read_text(encoding="utf-8")
+    assert "chown root:network" in sh_txt and "chmod 640" in sh_txt
+    assert "chmod 600" not in sh_txt  # hostapd runs as ujail -U network -G network
+    assert "if (!found && iface" in sh_txt  # BusyBox awk runs END even after exit
+    assert "/sys/class/ieee80211/phy0/macaddress" in sh_txt  # dynamic per-device MAC
+    assert "[ ! -d /sys/class/ieee80211/phy0 ]" in sh_txt  # cold-boot SDIO probe guard
+    # Functions called from cmd_watchdog must return, never exit the daemon
+    for fn_name in ("cmd_ensure_ap()", "cmd_fallback_ap()"):
+        start = sh_txt.index(fn_name)
+        end = sh_txt.index("\n}\n", start)
+        assert "exit 0" not in sh_txt[start:end], f"{fn_name} must use return, not exit"
+
+    # Validate rpcd ucode backend invariants (no regex NUL bug, no key leak, band saved/restored, newline-safe)
+    rpcd_txt = (rep_dir / "f50pro-repeater.rpcd").read_text(encoding="utf-8")
+    assert "function has_ctrl(" in rpcd_txt
+    assert "\\x00" not in rpcd_txt  # POSIX regcomp truncates on embedded NUL
+    assert "f50pro_band" in rpcd_txt
+    assert "it.ssid + '|||' + it.band" in rpcd_txt
+    assert "'\\0'" not in rpcd_txt
+    assert "5c:ff:a9:50:64" not in rpcd_txt  # zero device-specific MACs
+    assert "5c:ff:a9:50:64" not in sh_txt
+
+    # Validate LuCI view JS syntax if node is available on CI/host
+    js_path = rep_dir / "wifi-repeater.js"
+    js_txt = js_path.read_text(encoding="utf-8")
+    assert "apEncSelect.addEventListener('change'" in js_txt
+    assert "object: 'f50pro-repeater'" in js_txt
+    node_exe = shutil.which("node")
+    if node_exe:
+        chk = subprocess.run([node_exe, "--check", str(js_path)], capture_output=True, text=True)
+        assert chk.returncode == 0, f"JS syntax error: {chk.stderr}"
+
+    # Verify _ensure_wifi_repeater uploads all 7 files with exact permissions and runs sh -n + enable/restart
+    uploaded: list[tuple[str, int]] = []
+    cmds: list[str] = []
+    with (
+        patch(
+            "provision_openwrt.sftp_put_bytes",
+            side_effect=lambda _sftp, _data, rpath, mode=0o644: uploaded.append((rpath, mode)),
+        ),
+        patch("provision_openwrt.ssh_run", side_effect=lambda _ssh, cmd, **kw: cmds.append(cmd) or (0, "", "")),
+    ):
+        res = _ensure_wifi_repeater(MagicMock(), MagicMock())
+    assert res["installed"] is True
+    assert res["luci_path"] == "admin/network/wifi-repeater"
+    assert uploaded == [(rpath, mode) for _, rpath, mode in WIFI_REPEATER_FILES]
+    assert len(cmds) == 1
+    assert "sh -n /usr/libexec/f50pro-wifi-repeater.sh" in cmds[0]
+    assert "/etc/init.d/f50pro-repeater enable" in cmds[0]
+    assert "/tmp/luci-indexcache*" in cmds[0]
+
+
+
 
 
 

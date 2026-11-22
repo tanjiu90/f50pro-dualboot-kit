@@ -1,0 +1,13 @@
+{
+	"admin/network/wifi-repeater": {
+		"title": "Wi-Fi 中继",
+		"order": 16,
+		"action": {
+			"type": "view",
+			"path": "network/wifi-repeater"
+		},
+		"depends": {
+			"acl": [ "luci-app-f50pro-repeater" ]
+		}
+	}
+}
