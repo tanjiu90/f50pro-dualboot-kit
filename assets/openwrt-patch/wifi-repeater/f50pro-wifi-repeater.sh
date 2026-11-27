@@ -129,23 +129,20 @@ build_hostapd_conf() {
     get_macs
 
     if [ -f "$HOSTAPD_SRC" ] && grep -q '^interface=' "$HOSTAPD_SRC" 2>/dev/null; then
-        # Derive repeater/fallback hostapd config from netifd-generated hostapd-phy0.conf
-        # Strip start_disabled and band/width-specific options that can mismatch target channel.
+        # Derive repeater/fallback hostapd config from netifd-generated hostapd-phy0.conf.
+        # Keep Wi-Fi 6 (ieee80211ax) and HT LDPC/STBC/MAX-AMSDU capabilities intact so AP
+        # throughput is not degraded to bare 802.11n; strip only channel/width-tied oper fields.
         if [ "$hwmode" = "a" ]; then
             sed -e '/^start_disabled=/d' \
                 -e '/^acs_/d' \
                 -e '/^vht_oper_/d' \
                 -e '/^he_oper_/d' \
                 -e '/^op_class=/d' \
-                -e '/^ieee80211ac=/d' \
-                -e '/^vht_capab=/d' \
-                -e '/^ieee80211ax=/d' \
-                -e '/^he_/d' \
                 -e '/^basic_rates=/d' \
                 -e '/^supported_rates=/d' \
                 -e "s/^channel=.*/channel=$ch/" \
                 -e "s/^hw_mode=.*/hw_mode=a/" \
-                -e 's/^ht_capab=.*/ht_capab=[SHORT-GI-20]/' \
+                -e 's/^ht_capab=.*/ht_capab=[LDPC][SHORT-GI-20][TX-STBC][MAX-AMSDU-7935][RX-STBC1]/' \
                 -e "s/^bssid=.*/bssid=$AP_MAC/" \
                 "$HOSTAPD_SRC" > "$HOSTAPD_OUT"
         else
@@ -154,22 +151,20 @@ build_hostapd_conf() {
                 -e '/^vht_oper_/d' \
                 -e '/^he_oper_/d' \
                 -e '/^op_class=/d' \
-                -e '/^ieee80211ac=/d' \
-                -e '/^vht_capab=/d' \
-                -e '/^ieee80211ax=/d' \
-                -e '/^he_/d' \
                 -e "s/^channel=.*/channel=$ch/" \
                 -e "s/^hw_mode=.*/hw_mode=g/" \
-                -e 's/^ht_capab=.*/ht_capab=[SHORT-GI-20]/' \
+                -e 's/^ht_capab=.*/ht_capab=[LDPC][SHORT-GI-20][TX-STBC][MAX-AMSDU-7935][RX-STBC1]/' \
                 -e "s/^bssid=.*/bssid=$AP_MAC/" \
                 "$HOSTAPD_SRC" > "$HOSTAPD_OUT"
         fi
+        grep -q '^ieee80211ax=' "$HOSTAPD_OUT" 2>/dev/null || echo 'ieee80211ax=1' >> "$HOSTAPD_OUT"
         chown root:network "$HOSTAPD_OUT" 2>/dev/null || true
         chmod 640 "$HOSTAPD_OUT" 2>/dev/null || true
         return 0
     fi
 
     # Fallback generator directly from UCI if netifd did not emit hostapd-phy0.conf
+    rm -f "${HOSTAPD_OUT}.tmp"
     ucode -e '
 import * as uci from "uci";
 import * as fs from "fs";
@@ -179,6 +174,10 @@ let ssid = c.get("wireless", sec, "ssid") || "F50Pro-OpenWrt";
 let enc = c.get("wireless", sec, "encryption") || "psk2";
 let key = c.get("wireless", sec, "key") || "";
 let country = c.get("wireless", "radio0", "country") || "CN";
+if (enc != "none" && length(key) < 8) {
+    warn("f50pro-repeater: refusing to start fallback AP with invalid/missing key for encryption=" + enc + "\n");
+    exit(1);
+}
 let lines = [
     "driver=nl80211",
     "country_code=" + country,
@@ -186,7 +185,8 @@ let lines = [
     "hw_mode=" + hw,
     "channel=" + ch,
     "ieee80211n=1",
-    "ht_capab=[SHORT-GI-20]",
+    "ht_capab=[LDPC][SHORT-GI-20][TX-STBC][MAX-AMSDU-7935][RX-STBC1]",
+    "ieee80211ax=1",
     "interface=phy0-ap0",
     "bssid=" + bssid,
     "ctrl_interface=/var/run/hostapd",
@@ -197,26 +197,28 @@ let lines = [
     "ignore_broadcast_ssid=0",
     "disassoc_low_ack=0"
 ];
-if (enc != "none" && length(key) >= 8) {
-    lines.push("wpa=2");
-    lines.push("wpa_passphrase=" + key);
-    lines.push("wpa_pairwise=CCMP");
+if (enc != "none") {
+    push(lines, "wpa=2");
+    push(lines, "wpa_passphrase=" + key);
+    push(lines, "wpa_pairwise=CCMP");
     if (enc == "sae") {
-        lines.push("wpa_key_mgmt=SAE");
-        lines.push("ieee80211w=2");
+        push(lines, "wpa_key_mgmt=SAE");
+        push(lines, "ieee80211w=2");
     } else if (enc == "sae-mixed") {
-        lines.push("wpa_key_mgmt=WPA-PSK SAE");
-        lines.push("ieee80211w=1");
+        push(lines, "wpa_key_mgmt=WPA-PSK SAE");
+        push(lines, "ieee80211w=1");
     } else {
-        lines.push("wpa_key_mgmt=WPA-PSK");
-        lines.push("ieee80211w=0");
+        push(lines, "wpa_key_mgmt=WPA-PSK");
+        push(lines, "ieee80211w=0");
     }
 }
-fs.writefile(out, join("\n", lines) + "\n");
-' "$ch" "$hwmode" "$ap_sec" "$AP_MAC" "$HOSTAPD_OUT" 2>/dev/null
-    chown root:network "$HOSTAPD_OUT" 2>/dev/null || true
-    chmod 640 "$HOSTAPD_OUT" 2>/dev/null || true
-    [ -s "$HOSTAPD_OUT" ]
+if (!fs.writefile(out, join("\n", lines) + "\n")) exit(1);
+' "$ch" "$hwmode" "$ap_sec" "$AP_MAC" "${HOSTAPD_OUT}.tmp" 2>/dev/null || return 1
+    [ -s "${HOSTAPD_OUT}.tmp" ] || return 1
+    chown root:network "${HOSTAPD_OUT}.tmp" 2>/dev/null || true
+    chmod 640 "${HOSTAPD_OUT}.tmp" 2>/dev/null || true
+    mv -f "${HOSTAPD_OUT}.tmp" "$HOSTAPD_OUT"
+    return 0
 }
 
 start_ap_on_channel() {

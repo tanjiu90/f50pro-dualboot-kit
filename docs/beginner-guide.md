@@ -1,6 +1,6 @@
 # 中兴 F50 Pro (MU3356) 双系统工具包 · 零基础小白保姆级使用教程
 
-> **适用工具版本**：`f50pro-dualboot-kit v1.1.1`
+> **适用工具版本**：`f50pro-dualboot-kit v1.1.2`
 >
 > **适用机型**：**中兴 F50 Pro（型号 `MU3356` / 展锐 `UMS9632` / 出厂 Android 15）**
 >
@@ -65,16 +65,16 @@
 ### 第 1 步：打开 PowerShell 并下载代码
 
 1. 按键盘 `Win + S`，搜索 **`PowerShell`**，右键选择 **“以管理员身份运行”**（因为第 3 步装 USB 驱动需要管理员权限）。
-2. 依次复制执行以下命令（新建工作目录并下载官方 `v1.1.1` 稳定版代码）：
+2. 依次复制执行以下命令（新建工作目录并下载官方 `v1.1.2` 稳定版代码）：
 
 ```powershell
 mkdir D:\f50pro-kit -Force
 cd D:\f50pro-kit
-git clone --branch v1.1.1 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+git clone --branch v1.1.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 ```
 
-*(提示：如果之前没装 Git，也可以用浏览器打开 `https://github.com/tanjiu90/f50pro-dualboot-kit/releases/tag/v1.1.1` 下载 `f50pro-dualboot-kit-v1.1.1-src.tar.gz` 解压到 `D:\f50pro-kit\f50pro-dualboot-kit`，再 `cd` 进去。)*
+*(提示：如果之前没装 Git，也可以用浏览器打开 `https://github.com/tanjiu90/f50pro-dualboot-kit/releases/tag/v1.1.2` 下载 `f50pro-dualboot-kit-v1.1.2-src.tar.gz` 解压到 `D:\f50pro-kit\f50pro-dualboot-kit`，再 `cd` 进去。)*
 
 ### 第 2 步：运行一键引导脚本（创建 Python 环境 + 按需下载资源包）
 
@@ -103,17 +103,22 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ### 第 3 步：安装展锐 BROM / WinUSB 驱动（Windows 必做）
 
-如果电脑之前没刷过展锐设备，必须装一次 `1782:4D00` / `1782:4D03` 的 WinUSB 驱动，否则刷机工具找不到设备：
+如果电脑之前没刷过展锐设备，必须先预装一次 `1782:4D00`（`Unisoc BROM`）和 `1782:4D03`（`Unisoc Boot Diag`）的 WinUSB 驱动，否则刷机工具在设备进入下载模式时找不到端口：
 
 在同一个**管理员 PowerShell** 窗口执行：
 
 ```powershell
-.\build\runtime-tools\host-tools-win64\qmk_driver_installer\install_unisoc_drivers.bat
+.\scripts\install_unisoc_drivers.bat
 ```
 
-如果弹窗询问是否安装驱动，点 **安装 / 是**。
+如果弹窗询问是否安装驱动，点 **安装 / 是**；看到 `Unisoc BROM` 和 `Unisoc Boot Diag` 两项都提示 **`Success`** 即安装完成（此时**不需要**先插设备，也不需要设备进入刷机模式）。
 
-*(注：`v1.1.0+` 工具包里已经把 `install_connected_drivers.bat` 修复为指向 `unisoc_drivers.txt`，运行 `install_unisoc_drivers.bat` 或 `install_connected_drivers.bat` 都可以。)*
+> **重要避坑（如果你遇到 `No matching device found`）**：
+> - `qmk_driver_installer.exe` 不加 `--all` 参数时只会扫描**此刻已进入下载模式**的设备；而正常开机的 F50 Pro USB ID 是 `19D2:0246`（不是 `1782:4D00`），所以旧版 `v1.1.1` 漏掉 `--all` 时会提示 `No matching device found`。
+> - `v1.1.2` 已将 `.\scripts\install_unisoc_drivers.bat` 与解压后的 `install_unisoc_drivers.bat` 全部修复为 `--force --all` 离线预装；如果你手里还是旧目录，可直接手动执行：
+>   ```powershell
+>   .\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force --all .\build\runtime-tools\host-tools-win64\qmk_driver_installer\unisoc_drivers.txt
+>   ```
 
 ### 第 4 步：执行电脑环境预检（不连接设备也能测）
 
@@ -329,11 +334,17 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
   - `build\my-f50pro\build\flash-run\flash_failure_report.json`
 - 绝大多数情况下原本的系统分区（`_a` 槽）丝毫未损！只要确认是连接线松动或读回校验失败，排除线材/USB 口后重新执行带 `--reuse-backup` 的命令或写回原槽引导块即可。
 
-### Q2：提示找不到 `1782:4D00` / `Waiting for boot_diag` 一直卡住？
-1. 确认已经用管理员权限运行过 `install_unisoc_drivers.bat`；
-2. 确认你的 `--webui-password` 输入正确（如果输入错误脚本会立刻报 `WebUIAuthError` 退出）；
-3. 换一根确定能传数据的高品质 USB 线，改插电脑主机背后的 USB 口；
-4. 若你不知道原厂 WebUI 密码（也进不去后台），可在出现 `Waiting for boot_diag` 时手动按厂商进线刷模式方式重新插拔上电。
+### Q2：装驱动报 `No matching device found`，或 F50 Pro 插电脑完全识别不到 / 卡在 `Waiting for boot_diag`？
+1. **运行驱动脚本提示 `No matching device found`**：
+   - 这是缺少 `--all` 参数导致的（正常开机的 F50 Pro 是 `19D2:0246`，不会在安装驱动时显示 `1782:4D00`）。
+   - 请在**管理员 PowerShell** 中运行 `.\scripts\install_unisoc_drivers.bat`（或手动加 `--force --all` 参数执行 `qmk_driver_installer.exe --force --all ...\unisoc_drivers.txt`），直到两项都显示 `Success`。
+2. **正常开机插电脑就识别不到（打不开 `http://192.168.0.1:8080`，设备管理器没反应）**：
+   - **优先换数据线和 USB 口**：很多纯充电线或双头 Type-C 线不支持高速数据；换一根确认能给手机传数据的 **USB-A 转 Type-C 线**，直插台式机**主板后置 USB 口**（不要走扩展坞/前置面板）。
+   - **检查设备管理器 RNDIS 驱动**：正常开机插上电脑应出现 `VID_19D2&PID_0246`（Remote NDIS 网卡）。若出现带黄色感叹号的未知设备/RNDIS，右键 **更新驱动程序 -> 浏览我的电脑 -> 让我从计算机上的可用驱动程序列表中选取 -> 网络适配器 -> Microsoft -> 基于远程 NDIS 的 Internet 共享设备**。
+3. **驱动已装仍卡在 `Waiting for boot_diag`**：
+   - 确认你的 `--webui-password` 输入正确（如果输入错误脚本会立刻报 `WebUIAuthError` 退出）；
+   - 如果电脑以前装过老版展锐串口驱动（`SPRD U2S Diag` 抢占了 `1782:4D00`），可用 **Zadig**（`Options -> List All Devices`）在刷机窗口将 `1782:4D00` 强行替换为 **WinUSB**；
+   - 若你不知道原厂 WebUI 密码（也进不去后台），可在出现 `Waiting for boot_diag` 时手动按厂商进线刷模式方式重新插拔上电。
 
 ### Q3：提示 `Target unit identity mismatch`（设备指纹不匹配）？
 - 说明你拿**A 机器的 `backup`** 去刷 **B 机器** 了！这是安全锁主动救了你一命——请为当前插着的设备新建一个 `--work-dir`（例如 `build\device-2`）重新备份并生成计划。

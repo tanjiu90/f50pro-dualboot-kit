@@ -329,6 +329,36 @@ def _is_extracted_cache_valid(sub_out: Path, expected_archive_sha: str) -> bool:
         return False
 
 
+_FIXED_UNISOC_DRIVER_BAT = (
+    b'@echo off\r\n'
+    b'"%~dp0qmk_driver_installer.exe" --force --all "%~dp0unisoc_drivers.txt"\r\n'
+)
+
+
+def _normalize_win64_driver_scripts(sub_out: Path) -> bool:
+    """Ensure extracted host-tools-win64 install_unisoc_drivers.bat passes --all for offline pre-install."""
+    qmk_dir = sub_out / "qmk_driver_installer"
+    if is_link_or_reparse(qmk_dir) or not qmk_dir.is_dir():
+        return False
+    installer = qmk_dir / "qmk_driver_installer.exe"
+    drv_list = qmk_dir / "unisoc_drivers.txt"
+    bat = qmk_dir / "install_unisoc_drivers.bat"
+    if (
+        is_link_or_reparse(installer)
+        or is_link_or_reparse(drv_list)
+        or is_link_or_reparse(bat)
+        or not installer.is_file()
+        or not drv_list.is_file()
+    ):
+        return False
+    if bat.is_file():
+        existing = bat.read_bytes()
+        if b"--all" in existing and b"unisoc_drivers.txt" in existing:
+            return False
+    bat.write_bytes(_FIXED_UNISOC_DRIVER_BAT)
+    return True
+
+
 def _clean_dir_contents(target_dir: Path) -> None:
     if is_link_or_reparse(target_dir):
         try:
@@ -383,6 +413,9 @@ def fetch_and_extract(
         marker = sub_out / ".verified.sha256"
         manifest_f = sub_out / ".verified.manifest.json"
         if _is_extracted_cache_valid(sub_out, meta["sha256"]):
+            if key == "host_tools_win64" and _normalize_win64_driver_scripts(sub_out):
+                ext_manifest = _build_extracted_manifest(sub_out, meta["sha256"])
+                manifest_f.write_text(json.dumps(ext_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             extracted[key] = {"archive": str(arc), "dir": str(sub_out), "status": "cached"}
             continue
         _clean_dir_contents(sub_out)
@@ -391,6 +424,8 @@ def fetch_and_extract(
             if arc.suffix == ".zip"
             else _safe_extract_tar(arc, sub_out)
         )
+        if key == "host_tools_win64":
+            _normalize_win64_driver_scripts(sub_out)
         # Verify nested Magisk / UFI APK digests if present
         if key == "android_pkgs":
             for apk_name, apk_sha in meta.get("contains", {}).items():

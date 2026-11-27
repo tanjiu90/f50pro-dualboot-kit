@@ -21,11 +21,11 @@ Designed for **one-click per-OS selective download & deployment** and **autonomo
 
 ## Verification & Release Readiness Status (Honest Scope: 4 Tiers Separated)
 
-> **Important integrity notice**: [assets/release-manifest.json](assets/release-manifest.json) verifies **SHA-256 file integrity** against this repository's manifest, **not** cryptographic publisher signatures (GPG / Cosign / GitHub Attestation). For reproducible flashing, clone an **explicit Release tag or commit SHA** (now promoted cleanly from `v1.1.1-rc.1`..`rc.3` to **`v1.1.1`** on `main`; `v1.1.0` tag/assets remain frozen and intact).
+> **Important integrity notice**: [assets/release-manifest.json](assets/release-manifest.json) verifies **SHA-256 file integrity** against this repository's manifest, **not** cryptographic publisher signatures (GPG / Cosign / GitHub Attestation). For reproducible flashing, clone an **explicit Release tag or commit SHA** (latest stable tag: **`v1.1.2`** on `main`; `v1.1.0` binary packs remain frozen and intact).
 
 | Scope | Compilation / Packaging | Host CLI / Unit & Fault Tests | Live USB Comm | End-to-End Hardware | Notes / Explicit Limits |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Pure-Python builder & P0 safety guards (`v1.1.1`)** | `PASS` | `PASS` (`60` pytest fault + unit tests) | `N/A` *(offline)* | `N/A` *(offline)* | Offline `plan` / `auto` dry-run perform zero downloads, zero WebUI reboots, zero BROM/SSH/ADB calls; `auto --execute` uses single-session `SPRD4` (backup->build->flash with zero mid-flow reboot) + WebUI/OpenWrt-SSH/ADB auto-reboot; failure injects stop before `reset`/`wof` and persist `flash_state.json`. |
+| **Pure-Python builder & safety guards (`v1.1.2`)** | `PASS` | `PASS` (`70+` pytest fault + audit + unit tests) | `N/A` *(offline)* | `N/A` *(offline)* | Offline `plan` / `auto` dry-run perform zero downloads, zero WebUI reboots, zero BROM/SSH/ADB calls; `auto --execute` uses single-session `SPRD4` (backup->build->flash with zero mid-flow reboot) + WebUI/OpenWrt-SSH/ADB auto-reboot; includes multi-agent audit fixes, `apk-tools 3.0.5` fix, Wi-Fi repeater fixes, and `--force --all` Windows WinUSB pre-installer. |
 | **Windows x64 host toolkit (`v1.1.0` + P0)** | `PASS` | `PASS` (`win32` + CI `windows-latest`) | `PASS` *(upstream WinUSB)* | **`B28` VERIFIED *(upstream)*** / `UNVERIFIED` *(this CLI)* | Upstream `B28` verified full `_a`+`_b`+`5G NR SA`+Wi-Fi 6+OpenClash+5s roundtrip; refactored `kit.py` CLI awaiting authorized pilot. |
 | **`B15` (`board_id=1`, Built-in Dual eSIM)** | `PASS` *(image build parity)* | `PASS` *(DTB & offset fixture)* | `PASS` *(upstream dump)* | `PARTIAL` *(dual-boot roundtrip verified upstream)* | Upstream installed & roundtrip-switched `_b <-> _a`; **paid eSIM cellular WAN intentionally NOT tested per user decision (non-blocker)**. |
 | **Linux `x86_64` host** | `PASS` | `PASS` (CI `ubuntu-latest`) | `UNVERIFIED` *(live USB)* | `UNVERIFIED` | CI verifies `bootstrap.sh`, `preflight --strict`, offline `plan`, `spd_dump -h`, and `adb version`; physical USB flash/NCM isolation awaits live run. |
@@ -58,7 +58,7 @@ Pick only the host tool bundle + firmware/APK packs you actually need (via inter
 
 | Host Device | Bootstrap Command | USB / Privilege Notes | Detailed Guide |
 | :--- | :--- | :--- | :--- |
-| **Windows x64** | `.\scripts\bootstrap.ps1` (add `-Interactive`, `-Profile`, `-SkipOpenClash`) | Includes fixed `install_connected_drivers.bat` -> `unisoc_drivers.txt` + RNDIS6 isolator | Steps below |
+| **Windows x64** | `.\scripts\bootstrap.ps1` (add `-Interactive`, `-Profile`, `-SkipOpenClash`) | Run `.\scripts\install_unisoc_drivers.bat` (Admin, uses `--force --all` for offline `1782:4D00`/`4D03` pre-install) + RNDIS6 isolator | Steps below |
 | **Linux (`x86_64` / `arm64`)** | `bash scripts/bootstrap.sh` (add `--interactive`, `--profile`, `--no-openclash`) | Install `assets/udev/99-unisoc-f50pro.rules` or pass `--spd-mode sudo`; ARM64 needs distro `android-tools-adb` | [docs/multi-platform-host.md](docs/multi-platform-host.md) |
 | **macOS (Apple Silicon / Intel)** | `bash scripts/bootstrap.sh --platform macos` | Universal Mach-O binaries; raw USB requires `sudo` (`--spd-mode sudo`) + `networksetup` isolation | [docs/multi-platform-host.md](docs/multi-platform-host.md) |
 | **Android OTG (Termux `arm64`)** | `bash scripts/bootstrap.sh --platform android-arm64` | **Rooted (`su`)**: full `--spd-mode su` (`--kickto 2`). **Non-Root**: `--spd-mode termux-usb` (`--usb-fd`, pre-entered `1782:4d00` only) + wireless ADB / `termux-adb` | [docs/multi-platform-host.md](docs/multi-platform-host.md) |
@@ -85,15 +85,17 @@ List packs + direct URLs without downloading: `python3 scripts/kit.py fetch-asse
 ### 1. Pinned Clone, Python `.venv`, Dependencies & Selected Packs
 
 ```powershell
-# Windows: pin explicit release tag v1.1.1 (or latest main); v1.1.0 remains frozen
-git clone --branch v1.1.1 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+# Windows: pin explicit release tag v1.1.2 (or latest main); v1.1.0 binary packs remain frozen
+git clone --branch v1.1.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 .\scripts\bootstrap.ps1
+# First time on Windows (Run PowerShell as Administrator): pre-install Unisoc BROM/Boot Diag WinUSB drivers
+.\scripts\install_unisoc_drivers.bat
 ```
 
 ```bash
-# Linux / macOS / Android Termux: pin tag v1.1.1, then auto-detect OS/arch or pass --interactive / --profile
-git clone --branch v1.1.1 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+# Linux / macOS / Android Termux: pin tag v1.1.2, then auto-detect OS/arch or pass --interactive / --profile
+git clone --branch v1.1.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 bash scripts/bootstrap.sh --interactive
 ```

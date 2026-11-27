@@ -61,15 +61,20 @@ function parse_iw_dev() {
     return ifaces;
 }
 
+function safe_ifname(dev) {
+    return (type(dev) == 'string' && match(dev, /^[a-zA-Z0-9_.-]{1,15}$/)) ? dev : '';
+}
+
 function parse_sta_link(dev) {
     let info = { connected: false, bssid: '', ssid: '', signal: null, freq: 0, rx_bytes: 0, tx_bytes: 0 };
+    dev = safe_ifname(dev);
     if (!dev) return info;
-    let out = read_cmd('iw dev ' + dev + ' link 2>/dev/null');
+    let out = read_cmd("iw dev '" + dev + "' link 2>/dev/null");
     let m = match(out, /Connected to ([0-9a-fA-F:]{17})/);
     if (!m) return info;
     info.connected = true;
     info.bssid = lc(m[1]);
-    if ((m = match(out, /SSID:\s*([^\r\n]+)/))) info.ssid = unesc_ssid(trim(m[1]));
+    if ((m = match(out, /SSID:\s*([^\r\n]+)/))) info.ssid = unesc_ssid(m[1]);
     if ((m = match(out, /signal:\s*(-?\d+)\s*dBm/))) info.signal = int(m[1]);
     if ((m = match(out, /freq:\s*(\d+)/))) info.freq = int(m[1]);
     if ((m = match(out, /RX:\s*(\d+)\s+bytes/))) info.rx_bytes = int(m[1]);
@@ -78,8 +83,9 @@ function parse_sta_link(dev) {
 }
 
 function count_ap_clients(dev) {
+    dev = safe_ifname(dev);
     if (!dev) return 0;
-    let out = read_cmd('iw dev ' + dev + ' station dump 2>/dev/null');
+    let out = read_cmd("iw dev '" + dev + "' station dump 2>/dev/null");
     let cnt = 0;
     for (let line in split(out, '\n')) {
         if (match(line, /^Station\s+/)) cnt++;
@@ -261,8 +267,9 @@ function scan_fallback_iw() {
             if (x.type == 'AP') { dev = x.name; ap_flag = ' ap-force'; break; }
         }
     }
+    dev = safe_ifname(dev);
     if (!dev) return [];
-    let out = read_cmd('iw dev ' + dev + ' scan' + ap_flag + ' 2>/dev/null');
+    let out = read_cmd("iw dev '" + dev + "' scan" + ap_flag + ' 2>/dev/null');
     let list = [], cur = null;
     for (let line in split(out, '\n')) {
         let m = match(line, /^BSS\s+([0-9a-fA-F:]{17})/);

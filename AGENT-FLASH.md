@@ -22,15 +22,16 @@ Pin an explicit Release tag (or verified commit SHA) — never pull mutable `mai
 
 - **Windows PC**:
   ```powershell
-  git clone --branch v1.1.1 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   .\scripts\bootstrap.ps1 -Profile <PROFILE_ID>  # add -SkipOpenClash if unused
+  .\scripts\install_unisoc_drivers.bat           # Admin once: pre-installs 1782:4D00 / 1782:4D03 WinUSB (--force --all)
   .\.venv\Scripts\python.exe -m pytest -v
   .\.venv\Scripts\python.exe scripts\kit.py preflight --strict --operation auto --profile <PROFILE_ID>
   ```
 - **Linux (`x86_64` / `arm64`) / macOS (`Universal`) / Android Termux (`arm64`)**:
   ```bash
-  git clone --branch v1.1.1 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   bash scripts/bootstrap.sh --profile <PROFILE_ID>  # add --no-openclash if unused
   .venv/bin/python -m pytest -v
@@ -41,7 +42,7 @@ Expected assertions before proceeding:
 - All `pytest` unit/safety/sanitization tests pass (`0` failures).
 - `preflight` confirms `paramiko=true`, `serial=true`, `spd_dump` resolved (`spd_dump_termux_usb` also checked on `android-arm64`), `adb` resolved, and `adb_pubkey_present=true`.
 - Host-specific USB access checks:
-  - **Windows**: `host-tools-win64\qmk_driver_installer\install_connected_drivers.bat` (or `install_unisoc_drivers.bat`) installs WinUSB for `1782:4D00` / `1782:4D03`.
+  - **Windows**: `.\scripts\install_unisoc_drivers.bat` (or `qmk_driver_installer.exe --force --all unisoc_drivers.txt` as Administrator) pre-installs WinUSB for `1782:4D00` / `1782:4D03` even before entering BROM mode.
   - **Linux**: install `assets/udev/99-unisoc-f50pro.rules` into `/etc/udev/rules.d/` (or pass `--spd-mode sudo` in Steps 2 & 5). On `linux-arm64`, install distro `adb` (`android-tools-adb`).
   - **macOS**: pass `--spd-mode sudo` (or run under `sudo`) during Steps 2 & 5 because macOS `libusb` requires root to claim `1782:4D00`.
   - **Android Termux**: use `--spd-mode su` on rooted phones (full `--kickto 2` support); `--spd-mode termux-usb` on non-root phones is **EXPERIMENTAL** and requires target already enumerated in `1782:4D00` autodloader mode + `--adb-serial 192.168.0.1:5555` (or `termux-adb`).

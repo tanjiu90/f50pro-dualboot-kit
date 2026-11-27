@@ -12,12 +12,12 @@
 | **本仓库支持现状** | **`VERIFIED`（上游 8/8 次实机成功连机路径）**；注意 `r all` 不主动备份 `eMMC boot1` (`splloader_bak`) | **`BLOCKED / NOT INCLUDED`（上游 0/18 次成功实证；本仓库不含官方 `.pac` 或 `UMS9632` 签名 `FDL1/FDL2`）** |
 
 ### Windows WinUSB 驱动安装要点
-- 当 `spd_dump` 提示 `Waiting for boot_diag` 或缺少 `1782:4D00` / `1782:4D03` 驱动时，在 `v1.1.0` 中可直接运行 `qmk_driver_installer\install_connected_drivers.bat`（已修复指向 `unisoc_drivers.txt`）或 `install_unisoc_drivers.bat`（管理员运行）：
+- 当 `spd_dump` 提示 `Waiting for boot_diag` 或缺少 `1782:4D00` / `1782:4D03` 驱动时，在**管理员 PowerShell** 中直接运行 `.\scripts\install_unisoc_drivers.bat`（或在 `v1.1.2+` 中运行自动补全了 `--all` 的 `qmk_driver_installer\install_unisoc_drivers.bat`）；手动命令**必须带 `--all`** 才能在设备未进入下载模式时离线预装：
   ```powershell
-  .\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force `
+  .\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force --all `
     .\build\runtime-tools\host-tools-win64\qmk_driver_installer\unisoc_drivers.txt
   ```
-- **旧版 `v1.0.0` 注意**：若使用的是 `v1.0.0` 旧压缩包，其中的 `install_connected_drivers.bat` 默认读取 `drivers.txt`（不含 `1782:4D00`），请显式指定 `unisoc_drivers.txt` 或改用 Zadig。
+- **旧版 `v1.0.0` / `v1.1.0` / `v1.1.1` 注意**：若使用的是旧版包内未带 `--all` 的 `.bat`，在设备未处于 `1782:4D00` BROM 模式时会输出 `No matching device found` 且不会安装驱动；请显式补加 `--force --all unisoc_drivers.txt` 或改用 Zadig。
 - **Linux / macOS / Android Termux 主控说明**：详见 [docs/multi-platform-host.md](multi-platform-host.md)（Linux `udev` 规则、macOS `sudo` 权限与 Android Termux `--spd-mode su` vs `--usb-fd` 边界）。
 
 ---

@@ -1794,10 +1794,102 @@ def test_wifi_repeater_assets_hardening_and_provision_upload() -> None:
     assert "/etc/init.d/f50pro-repeater enable" in cmds[0]
     assert "/tmp/luci-indexcache*" in cmds[0]
 
+    # Verify ucode fallback hostapd bugfix (no JS .push() method in ucode) & safe_ifname quoting
+    assert "lines.push(" not in sh_txt
+    assert "push(lines," in sh_txt
+    assert 'HOSTAPD_OUT}.tmp' in sh_txt
+    assert "ieee80211ax=1" in sh_txt
+    assert "function safe_ifname(" in rpcd_txt
+    assert "'iw dev ' + dev +" not in rpcd_txt
+    assert "\"iw dev '\" + dev + \"' link 2>/dev/null\"" in rpcd_txt
+    assert "f50pro-key-dispatch" not in rpcd_txt  # keep pure public kit free of personal modular addons
 
 
+def test_win64_unisoc_driver_all_flag_and_doc_sync(tmp_path: Path) -> None:
+    """Verify --force --all offline WinUSB pre-install fix across repo wrapper, fetch_assets normalizer, and docs."""
+    import zipfile
 
+    from common import sha256_file, write_json
 
+    # 1. Repo-tracked wrapper checks admin privileges and passes --force --all
+    repo_bat = (REPO_ROOT / "scripts" / "install_unisoc_drivers.bat").read_text(encoding="utf-8")
+    assert "net session" in repo_bat
+    assert "--force --all" in repo_bat
+    assert "unisoc_drivers.txt" in repo_bat
 
+    # 2. fetch_and_extract auto-normalizes extracted (and pre-cached) host_tools_win64 install_unisoc_drivers.bat
+    cache_d = tmp_path / "cache"
+    tools_d = tmp_path / "tools"
+    cache_d.mkdir()
+    zip_path = cache_d / "f50pro-host-tools-win64.zip"
+    old_bat = b'@echo off\r\n"%~dp0qmk_driver_installer.exe" --force "%~dp0unisoc_drivers.txt"\r\n'
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("qmk_driver_installer/qmk_driver_installer.exe", b"MZ-stub")
+        zf.writestr("qmk_driver_installer/unisoc_drivers.txt", b"winusb,Unisoc BROM,1782,4D00,guid\n")
+        zf.writestr("qmk_driver_installer/install_unisoc_drivers.bat", old_bat)
 
+    manifest_file = tmp_path / "manifest.json"
+    zip_sha = sha256_file(zip_path)
+    write_json(
+        manifest_file,
+        {
+            "release_tag": "v-test",
+            "github_repo": "tanjiu90/f50pro-dualboot-kit",
+            "base_url": "https://example.invalid/v-test",
+            "packs": {
+                "host_tools_win64": {
+                    "filename": "f50pro-host-tools-win64.zip",
+                    "bytes": zip_path.stat().st_size,
+                    "sha256": zip_sha,
+                    "platforms": ["win64"],
+                }
+            },
+        },
+    )
+    with patch("fetch_assets.MANIFEST_PATH", manifest_file):
+        r1 = fetch_and_extract(
+            explicit_packs=["host_tools_win64"],
+            cache_dir=cache_d,
+            tools_dir=tools_d,
+            local_release_dir=cache_d,
+            offline_only=True,
+        )
+        assert r1["packs"]["host_tools_win64"]["status"] == "extracted"
+        bat_path = tools_d / "host-tools-win64" / "qmk_driver_installer" / "install_unisoc_drivers.bat"
+        assert b"--force --all" in bat_path.read_bytes()
 
+        # Subsequent run stays cached and valid
+        r2 = fetch_and_extract(
+            explicit_packs=["host_tools_win64"],
+            cache_dir=cache_d,
+            tools_dir=tools_d,
+            local_release_dir=cache_d,
+            offline_only=True,
+        )
+        assert r2["packs"]["host_tools_win64"]["status"] == "cached"
+
+        # Simulate pre-existing v1.1.1 extracted cache without --all -> re-run upgrades it cleanly
+        from fetch_assets import _build_extracted_manifest
+
+        bat_path.write_bytes(old_bat)
+        sub_out = tools_d / "host-tools-win64"
+        (sub_out / ".verified.manifest.json").write_text(
+            json.dumps(_build_extracted_manifest(sub_out, zip_sha)), encoding="utf-8"
+        )
+        r3 = fetch_and_extract(
+            explicit_packs=["host_tools_win64"],
+            cache_dir=cache_d,
+            tools_dir=tools_d,
+            local_release_dir=cache_d,
+            offline_only=True,
+        )
+        assert r3["packs"]["host_tools_win64"]["status"] == "cached"
+        assert b"--force --all" in bat_path.read_bytes()
+
+    # 3. Docs and bootstrap.ps1 stay aligned on v1.1.2 + --force --all
+    for rel in ("scripts/bootstrap.ps1", "docs/beginner-guide.md", "docs/recovery-and-safety.md", "AGENT-FLASH.md"):
+        txt = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert "--force --all" in txt, f"{rel} missing --force --all"
+    for rel in ("README.md", "AGENT-FLASH.md", "docs/beginner-guide.md"):
+        txt = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert "--branch v1.1.2" in txt, f"{rel} not updated to --branch v1.1.2"
