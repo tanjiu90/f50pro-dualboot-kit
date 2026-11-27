@@ -895,6 +895,7 @@ def test_round4_guards_win64_route_hijack_driver_bat_auth_tarball_audit_and_wifi
             },
         )
         env = dict(__import__("os").environ)
+        env["PSModulePath"] = str(tmp_path / "empty-psmodules")  # simulate pwsh->powershell 5.1 PSModulePath mismatch
         env["REPO_ROOT"] = str(fake_repo)
         env["INSTALLER"] = str(qmk_dir / "qmk_driver_installer.exe")
         env["LIST"] = str(qmk_dir / "unisoc_drivers.txt")
