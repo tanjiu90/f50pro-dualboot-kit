@@ -1,0 +1,51 @@
+name: Build Windows Portable GUI Flasher
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'gui/**'
+      - 'scripts/build_windows_gui.py'
+      - '.github/workflows/build-windows-gui.yml'
+
+jobs:
+  build-win64-gui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install runtime & build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install paramiko pyserial pytest pyinstaller
+
+      - name: Run GUI & core unit tests
+        run: python -m pytest -v tests/test_gui_flasher.py tests/test_sanitization.py
+
+      - name: Build portable F50Pro-Flasher-win64.zip
+        run: python scripts/build_windows_gui.py --output-zip dist/F50Pro-Flasher-win64.zip
+
+      - name: Smoke-test compiled F50Pro-Flasher.exe (--run-kit & --smoke-gui)
+        run: |
+          python -c "
+          import json, subprocess
+          exe = r'build\pyinstaller-dist\F50Pro-Flasher\F50Pro-Flasher.exe'
+          r1 = subprocess.run([exe, '--run-kit', '.', 'fetch-assets', '--list-packs'], capture_output=True, text=True, check=True)
+          d = json.loads(r1.stdout)
+          assert d['release_tag'] == 'v1.1.0' and len(d['packs']) >= 5
+          r2 = subprocess.run([exe, '--smoke-gui'], capture_output=True, text=True, check=True)
+          assert 'GUI_SMOKE_OK' in r2.stdout
+          print('COMPILED EXE SMOKE PASSED:', len(d['packs']), 'packs')
+          "
+
+      - name: Upload portable Windows GUI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: F50Pro-Flasher-win64
+          path: dist/F50Pro-Flasher-win64.zip

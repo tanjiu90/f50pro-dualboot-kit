@@ -1,10 +1,20 @@
 # 中兴 F50 Pro (MU3356) 双系统工具包 · 零基础小白保姆级使用教程
 
-> **适用工具版本**：`f50pro-dualboot-kit v1.1.2`
+> **适用工具版本**：`f50pro-dualboot-kit v1.1.3`
 >
 > **适用机型**：**中兴 F50 Pro（型号 `MU3356` / 展锐 `UMS9632` / 出厂 Android 15）**
 >
 > 涵盖 **插卡版（`board_id=6` / `B28`）** 与 **内置双 eSIM 版（`board_id=1` / `B15`）**。
+
+> ### 🌟 Windows 零基础最简方式（推荐：绿色图形一键刷机助手，免装 Python / Git！）
+>
+> 如果你不想敲任何命令行、也不想折腾 Python 和 Git：
+> 1. 打开 GitHub Releases 最新页面：`https://github.com/tanjiu90/f50pro-dualboot-kit/releases/latest`
+> 2. 下载 **`F50Pro-Flasher-win64.zip`**（约 17 MB 绿色免安装包）。
+> 3. **右键完整解压**到普通目录（如 `D:\F50Pro-Flasher`，**不要在压缩软件里直接双击**），双击运行 **`F50Pro-Flasher.exe`**（弹出管理员权限提示点「是」）。
+> 4. 软件内置 **自动拉取 GitHub 最新版（支持国内镜像加速 + SHA-256 严格校验）**、**实时 USB 雷达（自动拦截非 MU3356 机型）**、**自动以 `--force --all` 预装展锐驱动**、**原厂密码提前验证** 与 **报错自动排查一键修复**，按界面 ① -> ② -> ③ 顺序点击即可完成刷机！
+>
+> *(如果你偏好命令行手动操作，或使用 macOS / Linux / 安卓 Termux，请继续阅读下方完整步骤。)*
 
 ---
 
@@ -65,16 +75,16 @@
 ### 第 1 步：打开 PowerShell 并下载代码
 
 1. 按键盘 `Win + S`，搜索 **`PowerShell`**，右键选择 **“以管理员身份运行”**（因为第 3 步装 USB 驱动需要管理员权限）。
-2. 依次复制执行以下命令（新建工作目录并下载官方 `v1.1.2` 稳定版代码）：
+2. 依次复制执行以下命令（新建工作目录并下载官方 `v1.1.3` 稳定版代码）：
 
 ```powershell
 mkdir D:\f50pro-kit -Force
 cd D:\f50pro-kit
-git clone --branch v1.1.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+git clone --branch v1.1.3 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 ```
 
-*(提示：如果之前没装 Git，也可以用浏览器打开 `https://github.com/tanjiu90/f50pro-dualboot-kit/releases/tag/v1.1.2` 下载 `f50pro-dualboot-kit-v1.1.2-src.tar.gz` 解压到 `D:\f50pro-kit\f50pro-dualboot-kit`，再 `cd` 进去。)*
+*(提示：如果之前没装 Git，也可以用浏览器打开 `https://github.com/tanjiu90/f50pro-dualboot-kit/releases/tag/v1.1.3` 下载 `f50pro-dualboot-kit-v1.1.3-src.tar.gz` 解压到 `D:\f50pro-kit\f50pro-dualboot-kit`，再 `cd` 进去。)*
 
 ### 第 2 步：运行一键引导脚本（创建 Python 环境 + 按需下载资源包）
 

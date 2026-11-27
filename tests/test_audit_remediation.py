@@ -1892,4 +1892,4 @@ def test_win64_unisoc_driver_all_flag_and_doc_sync(tmp_path: Path) -> None:
         assert "--force --all" in txt, f"{rel} missing --force --all"
     for rel in ("README.md", "AGENT-FLASH.md", "docs/beginner-guide.md"):
         txt = (REPO_ROOT / rel).read_text(encoding="utf-8")
-        assert "--branch v1.1.2" in txt, f"{rel} not updated to --branch v1.1.2"
+        assert "--branch v1.1.3" in txt, f"{rel} not updated to --branch v1.1.3"

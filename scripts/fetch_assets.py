@@ -165,15 +165,36 @@ def interactive_select(manifest: dict[str, Any]) -> tuple[str, str, bool]:
     return host_platform, profile, include_openclash
 
 
+def _build_download_urls(url: str) -> list[str]:
+    """Return ordered download URLs honoring optional HTTPS F50PRO_GITHUB_MIRROR with direct fallback."""
+    mirror = os.environ.get("F50PRO_GITHUB_MIRROR", "").strip()
+    if mirror and url.startswith("https://github.com/"):
+        if not mirror.startswith("https://"):
+            raise ValueError(f"Refusing non-HTTPS F50PRO_GITHUB_MIRROR: {mirror}")
+        proxied = f"{mirror.rstrip('/')}/{url}"
+        return [proxied, url]
+    return [url]
+
+
 def _download_file(url: str, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
-    req = urllib.request.Request(url, headers={"User-Agent": "f50pro-dualboot-kit/1.1"})
-    print(f"Downloading {url} ...", file=sys.stderr)
-    with urllib.request.urlopen(req, timeout=180) as resp, tmp.open("wb") as out:
-        while chunk := resp.read(1 << 20):
-            out.write(chunk)
-    tmp.replace(dst)
+    last_exc: Exception | None = None
+    for candidate in _build_download_urls(url):
+        req = urllib.request.Request(candidate, headers={"User-Agent": "f50pro-dualboot-kit/1.1"})
+        print(f"Downloading {candidate} ...", file=sys.stderr, flush=True)
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp, tmp.open("wb") as out:
+                while chunk := resp.read(1 << 20):
+                    out.write(chunk)
+            tmp.replace(dst)
+            return
+        except Exception as exc:
+            last_exc = exc
+            tmp.unlink(missing_ok=True)
+            print(f"Download attempt failed ({candidate}): {exc}", file=sys.stderr, flush=True)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _locate_or_fetch_archive(

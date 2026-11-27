@@ -4,7 +4,9 @@ Turnkey, sanitized, **pure-Python (zero-WSL)** toolkit for backing up, building,
 
 Designed for **one-click per-OS selective download & deployment** and **autonomous AI Agent flashing** (`AGENT-FLASH.md`).
 
-> **新手入门 / 零基础用户**：请直接阅读中文零基础保姆级指南 -> [docs/beginner-guide.md](docs/beginner-guide.md)（手把手教你从装 Python/驱动、备份原厂分区到一键双系统及回退）。
+> **新手入门 / 零基础用户**：
+> - **Windows 图形一键助手（最推荐，免装 Python / Git）**：在 [Releases 页面](https://github.com/tanjiu90/f50pro-dualboot-kit/releases/latest)下载 **`F50Pro-Flasher-win64.zip`**，完整解压后双击 **`F50Pro-Flasher.exe`**（自动拉取 GitHub 最新版 + 国内镜像加速 + 实时 USB 设备雷达 + 自动预装 `--force --all` 展锐驱动 + 报错自动排查一键修复）。
+> - **详细图文/命令行指南**：[docs/beginner-guide.md](docs/beginner-guide.md)（手把手教你备份原厂分区、一键双系统及回退）。
 
 ---
 
@@ -21,11 +23,11 @@ Designed for **one-click per-OS selective download & deployment** and **autonomo
 
 ## Verification & Release Readiness Status (Honest Scope: 4 Tiers Separated)
 
-> **Important integrity notice**: [assets/release-manifest.json](assets/release-manifest.json) verifies **SHA-256 file integrity** against this repository's manifest, **not** cryptographic publisher signatures (GPG / Cosign / GitHub Attestation). For reproducible flashing, clone an **explicit Release tag or commit SHA** (latest stable tag: **`v1.1.2`** on `main`; `v1.1.0` binary packs remain frozen and intact).
+> **Important integrity notice**: [assets/release-manifest.json](assets/release-manifest.json) verifies **SHA-256 file integrity** against this repository's manifest, **not** cryptographic publisher signatures (GPG / Cosign / GitHub Attestation). For reproducible flashing, clone an **explicit Release tag or commit SHA** (latest stable tag: **`v1.1.3`** on `main`; `v1.1.0` binary packs remain frozen and intact).
 
 | Scope | Compilation / Packaging | Host CLI / Unit & Fault Tests | Live USB Comm | End-to-End Hardware | Notes / Explicit Limits |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Pure-Python builder & safety guards (`v1.1.2`)** | `PASS` | `PASS` (`70+` pytest fault + audit + unit tests) | `N/A` *(offline)* | `N/A` *(offline)* | Offline `plan` / `auto` dry-run perform zero downloads, zero WebUI reboots, zero BROM/SSH/ADB calls; `auto --execute` uses single-session `SPRD4` (backup->build->flash with zero mid-flow reboot) + WebUI/OpenWrt-SSH/ADB auto-reboot; includes multi-agent audit fixes, `apk-tools 3.0.5` fix, Wi-Fi repeater fixes, and `--force --all` Windows WinUSB pre-installer. |
+| **Pure-Python builder, GUI Flasher & safety guards (`v1.1.3`)** | `PASS` | `PASS` (`77` pytest fault + audit + GUI + unit tests) | `N/A` *(offline)* | `N/A` *(offline)* | Includes portable Windows GUI `F50Pro-Flasher-win64.zip` (zero Python/Git needed, auto GitHub update + mirror + SHA-256 + live USB radar + auto-diagnostics), offline `plan` / `auto` dry-run, single-session `SPRD4`, multi-agent audit fixes, `apk-tools 3.0.5` fix, Wi-Fi repeater fixes, and `--force --all` WinUSB pre-installer. |
 | **Windows x64 host toolkit (`v1.1.0` + P0)** | `PASS` | `PASS` (`win32` + CI `windows-latest`) | `PASS` *(upstream WinUSB)* | **`B28` VERIFIED *(upstream)*** / `UNVERIFIED` *(this CLI)* | Upstream `B28` verified full `_a`+`_b`+`5G NR SA`+Wi-Fi 6+OpenClash+5s roundtrip; refactored `kit.py` CLI awaiting authorized pilot. |
 | **`B15` (`board_id=1`, Built-in Dual eSIM)** | `PASS` *(image build parity)* | `PASS` *(DTB & offset fixture)* | `PASS` *(upstream dump)* | `PARTIAL` *(dual-boot roundtrip verified upstream)* | Upstream installed & roundtrip-switched `_b <-> _a`; **paid eSIM cellular WAN intentionally NOT tested per user decision (non-blocker)**. |
 | **Linux `x86_64` host** | `PASS` | `PASS` (CI `ubuntu-latest`) | `UNVERIFIED` *(live USB)* | `UNVERIFIED` | CI verifies `bootstrap.sh`, `preflight --strict`, offline `plan`, `spd_dump -h`, and `adb version`; physical USB flash/NCM isolation awaits live run. |
@@ -85,8 +87,8 @@ List packs + direct URLs without downloading: `python3 scripts/kit.py fetch-asse
 ### 1. Pinned Clone, Python `.venv`, Dependencies & Selected Packs
 
 ```powershell
-# Windows: pin explicit release tag v1.1.2 (or latest main); v1.1.0 binary packs remain frozen
-git clone --branch v1.1.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+# Windows: pin explicit release tag v1.1.3 (or latest main); v1.1.0 binary packs remain frozen
+git clone --branch v1.1.3 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 .\scripts\bootstrap.ps1
 # First time on Windows (Run PowerShell as Administrator): pre-install Unisoc BROM/Boot Diag WinUSB drivers
@@ -94,8 +96,8 @@ cd f50pro-dualboot-kit
 ```
 
 ```bash
-# Linux / macOS / Android Termux: pin tag v1.1.2, then auto-detect OS/arch or pass --interactive / --profile
-git clone --branch v1.1.2 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+# Linux / macOS / Android Termux: pin tag v1.1.3, then auto-detect OS/arch or pass --interactive / --profile
+git clone --branch v1.1.3 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 bash scripts/bootstrap.sh --interactive
 ```
