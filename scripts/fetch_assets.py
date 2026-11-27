@@ -176,7 +176,8 @@ def _build_download_urls(url: str) -> list[str]:
     return [url]
 
 
-def _download_file(url: str, dst: Path) -> None:
+def _download_file(url: str, dst: Path, *, expected_sha256: str | None = None) -> str:
+    """Download from ordered mirror/direct URLs; if expected_sha256 is set, reject bad mirrors and fall back to direct."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
     last_exc: Exception | None = None
@@ -187,8 +188,15 @@ def _download_file(url: str, dst: Path) -> None:
             with urllib.request.urlopen(req, timeout=180) as resp, tmp.open("wb") as out:
                 while chunk := resp.read(1 << 20):
                     out.write(chunk)
+            if expected_sha256 is not None:
+                actual = sha256_file(tmp)
+                if actual != expected_sha256:
+                    tmp.unlink(missing_ok=True)
+                    raise ValueError(
+                        f"Downloaded archive {dst.name} SHA-256 mismatch from {candidate}: {actual} != {expected_sha256}"
+                    )
             tmp.replace(dst)
-            return
+            return candidate
         except Exception as exc:
             last_exc = exc
             tmp.unlink(missing_ok=True)
@@ -210,25 +218,34 @@ def _locate_or_fetch_archive(
     candidates = [cache_dir / fname]
     if local_release_dir is not None:
         candidates.insert(0, local_release_dir / fname)
+    local_mismatches: list[str] = []
     for cand in candidates:
         if cand.is_file():
-            if sha256_file(cand) != expected:
-                raise ValueError(f"SHA-256 mismatch on local archive {cand}")
-            return cand, None
+            got = sha256_file(cand)
+            if got == expected:
+                return cand, None
+            local_mismatches.append(f"SHA-256 mismatch on local archive {cand}: {got} != {expected}")
 
     if offline_only:
+        if local_mismatches:
+            raise ValueError("; ".join(local_mismatches))
         raise FileNotFoundError(
             f"Offline mode forbids network download and archive {fname} is missing from cache/local dir"
         )
 
     dst = cache_dir / fname
     url = f"{base_url.rstrip('/')}/{fname}"
-    _download_file(url, dst)
+    try:
+        used_url = _download_file(url, dst, expected_sha256=expected)
+    except Exception as dl_exc:
+        if local_mismatches:
+            raise ValueError(f"{'; '.join(local_mismatches)}; online fallback failed: {dl_exc}") from dl_exc
+        raise
     actual = sha256_file(dst)
     if actual != expected:
         dst.unlink(missing_ok=True)
         raise ValueError(f"Downloaded archive {fname} SHA-256 mismatch: {actual} != {expected}")
-    return dst, url
+    return dst, used_url
 
 
 def _safe_extract_zip(archive: Path, target_dir: Path) -> list[str]:
@@ -290,7 +307,92 @@ def _build_extracted_manifest(sub_out: Path, archive_sha256: str) -> dict[str, A
     return {"archive_sha256": archive_sha256, "files": files_meta}
 
 
-def _is_extracted_cache_valid(sub_out: Path, expected_archive_sha: str) -> bool:
+def _archive_member_hashes(archive: Path) -> dict[str, tuple[int, str]]:
+    """Compute exact (size, sha256) for every regular file inside an authenticated zip or tar archive."""
+    import hashlib
+
+    out: dict[str, tuple[int, str]] = {}
+    if archive.suffix == ".zip":
+        with zipfile.ZipFile(archive) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                rel = Path(info.filename).as_posix().lstrip("./")
+                data = zf.read(info)
+                out[rel] = (len(data), hashlib.sha256(data).hexdigest())
+    else:
+        with tarfile.open(archive, "r:*") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                rel = Path(member.name).as_posix().lstrip("./")
+                fh = tf.extractfile(member)
+                if fh is None:
+                    continue
+                h = hashlib.sha256()
+                sz = 0
+                while chunk := fh.read(1 << 20):
+                    h.update(chunk)
+                    sz += len(chunk)
+                out[rel] = (sz, h.hexdigest())
+    return out
+
+
+def _verify_extracted_against_archive(
+    sub_out: Path,
+    archive: Path,
+    *,
+    allow_normalized_win64_bat: bool = False,
+) -> bool:
+    """Bind extracted files on disk directly to the authenticated pack archive (zero trust in writable adjacent manifests)."""
+    import hashlib
+
+    try:
+        if is_link_or_reparse(sub_out) or not sub_out.is_dir():
+            return False
+        expected = _archive_member_hashes(archive)
+        if not expected:
+            return False
+        fixed_bat_sha = hashlib.sha256(_FIXED_UNISOC_DRIVER_BAT).hexdigest()
+        actual_rels: set[str] = set()
+        for p in sub_out.rglob("*"):
+            if is_link_or_reparse(p):
+                return False
+            if p.name in (".verified.sha256", ".verified.manifest.json") and p.parent == sub_out:
+                continue
+            if p.is_file():
+                actual_rels.add(p.relative_to(sub_out).as_posix())
+        if actual_rels != set(expected.keys()):
+            return False
+        for rel, (exp_sz, exp_sha) in expected.items():
+            cand = sub_out / rel
+            if is_link_or_reparse(cand) or not cand.is_file():
+                return False
+            got_sz = cand.stat().st_size
+            got_sha = sha256_file(cand)
+            if got_sz == exp_sz and got_sha == exp_sha:
+                continue
+            if (
+                allow_normalized_win64_bat
+                and rel == "qmk_driver_installer/install_unisoc_drivers.bat"
+                and got_sz == len(_FIXED_UNISOC_DRIVER_BAT)
+                and got_sha == fixed_bat_sha
+            ):
+                continue
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _is_extracted_cache_valid(
+    sub_out: Path,
+    expected_archive_sha: str,
+    *,
+    archive_path: Path | None = None,
+    bind_to_archive: bool = False,
+    allow_normalized_win64_bat: bool = False,
+) -> bool:
     """Return True only if marker AND exact set of extracted files exist with intact size & SHA-256 (zero extras/links/junctions)."""
     marker = sub_out / ".verified.sha256"
     manifest_f = sub_out / ".verified.manifest.json"
@@ -301,6 +403,11 @@ def _is_extracted_cache_valid(sub_out: Path, expected_archive_sha: str) -> bool:
             return False
         if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != expected_archive_sha:
             return False
+        if bind_to_archive and archive_path is not None and archive_path.is_file():
+            if not _verify_extracted_against_archive(
+                sub_out, archive_path, allow_normalized_win64_bat=allow_normalized_win64_bat
+            ):
+                return False
         if not manifest_f.is_file():
             return False
         rec = read_json(manifest_f)
@@ -433,7 +540,13 @@ def fetch_and_extract(
         sub_out = tools_dir / key.replace("_", "-")
         marker = sub_out / ".verified.sha256"
         manifest_f = sub_out / ".verified.manifest.json"
-        if _is_extracted_cache_valid(sub_out, meta["sha256"]):
+        if _is_extracted_cache_valid(
+            sub_out,
+            meta["sha256"],
+            archive_path=arc,
+            bind_to_archive=True,
+            allow_normalized_win64_bat=(key == "host_tools_win64"),
+        ):
             if key == "host_tools_win64" and _normalize_win64_driver_scripts(sub_out):
                 ext_manifest = _build_extracted_manifest(sub_out, meta["sha256"])
                 manifest_f.write_text(json.dumps(ext_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

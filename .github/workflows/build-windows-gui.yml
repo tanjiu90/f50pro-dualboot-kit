@@ -5,10 +5,8 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'gui/**'
-      - 'scripts/build_windows_gui.py'
-      - '.github/workflows/build-windows-gui.yml'
+    tags:
+      - 'v*'
 
 jobs:
   build-win64-gui:
@@ -20,32 +18,61 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install runtime & build dependencies
+      - name: Install pinned runtime & build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install paramiko pyserial pytest pyinstaller
+          python -m pip install paramiko==5.1.0 pyserial==3.5 pytest==9.2.0 pyinstaller==6.22.3
 
-      - name: Run GUI & core unit tests
-        run: python -m pytest -v tests/test_gui_flasher.py tests/test_sanitization.py
+      - name: Run full remediation, safety, GUI & sanitization pytest suite
+        run: python -m pytest -v
 
-      - name: Build portable F50Pro-Flasher-win64.zip
-        run: python scripts/build_windows_gui.py --output-zip dist/F50Pro-Flasher-win64.zip
+      - name: Build portable F50Pro-Flasher-win64.zip & audit source tarball from clean commit
+        run: |
+          python scripts/build_windows_gui.py --output-zip dist/F50Pro-Flasher-win64.zip --metadata-out dist/F50Pro-Flasher-win64.metadata.json
+          git archive --format=tar.gz --prefix=f50pro-dualboot-kit-ci/ -o dist/source-audit.tar.gz HEAD
+          python scripts/build_windows_gui.py --audit-tarball dist/source-audit.tar.gz
 
-      - name: Smoke-test compiled F50Pro-Flasher.exe (--run-kit & --smoke-gui)
+      - name: Smoke-test unzipped portable F50Pro-Flasher.exe with stripped Python PATH and fault bounds
         run: |
           python -c "
-          import json, subprocess
-          exe = r'build\pyinstaller-dist\F50Pro-Flasher\F50Pro-Flasher.exe'
-          r1 = subprocess.run([exe, '--run-kit', '.', 'fetch-assets', '--list-packs'], capture_output=True, text=True, check=True)
+          import json, os, shutil, subprocess, zipfile
+          from pathlib import Path
+          tmp = Path(os.environ['RUNNER_TEMP']) / 'unzipped-gui'
+          if tmp.exists():
+              shutil.rmtree(tmp)
+          with zipfile.ZipFile(r'dist\F50Pro-Flasher-win64.zip') as zf:
+              assert zf.testzip() is None
+              zf.extractall(tmp)
+          app = tmp / 'F50Pro-Flasher'
+          exe = str(app / 'F50Pro-Flasher.exe')
+          bundled = str(app / '_internal')
+          env = os.environ.copy()
+          env['PATH'] = r'C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0'
+          r1 = subprocess.run([exe, '--run-kit', bundled, 'fetch-assets', '--list-packs'], capture_output=True, text=True, env=env, timeout=30, check=True)
           d = json.loads(r1.stdout)
           assert d['release_tag'] == 'v1.1.0' and len(d['packs']) >= 5
-          r2 = subprocess.run([exe, '--smoke-gui'], capture_output=True, text=True, check=True)
-          assert 'GUI_SMOKE_OK' in r2.stdout
-          print('COMPILED EXE SMOKE PASSED:', len(d['packs']), 'packs')
+          r2 = subprocess.run([exe, '--run-host-network', bundled, 'audit'], capture_output=True, text=True, env=env, timeout=30, check=True)
+          aud = json.loads(r2.stdout)
+          assert 'host_platform' in aud
+          # Successful credential IPC check: valid --secrets-stdin JSON with leading hyphens/spaces parsed cleanly on bundled worker
+          valid_sec = json.dumps({'webui_password': ' -pw ', 'wifi_password': '-wifi1234', 'root_password': ' -rt '})
+          r_cred = subprocess.run([exe, '--run-kit', bundled, 'auto', '--profile', '3-dual-full', '--work-dir', str(tmp / 'empty-plan'), '--secrets-stdin'], input=valid_sec, capture_output=True, text=True, env=env, timeout=30, check=True)
+          assert json.loads(r_cred.stdout)['status'] == 'BACKUP_REQUIRED'
+          # Fault-bound check: malformed --secrets-stdin MUST exit non-zero quickly (never hang runw.exe modal!)
+          r_bad = subprocess.run([exe, '--run-kit', bundled, 'probe', '--secrets-stdin'], input='{bad-json', capture_output=True, text=True, env=env, timeout=15)
+          assert r_bad.returncode != 0 and 'worker_error' in (r_bad.stderr + r_bad.stdout)
+          # Trust-boundary check: untrusted kit_root MUST be rejected
+          r_untrusted = subprocess.run([exe, '--run-kit', str(tmp), 'fetch-assets', '--list-packs'], capture_output=True, text=True, env=env, timeout=15)
+          assert r_untrusted.returncode != 0 and 'UntrustedKitRoot' in (r_untrusted.stderr + r_untrusted.stdout)
+          r3 = subprocess.run([exe, '--smoke-gui'], capture_output=True, text=True, env=env, timeout=30, check=True)
+          assert 'GUI_SMOKE_OK' in r3.stdout
+          print('UNZIPPED PORTABLE EXE ZERO-PYTHON + FAULT-BOUND SMOKE PASSED:', len(d['packs']), 'packs')
           "
 
-      - name: Upload portable Windows GUI artifact
+      - name: Upload portable Windows GUI artifact & build metadata
         uses: actions/upload-artifact@v4
         with:
           name: F50Pro-Flasher-win64
-          path: dist/F50Pro-Flasher-win64.zip
+          path: |
+            dist/F50Pro-Flasher-win64.zip
+            dist/F50Pro-Flasher-win64.metadata.json

@@ -1457,6 +1457,24 @@ def provision_openwrt(
         # On retries after a previous password rotation, reuse the persisted generated password idempotently.
         applied_pw = saved_pw or generate_strong_password()
 
+    effective_wifi_pw = wifi_password
+    if effective_wifi_pw is not None and effective_wifi_pw != "":
+        if not (8 <= len(effective_wifi_pw) <= 63) or any(not (32 <= ord(c) <= 126) for c in effective_wifi_pw):
+            raise ValueError("OpenWrt Wi-Fi password must be 8..63 printable ASCII characters.")
+    elif out_dir is not None or credentials_file is not None:
+        # Never leave the shared public default Wi-Fi key active when provisioning with a credentials/output path.
+        existing_wifi_pw = None
+        cand_creds = [c for c in (credentials_file, (out_dir / "openwrt-credentials.json") if out_dir is not None else None) if c is not None]
+        for cand_cred in cand_creds:
+            if cand_cred.is_file():
+                try:
+                    existing_wifi_pw = read_json(cand_cred).get("wifi_password")
+                    if existing_wifi_pw:
+                        break
+                except Exception:
+                    pass
+        effective_wifi_pw = str(existing_wifi_pw) if existing_wifi_pw else generate_strong_password(16)
+
     transition_meta: dict[str, Any] | None = None
     device_identity_verified: dict[str, Any] | None = None
     try:
@@ -1499,11 +1517,11 @@ def provision_openwrt(
             f"WIFI_SEC=default_radio0; uci -q get wireless.default_radio0 >/dev/null || WIFI_SEC=@wifi-iface[0]; uci set wireless.$WIFI_SEC.ssid={_shq(wifi_ssid)}",
             f"if [ -f /etc/mu300/hotspot.conf ]; then (grep -v '^SSID=' /etc/mu300/hotspot.conf; printf 'SSID=%s\\n' {_shq(wifi_ssid)}) > /tmp/hotspot.conf.new && mv /tmp/hotspot.conf.new /etc/mu300/hotspot.conf; fi",
         ]
-        if wifi_password:
+        if effective_wifi_pw:
             cmds.extend([
                 "uci set wireless.$WIFI_SEC.encryption='psk2+ccmp'",
-                f"uci set wireless.$WIFI_SEC.key={_shq(wifi_password)}",
-                f"if [ -f /etc/mu300/hotspot.conf ]; then (grep -v '^PSK=' /etc/mu300/hotspot.conf; printf 'PSK=%s\\n' {_shq(wifi_password)}) > /tmp/hotspot.conf.new && mv /tmp/hotspot.conf.new /etc/mu300/hotspot.conf; fi",
+                f"uci set wireless.$WIFI_SEC.key={_shq(effective_wifi_pw)}",
+                f"if [ -f /etc/mu300/hotspot.conf ]; then (grep -v '^PSK=' /etc/mu300/hotspot.conf; printf 'PSK=%s\\n' {_shq(effective_wifi_pw)}) > /tmp/hotspot.conf.new && mv /tmp/hotspot.conf.new /etc/mu300/hotspot.conf; fi",
             ])
         cmds.extend([
             "uci commit system",
@@ -1522,8 +1540,8 @@ def provision_openwrt(
         try:
             ssh_run(ssh, " && ".join(cmds), timeout=90)
         except Exception as exc:
-            if wifi_password:
-                wifi_err = _redact_text(str(exc), (wifi_password,))
+            if effective_wifi_pw:
+                wifi_err = _redact_text(str(exc), (effective_wifi_pw,))
             else:
                 raise
         if wifi_err is not None:
@@ -1556,7 +1574,9 @@ def provision_openwrt(
             #  - if remote passwd fails, the existing working credentials file is NOT overwritten/erased;
             #  - if the link drops right after remote passwd succeeds, *.pending.json still holds the new secret
             #    and retries automatically try both the existing and pending credentials.
-            cred_payload = {"host": openwrt_host, "username": "root", "password": applied_pw}
+            cred_payload: dict[str, Any] = {"host": openwrt_host, "username": "root", "password": applied_pw, "wifi_ssid": wifi_ssid}
+            if effective_wifi_pw:
+                cred_payload["wifi_password"] = effective_wifi_pw
             cred_targets: list[Path] = []
             if credentials_file is not None:
                 cred_targets.append(credentials_file)
@@ -1585,6 +1605,32 @@ def provision_openwrt(
             if cred_targets:
                 cred_path = str(cred_targets[0])
             pw_candidates = (applied_pw,)
+        elif effective_wifi_pw and (credentials_file is not None or out_dir is not None):
+            # Persist unique Wi-Fi credentials even when root password rotation was not requested.
+            wifi_targets: list[Path] = []
+            if credentials_file is not None:
+                wifi_targets.append(credentials_file)
+            if out_dir is not None:
+                default_cfile = out_dir / "openwrt-credentials.json"
+                if all(t.resolve() != default_cfile.resolve() for t in wifi_targets):
+                    wifi_targets.append(default_cfile)
+            for ct in wifi_targets:
+                existing_rec: dict[str, Any] = {}
+                if ct.is_file():
+                    try:
+                        loaded = read_json(ct)
+                        if isinstance(loaded, dict):
+                            existing_rec = dict(loaded)
+                    except Exception:
+                        existing_rec = {}
+                existing_rec.setdefault("host", openwrt_host)
+                existing_rec.setdefault("username", "root")
+                existing_rec["wifi_ssid"] = wifi_ssid
+                existing_rec["wifi_password"] = effective_wifi_pw
+                ct.parent.mkdir(parents=True, exist_ok=True)
+                write_json(ct, existing_rec)
+            if wifi_targets:
+                cred_path = str(wifi_targets[0])
 
         # Confirm permanent boot to OpenWrt _b and snapshot exact verified BCAB block
         ssh_run(ssh, "/opt/mu300/bin/mu300-next-boot linux")

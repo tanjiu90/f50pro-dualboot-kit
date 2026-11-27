@@ -22,16 +22,16 @@ Pin an explicit Release tag (or verified commit SHA) — never pull mutable `mai
 
 - **Windows PC**:
   ```powershell
-  git clone --branch v1.1.3 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.4 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   .\scripts\bootstrap.ps1 -Profile <PROFILE_ID>  # add -SkipOpenClash if unused
-  .\scripts\install_unisoc_drivers.bat           # Admin once: pre-installs 1782:4D00 / 1782:4D03 WinUSB (--force --all)
+  .\scripts\install_unisoc_drivers.bat           # Admin once: pre-installs & verifies 1782:4D00 / 1782:4D03 WinUSB (--force --all)
   .\.venv\Scripts\python.exe -m pytest -v
   .\.venv\Scripts\python.exe scripts\kit.py preflight --strict --operation auto --profile <PROFILE_ID>
   ```
 - **Linux (`x86_64` / `arm64`) / macOS (`Universal`) / Android Termux (`arm64`)**:
   ```bash
-  git clone --branch v1.1.3 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+  git clone --branch v1.1.4 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
   cd f50pro-dualboot-kit
   bash scripts/bootstrap.sh --profile <PROFILE_ID>  # add --no-openclash if unused
   .venv/bin/python -m pytest -v

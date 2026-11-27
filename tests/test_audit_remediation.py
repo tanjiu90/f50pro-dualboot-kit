@@ -709,6 +709,7 @@ def test_host_network_disambiguation_snapshot_restore_and_fetch_cache_integrity(
     )
     ps_dhcp_cmds: list[str] = []
     with (
+        patch("host_network._check_windows_f50_usb_disconnected", return_value={"query_ok": True, "connected_count": 0}),
         patch("host_network._snapshot_windows_adapter", return_value={"platform": "win64", "name": "Bob's F50", "ips": [{"IPAddress": "192.168.77.12"}]}),
         patch("host_network._ps", side_effect=lambda c, **k: ps_dhcp_cmds.append(c) or '{"found":true,"errors":[]}'),
     ):
@@ -1794,12 +1795,18 @@ def test_wifi_repeater_assets_hardening_and_provision_upload() -> None:
     assert "/etc/init.d/f50pro-repeater enable" in cmds[0]
     assert "/tmp/luci-indexcache*" in cmds[0]
 
-    # Verify ucode fallback hostapd bugfix (no JS .push() method in ucode) & safe_ifname quoting
+    # Verify ucode fallback hostapd bugfix (no JS .push() method in ucode), atomic candidate staging & safe_ifname quoting
     assert "lines.push(" not in sh_txt
     assert "push(lines," in sh_txt
-    assert 'HOSTAPD_OUT}.tmp' in sh_txt
-    assert "ieee80211ax=1" in sh_txt
+    assert "out_file}.tmp" in sh_txt
+    assert "HOSTAPD_OUT}.cand" in sh_txt
+    assert "HOSTAPD_OUT}.prev" in sh_txt
+    assert "conservative" in sh_txt
+    assert "ieee80211ax=1" not in sh_txt
+    assert "saved_sta=$sta_ssid" not in sh_txt  # never log personal upstream SSID to syslog
     assert "function safe_ifname(" in rpcd_txt
+    assert "function read_cmd_status(" in rpcd_txt
+    assert "if (cmd_res.rc != 0)" in rpcd_txt
     assert "'iw dev ' + dev +" not in rpcd_txt
     assert "\"iw dev '\" + dev + \"' link 2>/dev/null\"" in rpcd_txt
     assert "f50pro-key-dispatch" not in rpcd_txt  # keep pure public kit free of personal modular addons
@@ -1811,11 +1818,14 @@ def test_win64_unisoc_driver_all_flag_and_doc_sync(tmp_path: Path) -> None:
 
     from common import sha256_file, write_json
 
-    # 1. Repo-tracked wrapper checks admin privileges and passes --force --all
+    # 1. Repo-tracked wrapper checks admin privileges (token-based) and verifies 4D00 & 4D03 Driver Store install
     repo_bat = (REPO_ROOT / "scripts" / "install_unisoc_drivers.bat").read_text(encoding="utf-8")
-    assert "net session" in repo_bat
+    assert "fltmc" in repo_bat
+    assert "IsInRole" in repo_bat
     assert "--force --all" in repo_bat
     assert "unisoc_drivers.txt" in repo_bat
+    assert "VID_1782&PID_4D00" in repo_bat
+    assert "VID_1782&PID_4D03" in repo_bat
 
     # 2. fetch_and_extract auto-normalizes extracted (and pre-cached) host_tools_win64 install_unisoc_drivers.bat
     cache_d = tmp_path / "cache"
@@ -1886,10 +1896,10 @@ def test_win64_unisoc_driver_all_flag_and_doc_sync(tmp_path: Path) -> None:
         assert r3["packs"]["host_tools_win64"]["status"] == "cached"
         assert b"--force --all" in bat_path.read_bytes()
 
-    # 3. Docs and bootstrap.ps1 stay aligned on v1.1.2 + --force --all
+    # 3. Docs and bootstrap.ps1 stay aligned on v1.1.4 + --force --all
     for rel in ("scripts/bootstrap.ps1", "docs/beginner-guide.md", "docs/recovery-and-safety.md", "AGENT-FLASH.md"):
         txt = (REPO_ROOT / rel).read_text(encoding="utf-8")
         assert "--force --all" in txt, f"{rel} missing --force --all"
     for rel in ("README.md", "AGENT-FLASH.md", "docs/beginner-guide.md"):
         txt = (REPO_ROOT / rel).read_text(encoding="utf-8")
-        assert "--branch v1.1.3" in txt, f"{rel} not updated to --branch v1.1.3"
+        assert "--branch v1.1.4" in txt, f"{rel} not updated to --branch v1.1.4"

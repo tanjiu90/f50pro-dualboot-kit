@@ -5,12 +5,17 @@ import * as fs from 'fs';
 import * as ubus from 'ubus';
 import * as uci from 'uci';
 
-function read_cmd(cmd) {
+function read_cmd_status(cmd) {
     let p = fs.popen(cmd, 'r');
-    if (!p) return '';
+    if (!p) return { rc: 127, out: '' };
     let out = p.read('all') || '';
-    p.close();
-    return out;
+    let rc = p.close();
+    // Per ucode fs.proc.close(): returns null on failure/error, integer exit status on completion.
+    return { rc: (rc == null ? 1 : int(rc)), out: out };
+}
+
+function read_cmd(cmd) {
+    return read_cmd_status(cmd).out;
 }
 
 function get_macs() {
@@ -30,9 +35,12 @@ function read_state_file() {
     let res = {};
     let txt = fs.readfile('/tmp/run/f50pro-repeater.state') || '';
     for (let line in split(txt, '\n')) {
+        line = replace(line, /\r$/, '');
         let idx = index(line, '=');
         if (idx > 0) {
-            res[substr(line, 0, idx)] = trim(substr(line, idx + 1));
+            let k = substr(line, 0, idx);
+            let v = substr(line, idx + 1);
+            res[k] = (k == 'STA_SSID') ? v : trim(v);
         }
     }
     return res;
@@ -43,6 +51,7 @@ function parse_iw_dev() {
     let ifaces = [];
     let cur = null;
     for (let line in split(out, '\n')) {
+        line = replace(line, /\r$/, '');
         let m = match(line, /^\s*Interface\s+(\S+)/);
         if (m) {
             cur = { name: m[1], type: '', ssid: '', channel: 0, freq: 0, mac: '' };
@@ -51,7 +60,7 @@ function parse_iw_dev() {
         }
         if (!cur) continue;
         if ((m = match(line, /^\s*type\s+(\S+)/))) cur.type = m[1];
-        else if ((m = match(line, /^\s*ssid\s+(.*)$/))) cur.ssid = unesc_ssid(trim(m[1]));
+        else if ((m = match(line, /^\s*ssid (.*)$/))) cur.ssid = unesc_ssid(m[1]);
         else if ((m = match(line, /^\s*addr\s+(\S+)/))) cur.mac = m[1];
         else if ((m = match(line, /^\s*channel\s+(\d+)\s+\((\d+)\s+MHz\)/))) {
             cur.channel = int(m[1]);
@@ -74,7 +83,7 @@ function parse_sta_link(dev) {
     if (!m) return info;
     info.connected = true;
     info.bssid = lc(m[1]);
-    if ((m = match(out, /SSID:\s*([^\r\n]+)/))) info.ssid = unesc_ssid(m[1]);
+    if ((m = match(out, /SSID: ([^\r\n]+)/))) info.ssid = unesc_ssid(m[1]);
     if ((m = match(out, /signal:\s*(-?\d+)\s*dBm/))) info.signal = int(m[1]);
     if ((m = match(out, /freq:\s*(\d+)/))) info.freq = int(m[1]);
     if ((m = match(out, /RX:\s*(\d+)\s+bytes/))) info.rx_bytes = int(m[1]);
@@ -268,10 +277,14 @@ function scan_fallback_iw() {
         }
     }
     dev = safe_ifname(dev);
-    if (!dev) return [];
-    let out = read_cmd("iw dev '" + dev + "' scan" + ap_flag + ' 2>/dev/null');
+    if (!dev) return { ok: false, error: 'no_wifi_interface', list: [] };
+    let cmd_res = read_cmd_status("iw dev '" + dev + "' scan" + ap_flag + ' 2>/dev/null');
+    if (cmd_res.rc != 0)
+        return { ok: false, error: 'iw_scan_failed', rc: cmd_res.rc, list: [] };
+    let out = cmd_res.out;
     let list = [], cur = null;
     for (let line in split(out, '\n')) {
+        line = replace(line, /\r$/, '');
         let m = match(line, /^BSS\s+([0-9a-fA-F:]{17})/);
         if (m) {
             if (cur && length(cur.ssid) > 0) push(list, cur);
@@ -285,8 +298,8 @@ function scan_fallback_iw() {
             cur.band = cur.freq > 4000 ? '5g' : '2g';
         } else if ((m = match(line, /^\s*signal:\s*(-?\d+)/))) {
             cur.signal = int(m[1]);
-        } else if ((m = match(line, /^\s*SSID:\s*(.*)$/))) {
-            cur.ssid = unesc_ssid(trim(m[1]));
+        } else if ((m = match(line, /^\s*SSID: (.*)$/))) {
+            cur.ssid = unesc_ssid(m[1]);
         } else if (match(line, /capability:.*Privacy/)) {
             cur.privacy = true;
         } else if (match(line, /^\s*RSN:/)) {
@@ -311,7 +324,7 @@ function scan_fallback_iw() {
             x.enc = 'psk2'; x.enc_label = 'WPA2';
         }
     }
-    return list;
+    return { ok: true, list: list };
 }
 
 function do_scan() {
@@ -320,6 +333,7 @@ function do_scan() {
     conn.disconnect();
 
     let items = [];
+    let scan_error = '';
     if (raw && type(raw.results) == 'array' && length(raw.results) > 0) {
         for (let r in raw.results) {
             if (!r.ssid || length(r.ssid) == 0) continue;
@@ -338,16 +352,21 @@ function do_scan() {
     }
 
     if (length(items) == 0) {
-        for (let r in scan_fallback_iw()) {
-            push(items, {
-                ssid: r.ssid,
-                bssid: r.bssid,
-                band: r.band,
-                channel: r.channel,
-                signal: r.signal,
-                encryption: r.enc,
-                enc_label: r.enc_label
-            });
+        let fb = scan_fallback_iw();
+        if (!fb.ok) {
+            scan_error = fb.error || 'iw_scan_failed';
+        } else {
+            for (let r in fb.list) {
+                push(items, {
+                    ssid: r.ssid,
+                    bssid: r.bssid,
+                    band: r.band,
+                    channel: r.channel,
+                    signal: r.signal,
+                    encryption: r.enc,
+                    enc_label: r.enc_label
+                });
+            }
         }
     }
 
@@ -361,6 +380,8 @@ function do_scan() {
     let out = [];
     for (let k in best) push(out, best[k]);
     sort(out, (a, b) => b.signal - a.signal);
+    if (scan_error != '' && length(out) == 0)
+        return { ok: 0, error: scan_error, results: [] };
     return { ok: 1, results: out };
 }
 

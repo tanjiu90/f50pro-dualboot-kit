@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from common import (
+    BSP_SYNC_PAIRS_F50PRO,
     DEFAULT_TOOLS_DIR,
     REPO_ROOT,
     AuthContext,
@@ -37,6 +38,23 @@ from common import (
     sha256_file,
     win_no_window_kwargs,
     write_json,
+)
+
+RESTORABLE_REQUIRED_PARTITIONS: frozenset[str] = frozenset(
+    {
+        "splloader",
+        "misc",
+        "trustos_a",
+        "trustos_b",
+        "boot_a",
+        "boot_b",
+        "vendor_boot_a",
+        "vendor_boot_b",
+        "init_boot_a",
+        "init_boot_b",
+        "fulldumpdb",
+    }
+    | {p for pair in BSP_SYNC_PAIRS_F50PRO for p in pair}
 )
 
 FATAL_SPD_RE = re.compile(
@@ -93,73 +111,125 @@ class WebUIAuthError(RuntimeError):
     """Raised when stock ZTE WebUI explicitly rejects credentials."""
 
 
+def _zte_webui_login_session(
+    password: str,
+    host: str = "http://192.168.0.1:8080",
+    *,
+    timeout: float = 3.0,
+) -> tuple[urllib.request.OpenerDirector | None, dict[str, Any]]:
+    """Shared ZTE stock WebUI goform SHA-256 challenge/LOGIN helper used by BOTH password test and live reboot."""
+    if password == "":
+        return None, {"ok": False, "reason": "empty", "detail": "Empty WebUI password."}
+
+    def sha_u(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
+
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPCookieProcessor(jar),
+    )
+    base = host.rstrip("/")
+    try:
+        req1 = urllib.request.Request(
+            f"{base}/goform/goform_get_cmd_process?isTest=false&multi_data=1&cmd=loginfo,LD,RD,model_name,wa_inner_version,cr_version",
+            headers={"Referer": f"{base}/index.html"},
+        )
+        with opener.open(req1, timeout=timeout) as resp:
+            info = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        return None, {"ok": False, "reason": "unreachable", "detail": str(exc)}
+
+    if not isinstance(info, dict) or not info.get("LD"):
+        return None, {"ok": False, "reason": "invalid_response", "detail": "missing LD challenge"}
+
+    login_hash = sha_u(sha_u(password) + str(info["LD"]))
+    body = urllib.parse.urlencode({"isTest": "false", "goformId": "LOGIN", "password": login_hash}).encode("utf-8")
+    req2 = urllib.request.Request(
+        f"{base}/goform/goform_set_cmd_process",
+        data=body,
+        headers={
+            "Referer": f"{base}/index.html",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+    try:
+        with opener.open(req2, timeout=timeout) as resp:
+            res = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        return None, {"ok": False, "reason": "login_error", "detail": str(exc)}
+
+    code = str(res.get("result")) if isinstance(res, dict) else ""
+    if code in ("0", "4"):
+        return opener, {
+            "ok": True,
+            "result_code": code,
+            "model_name": str(info.get("model_name") or ""),
+            "cr_version": str(info.get("cr_version") or ""),
+            "wa_inner_version": str(info.get("wa_inner_version") or ""),
+        }
+    return None, {"ok": False, "reason": "wrong_password", "result_code": code, "raw_result": res}
+
+
+def verify_zte_webui_login(
+    password: str,
+    host: str = "http://192.168.0.1:8080",
+    *,
+    timeout: float = 3.0,
+) -> dict[str, Any]:
+    """Read-only ZTE WebUI LOGIN verification sharing `_zte_webui_login_session` (NEVER calls REBOOT_DEVICE)."""
+    _, meta = _zte_webui_login_session(password, host=host, timeout=timeout)
+    return meta
+
+
 def _attempt_zte_webui_reboot_once(
     password: str,
     host: str = "http://192.168.0.1:8080",
 ) -> dict[str, Any] | None:
-    """Single non-blocking probe + LOGIN + REBOOT_DEVICE attempt against ZTE stock WebUI."""
+    """Single non-blocking probe + LOGIN (via shared session helper) + REBOOT_DEVICE attempt against ZTE stock WebUI."""
     if not password:
         raise ValueError("Explicit --webui-password required when triggering ZTE WebUI reboot")
 
     def sha_u(text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
 
-    jar = http.cookiejar.CookieJar()
-    # Explicitly bypass OS/environment HTTP proxies when talking to local 192.168.0.1 WebUI.
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        urllib.request.HTTPCookieProcessor(jar),
-    )
+    opener, meta = _zte_webui_login_session(password, host=host, timeout=2.5)
+    if meta.get("reason") == "wrong_password":
+        raise WebUIAuthError(f"WebUI login failed: {meta.get('raw_result', {'result': meta.get('result_code')})}")
+    if opener is None or not meta.get("ok"):
+        return None
 
-    def zget(cmd: str) -> dict[str, Any]:
-        url = f"{host}/goform/goform_get_cmd_process?isTest=false&multi_data=1&cmd={urllib.parse.quote(cmd)}"
-        req = urllib.request.Request(url, headers={"Referer": f"{host}/index.html"})
-        with opener.open(req, timeout=2.0) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
-
-    def zpost(data: dict[str, str]) -> dict[str, Any]:
-        body = urllib.parse.urlencode(data).encode("utf-8")
-        req = urllib.request.Request(
-            f"{host}/goform/goform_set_cmd_process",
-            data=body,
-            headers={
-                "Referer": f"{host}/index.html",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest",
-            },
+    base = host.rstrip("/")
+    try:
+        req_rd = urllib.request.Request(
+            f"{base}/goform/goform_get_cmd_process?isTest=false&multi_data=1&cmd=RD",
+            headers={"Referer": f"{base}/index.html"},
         )
-        with opener.open(req, timeout=2.5) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
-
-    try:
-        info = zget("loginfo,LD,RD,wa_inner_version,cr_version")
-    except Exception:
-        return None
-    if not info or not info.get("LD"):
-        return None
-
-    login_hash = sha_u(sha_u(password) + info["LD"])
-    try:
-        login_res = zpost({"isTest": "false", "goformId": "LOGIN", "password": login_hash})
-    except Exception:
-        return None
-    if str(login_res.get("result")) not in ("0", "4"):
-        raise WebUIAuthError(f"WebUI login failed: {login_res}")
-
-    try:
-        rd_resp = zget("RD")
+        with opener.open(req_rd, timeout=2.0) as resp:
+            rd_resp = json.loads(resp.read().decode("utf-8", "replace"))
         rd = rd_resp.get("RD") if isinstance(rd_resp, dict) else None
     except Exception:
         return None
     if not rd:
         return None
-    ad = sha_u(sha_u(info.get("wa_inner_version", "") + info.get("cr_version", "")) + rd)
+    ad = sha_u(sha_u(meta.get("wa_inner_version", "") + meta.get("cr_version", "")) + rd)
+    body = urllib.parse.urlencode({"isTest": "false", "goformId": "REBOOT_DEVICE", "AD": ad}).encode("utf-8")
+    req_reb = urllib.request.Request(
+        f"{base}/goform/goform_set_cmd_process",
+        data=body,
+        headers={
+            "Referer": f"{base}/index.html",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
     try:
-        reb = zpost({"isTest": "false", "goformId": "REBOOT_DEVICE", "AD": ad})
+        with opener.open(req_reb, timeout=2.5) as resp:
+            reb = json.loads(resp.read().decode("utf-8", "replace"))
     except (OSError, http.client.HTTPException, urllib.error.URLError) as exc:
-        # Router may drop TCP immediately as it begins rebooting.
         reb = {"connection_reset_during_reboot": True, "detail": str(exc)}
-    return {"method": "webui_reboot_device", "cr_version": info.get("cr_version"), "reboot_response": reb}
+    return {"method": "webui_reboot_device", "cr_version": meta.get("cr_version"), "reboot_response": reb}
 
 
 def trigger_zte_webui_reboot(
@@ -403,8 +473,9 @@ def verify_backup_dir(
     if missing_core:
         errors.append(f"Missing core partitions in table: {missing_core}")
 
-    # Zero-byte or virtual/userdata partitions normally omitted by 'r all'
+    # Zero-byte or virtual/userdata partitions normally omitted by 'r all' (NEVER modifiable boot/system slots)
     optional_excluded = {"userdata", "cache", "blackbox", "splloader_bak"}
+    excluded_present_in_table: list[str] = []
     sums_lines: list[str] = []
     actual_sums: dict[str, str] = {}
     checked_bytes = 0
@@ -415,6 +486,8 @@ def verify_backup_dir(
         fpath = backup_dir / part
         if not fpath.is_file():
             if part in optional_excluded or expected_sz == 0:
+                if part in optional_excluded:
+                    excluded_present_in_table.append(part)
                 warnings.append(f"Excluded/optional partition not dumped: {part}")
             elif require_complete_table:
                 errors.append(f"Missing dumped partition: {part} (expected {expected_sz} B)")
@@ -495,6 +568,12 @@ def verify_backup_dir(
         except Exception as exc:
             errors.append(f"Invalid misc bootloader_control (BCAB): {exc}")
 
+    missing_restorable = sorted(
+        p for p in RESTORABLE_REQUIRED_PARTITIONS if (p in table or p == "splloader") and p not in actual_sums
+    )
+    if require_complete_table and missing_restorable:
+        errors.append(f"Missing required restorable partitions in backup: {missing_restorable}")
+
     # Only generate SHA256SUMS.txt on first verification of a fresh backup; never overwrite existing manifest.
     if existing_sums is None and not errors and not require_existing_manifest:
         sums_path.write_text("\n".join(fresh_sums_lines) + "\n", encoding="utf-8")
@@ -504,6 +583,20 @@ def verify_backup_dir(
         "sha256sums_mode": "verified_existing" if existing_sums is not None else "generated_fresh",
         "checked_files": checked_files,
         "checked_bytes": checked_bytes,
+        "verified_partitions": sorted(actual_sums.keys()),
+        "backup_coverage": {
+            "flashed_targets_and_boot_slots_covered": not missing_restorable and not errors,
+            "full_emmc_including_userdata_and_boot1_covered": bool(
+                spl_bak_present and not excluded_present_in_table and not missing_restorable and not errors
+            ),
+            "missing_required_boot_or_target_partitions": missing_restorable,
+            "excluded_untouched_partitions": sorted(set(excluded_present_in_table)),
+            "splloader_bak_present": spl_bak_present,
+            "coverage_scope_note": (
+                "SPRD4:AutoD 'r all' covers all flashable boot/BSP/system/identity GPT partitions + splloader; "
+                "untouched userdata/cache/blackbox and eMMC boot1 (splloader_bak) are not dumped by 'r all'."
+            ),
+        },
         "recovery_channel": "SPRD4:AutoD (U-Boot autodloader; requires functional SPL + U-Boot)",
         "bare_metal_sprd3_ready": False,
         "splloader_bak_present": spl_bak_present,
@@ -633,6 +726,21 @@ def _spd_token(val: object) -> str:
     return f'"{s}"'
 
 
+def _sanitize_operational_log_line(line: str) -> str:
+    """Scrub USB serials, MACs, user profile paths, and labeled secrets before writing native tool logs to disk."""
+    out = re.sub(
+        r"(USB(?:\\{1,2}|/)VID_[0-9A-F]{4}&PID_[0-9A-F]{4}(?:&MI_[0-9A-F]{2})?(?:\\{1,2}|/))[^\s\"',}\]]+",
+        r"\1<USB_SERIAL_REDACTED>",
+        line,
+        flags=re.I,
+    )
+    out = re.sub(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b", "<MAC_REDACTED>", out)
+    out = re.sub(r"([A-Za-z]:[/\\]+Users[/\\]+)[^/\\\s\"']+", r"\1<USER>", out, flags=re.I)
+    out = re.sub(r"(/(?:Users|home)/)[^/\s\"']+", r"\1<USER>", out)
+    out = re.sub(r"(--(?:webui-password|wifi-password|root-password)\s+)\S+", r"\1<REDACTED>", out)
+    return out
+
+
 def _drain_stream_to_queue(
     stream: Any,
     out_queue: queue.Queue[str | None],
@@ -644,7 +752,7 @@ def _drain_stream_to_queue(
         log_handle.write(banner)
         log_handle.flush()
     for line in stream:
-        log_handle.write(line)
+        log_handle.write(_sanitize_operational_log_line(line))
         log_handle.flush()
         out_queue.put(line)
     out_queue.put(None)

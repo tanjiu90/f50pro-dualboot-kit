@@ -485,6 +485,12 @@ return view.extend({
 		this.scanBtn.textContent = '扫描中…';
 		dom.content(this.scanListEl, E('div', { 'class': 'f50r-note' }, '正在扫描周围 2.4G / 5G Wi-Fi（约 2~4 秒）…'));
 		return callScan().then(function(res) {
+			if (!res || res.ok === 0) {
+				var errMsg = (res && res.error) ? res.error : '无线接口暂时无法扫描，请稍候重试';
+				self.scanResults = [];
+				dom.content(self.scanListEl, E('div', { 'class': 'f50r-note' }, '扫描失败：' + errMsg));
+				return;
+			}
 			self.scanResults = (res && res.results) || [];
 			self.paintScanList();
 		}).catch(function() {
@@ -497,13 +503,13 @@ return view.extend({
 
 	doConnect: function() {
 		var self = this;
-		var ssid = (this.ssidInput.value || '').trim();
+		var ssid = String(this.ssidInput.value || '');
 		var enc = this.encSelect.value || 'psk2';
 		var key = this.keyInput.value || '';
 		var band = this.bandSelect.value || '2g';
 		var ch = (this.channelInput.value || 'auto').trim() || 'auto';
 
-		if (!ssid) {
+		if (!ssid || ssid.length === 0) {
 			ui.addNotification(null, E('p', '请先选择或输入上级 Wi-Fi 名称'), 'warning');
 			return;
 		}

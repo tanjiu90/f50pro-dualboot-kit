@@ -517,7 +517,7 @@ def _snapshot_windows_adapter(iface_name: str) -> dict[str, Any]:
         "$staticDns = if ($ns) { @($ns -split '[,\\s]+' | Where-Object { $_ }) } else { @() }; "
         "$v6 = (Get-NetAdapterBinding -Name $ad.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue).Enabled; "
         "$regDns = (Get-DnsClient -InterfaceIndex $ad.ifIndex -ErrorAction SilentlyContinue).RegisterThisConnectionsAddress; "
-        "@{ name = $ad.Name; ifIndex = $ad.ifIndex; dhcp = ($ifv4.Dhcp -eq 'Enabled'); ips = $ips; gateways = $gws; dns = @($dns); static_dns = $staticDns; ipv6_enabled = $v6; register_dns = $regDns } | ConvertTo-Json -Depth 4 -Compress }"
+        "@{ name = $ad.Name; ifIndex = $ad.ifIndex; pnp_id = $ad.PnpDeviceID; status = [string]$ad.Status; dhcp = ($ifv4.Dhcp -eq 'Enabled'); ips = $ips; gateways = $gws; dns = @($dns); static_dns = $staticDns; ipv6_enabled = $v6; register_dns = $regDns } | ConvertTo-Json -Depth 4 -Compress }"
     )
     return {"platform": "win64", **json.loads(raw)} if raw else {"platform": "win64", "name": iface_name}
 
@@ -565,6 +565,22 @@ def _save_initial_snapshot(
             "entries": merged_entries,
         },
     )
+
+
+def _check_windows_f50_usb_disconnected() -> dict[str, Any]:
+    """Fail-closed live PnP check verifying no F50 Pro USB device (OpenWrt or Stock Android) is connected on Windows."""
+    live_usb_raw = _ps(
+        "$ok = $true; $hits = @(); "
+        "try { $hits = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | "
+        "Where-Object { $_.PNPDeviceID -match 'VID_1D6B&PID_0104|VID_19D2&PID_024' } | "
+        "Select-Object -ExpandProperty PNPDeviceID) } catch { $ok = $false }; "
+        "@{ query_ok = $ok; connected_count = $hits.Count } | ConvertTo-Json -Compress"
+    )
+    try:
+        parsed = json.loads(live_usb_raw) if live_usb_raw else {"query_ok": False, "connected_count": 0}
+        return parsed if isinstance(parsed, dict) else {"query_ok": False, "connected_count": 0}
+    except Exception:
+        return {"query_ok": False, "connected_count": 0}
 
 
 def restore_network_snapshot(
@@ -648,7 +664,25 @@ def restore_network_snapshot(
             results.append({"network_service": svc, "status": "restored_macos"})
         elif plat == "win64":
             name = entry["name"]
+            # Always enforce live USB disconnect gate on Windows EVEN when force=True so forced restore
+            # can never release host management isolation while F50 Pro is still plugged in!
+            usb_chk = _check_windows_f50_usb_disconnected()
+            if not usb_chk.get("query_ok"):
+                raise RuntimeError(
+                    "Refusing to restore Windows network snapshot because live USB PnP safety check failed "
+                    "(unplug F50 Pro and verify Windows CIM/PnP health before retrying)."
+                )
+            if int(usb_chk.get("connected_count") or 0) > 0:
+                raise RuntimeError(
+                    "Refusing to restore Windows DHCP/gateway snapshot while F50 Pro USB device is still connected "
+                    "(unplug the F50 Pro USB cable first to prevent host route leak)."
+                )
             cur = _snapshot_windows_adapter(name)
+            snap_pnp = str(entry.get("pnp_id") or "").upper()
+            cur_pnp = str(cur.get("pnp_id") or "").upper()
+            if not force and snap_pnp and cur_pnp and snap_pnp != cur_pnp:
+                results.append({"iface": name, "status": "skipped_pnp_mismatch"})
+                continue
             live_ips = [x.get("IPAddress") for x in cur.get("ips", [])]
             if not force and live_ips != [applied_ip]:
                 results.append({"iface": name, "status": "skipped_user_modified", "live_ips": live_ips})
@@ -725,7 +759,17 @@ def restore_network_snapshot(
                 raise RuntimeError(f"Failed restoring Windows network adapter {name!r}: {err_list}")
             else:
                 results.append({"iface": name, "status": "restored_dhcp" if was_dhcp else "restored_static"})
-    return {"snapshot_path": str(snapshot_path), "results": results}
+    restored_count = sum(
+        1 for r in results if str(r.get("status", "")).startswith("restored_") or r.get("status") == "flushed_ip"
+    )
+    skipped_count = len(results) - restored_count
+    return {
+        "snapshot_path": str(snapshot_path),
+        "restored_count": restored_count,
+        "skipped_count": skipped_count,
+        "all_restored": restored_count > 0 and skipped_count == 0,
+        "results": results,
+    }
 
 
 def isolate_usb_rndis_adapter(
@@ -736,13 +780,19 @@ def isolate_usb_rndis_adapter(
     usb_topology: dict[str, Any] | None = None,
     include_zte_android: bool = False,
     snapshot_path: Path | None = None,
+    allow_host_route_hijack: bool = False,
 ) -> dict[str, Any]:
-    """Configure ONLY the correlated F50 Pro USB interface (`management` LAN-only vs explicit `internet-exit`)."""
+    """Configure ONLY the correlated F50 Pro USB interface (`management` LAN-only; Windows blocks `internet-exit` by default)."""
     if mode not in ("management", "internet-exit"):
         raise ValueError(f"Unsupported host network mode {mode!r}; expected 'management' or 'internet-exit'")
 
     plat = detect_host_platform()
     if mode == "internet-exit":
+        if plat == "win64" and not allow_host_route_hijack:
+            raise RuntimeError(
+                "Refusing internet-exit on Windows without explicit allow_host_route_hijack=True "
+                "(management isolation prevents host route hijack)."
+            )
         restored: list[dict[str, Any]] = []
         if snapshot_path is not None and snapshot_path.is_file():
             rest = restore_network_snapshot(
@@ -891,37 +941,57 @@ def isolate_usb_rndis_adapter(
         q_ip = _ps_quote(static_ip)
         ps_script = f"""
 $ErrorActionPreference = 'Stop'
-$ads = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -in @({names_ps}) }}
+$ads = @(Get-NetAdapter -ErrorAction Stop | Where-Object {{ $_.Name -in @({names_ps}) }})
 $updated = @()
+$applyErrs = @()
 foreach ($ad in $ads) {{
     $reg = "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$($ad.InterfaceGuid)"
     if (Test-Path $reg) {{
-        Set-ItemProperty -Path $reg -Name EnableDHCP -Value 0 -Type DWord
-        Set-ItemProperty -Path $reg -Name IPAddress -Value ([string[]]@({q_ip})) -Type MultiString
-        Set-ItemProperty -Path $reg -Name SubnetMask -Value ([string[]]@('255.255.255.0')) -Type MultiString
-        Set-ItemProperty -Path $reg -Name DefaultGateway -Value ([string[]]@()) -Type MultiString
-        Set-ItemProperty -Path $reg -Name NameServer -Value '' -Type String
-        Remove-ItemProperty -Path $reg -Name DhcpDefaultGateway -ErrorAction SilentlyContinue
-        Remove-ItemProperty -Path $reg -Name DhcpNameServer -ErrorAction SilentlyContinue
+        try {{
+            Set-ItemProperty -Path $reg -Name EnableDHCP -Value 0 -Type DWord -ErrorAction Stop
+            Set-ItemProperty -Path $reg -Name IPAddress -Value ([string[]]@({q_ip})) -Type MultiString -ErrorAction Stop
+            Set-ItemProperty -Path $reg -Name SubnetMask -Value ([string[]]@('255.255.255.0')) -Type MultiString -ErrorAction Stop
+            Set-ItemProperty -Path $reg -Name DefaultGateway -Value ([string[]]@()) -Type MultiString -ErrorAction Stop
+            Set-ItemProperty -Path $reg -Name NameServer -Value '' -Type String -ErrorAction Stop
+            Remove-ItemProperty -Path $reg -Name DhcpDefaultGateway -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $reg -Name DhcpNameServer -ErrorAction SilentlyContinue
+        }} catch {{ $applyErrs += ('reg:' + $_.Exception.Message) }}
     }}
-    Disable-NetAdapterBinding -Name $ad.Name -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue
-    Set-NetIPInterface -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -Dhcp Disabled -AutomaticMetric Disabled -InterfaceMetric 5000 -ErrorAction SilentlyContinue
+    try {{ Disable-NetAdapterBinding -Name $ad.Name -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop }} catch {{ $applyErrs += ('v6:' + $_.Exception.Message) }}
+    try {{ Set-NetIPInterface -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -Dhcp Disabled -AutomaticMetric Disabled -InterfaceMetric 5000 -ErrorAction Stop }} catch {{ $applyErrs += ('ipif:' + $_.Exception.Message) }}
     Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -ne {q_ip} }} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
     if (-not (Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq {q_ip} }})) {{
-        New-NetIPAddress -InterfaceIndex $ad.ifIndex -IPAddress {q_ip} -PrefixLength 24 -Confirm:$false | Out-Null
+        try {{ New-NetIPAddress -InterfaceIndex $ad.ifIndex -IPAddress {q_ip} -PrefixLength 24 -Confirm:$false -ErrorAction Stop | Out-Null }} catch {{ $applyErrs += ('newip:' + $_.Exception.Message) }}
     }}
-    Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue
-    Set-DnsClient -InterfaceIndex $ad.ifIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
+    try {{ Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ResetServerAddresses -ErrorAction Stop }} catch {{ $applyErrs += ('dns:' + $_.Exception.Message) }}
+    try {{ Set-DnsClient -InterfaceIndex $ad.ifIndex -RegisterThisConnectionsAddress $false -ErrorAction Stop }} catch {{ $applyErrs += ('regdns:' + $_.Exception.Message) }}
     Get-NetRoute -InterfaceIndex $ad.ifIndex -DestinationPrefix '0.0.0.0/0','::/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
     $updated += @{{ name = $ad.Name; ifIndex = $ad.ifIndex; pnp_id = $ad.PnpDeviceID; ip = {q_ip} }}
 }}
 Start-Sleep -Seconds 2
 $targetIdx = @($ads | ForEach-Object {{ $_.ifIndex }})
-$qErrs = @()
+$qErrs = @($applyErrs)
+$readback = @()
+foreach ($ad in $ads) {{
+    $ifv4 = $null; $ips = @(); $dns = @(); $v6 = $true; $regDns = $true; $qOk = $true
+    try {{ $ifv4 = Get-NetIPInterface -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction Stop }} catch {{ $qOk = $false; $qErrs += ('readback_ifv4:' + $_.Exception.Message) }}
+    try {{ $ips = @(Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction Stop | Select-Object IPAddress,PrefixLength) }} catch {{ $qOk = $false; $qErrs += ('readback_ips:' + $_.Exception.Message) }}
+    try {{ $dnsObj = Get-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction Stop; $dns = @($dnsObj.ServerAddresses | Where-Object {{ $_ }}) }} catch {{ $qOk = $false; $qErrs += ('readback_dns:' + $_.Exception.Message) }}
+    try {{ $v6Obj = Get-NetAdapterBinding -Name $ad.Name -ComponentID ms_tcpip6 -ErrorAction Stop; $v6 = [bool]$v6Obj.Enabled }} catch {{ $qOk = $false; $qErrs += ('readback_v6:' + $_.Exception.Message) }}
+    try {{ $regObj = Get-DnsClient -InterfaceIndex $ad.ifIndex -ErrorAction Stop; $regDns = [bool]$regObj.RegisterThisConnectionsAddress }} catch {{ $qOk = $false; $qErrs += ('readback_regdns:' + $_.Exception.Message) }}
+    $hasIp = (@($ips | Where-Object {{ $_.IPAddress -eq {q_ip} -and $_.PrefixLength -eq 24 }}).Count -ge 1)
+    if (-not $hasIp) {{ $qErrs += ('readback_ip_missing:' + $ad.Name) }}
+    if (-not $ifv4 -or ($ifv4.Dhcp -ne 'Disabled')) {{ $qErrs += ('readback_dhcp_not_disabled:' + $ad.Name) }}
+    if (-not $ifv4 -or ([int]$ifv4.InterfaceMetric -ne 5000)) {{ $qErrs += ('readback_metric_mismatch:' + $ad.Name) }}
+    if ($v6 -eq $true) {{ $qErrs += ('readback_ipv6_still_enabled:' + $ad.Name) }}
+    if ($dns.Count -gt 0) {{ $qErrs += ('readback_dns_not_empty:' + $ad.Name) }}
+    if ($regDns -eq $true) {{ $qErrs += ('readback_register_dns_enabled:' + $ad.Name) }}
+    $readback += @{{ name = $ad.Name; pnp_id = $ad.PnpDeviceID; query_ok = $qOk; ip_ok = $hasIp; dhcp = if($ifv4){{[string]$ifv4.Dhcp}}else{{'unknown'}}; metric = if($ifv4){{[int]$ifv4.InterfaceMetric}}else{{-1}}; ipv6_enabled = [bool]$v6; dns_count = $dns.Count; register_dns = [bool]$regDns }}
+}}
 $allRoutes = @()
 try {{ $allRoutes = @(Get-NetRoute -ErrorAction Stop | Select-Object DestinationPrefix,ifIndex,InterfaceAlias,NextHop,RouteMetric) }} catch {{ if ($_.CategoryInfo.Category -ne 'ObjectNotFound') {{ $qErrs += ('routes:' + $_.Exception.Message) }} }}
 $routes = @($allRoutes | Where-Object {{ ($_.DestinationPrefix -eq '0.0.0.0/0' -or $_.DestinationPrefix -eq '::/0') -and ($_.ifIndex -in $targetIdx) }} | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric)
-@{{ isolated = $updated; target_default_routes = $routes; query_errors = $qErrs }} | ConvertTo-Json -Depth 4 -Compress
+@{{ isolated = $updated; readback = $readback; target_default_routes = $routes; query_errors = $qErrs }} | ConvertTo-Json -Depth 4 -Compress
 """
         raw = _ps(ps_script)
         data = json.loads(raw) if raw else {"isolated": [], "target_default_routes": [], "query_errors": ["empty_ps_output"]}
@@ -1184,19 +1254,21 @@ def main() -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_aud = sub.add_parser("audit", help="Verify host default gateway does not traverse correlated F50 Pro USB interface")
     p_aud.add_argument("--target-iface")
+    p_aud.add_argument("--include-zte-android", action="store_true", help="Also inspect stock ZTE Android 19D2:024* adapters")
     sub.add_parser("bind-rndis", help="Bind Windows RNDIS6 driver (no-op on POSIX)")
     p_iso = sub.add_parser("isolate", help="Isolate correlated F50 Pro USB adapter to static management IP only")
     p_iso.add_argument("--ip", default="192.168.77.12")
     p_iso.add_argument("--mode", default="management", choices=["management", "internet-exit"])
+    p_iso.add_argument("--allow-host-route-hijack", action="store_true", help="Explicit override required to use internet-exit on Windows")
     p_iso.add_argument("--target-iface")
     p_iso.add_argument("--snapshot", type=Path)
-    p_res = sub.add_parser("restore", help="Restore saved network snapshot (refuses overwriting user changes unless --force)")
+    p_res = sub.add_parser("restore", help="Restore saved network snapshot after unplugging F50 Pro USB")
     p_res.add_argument("--snapshot", type=Path, required=True)
     p_res.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     if args.cmd == "audit":
-        res = audit_default_routes(target_iface=args.target_iface)
+        res = audit_default_routes(target_iface=args.target_iface, include_zte_android=args.include_zte_android)
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 1 if (res.get("usb_default_route_leak") or res.get("audit_incomplete")) else 0
     if args.cmd == "bind-rndis":
@@ -1208,12 +1280,18 @@ def main() -> int:
     if args.cmd == "restore":
         res = restore_network_snapshot(args.snapshot, force=args.force)
         print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0
+        return 0 if res.get("all_restored") else 1
+    if args.mode == "internet-exit" and detect_host_platform() == "win64" and not args.allow_host_route_hijack:
+        raise RuntimeError(
+            "Refusing --mode internet-exit on Windows without --allow-host-route-hijack "
+            "(management isolation protects host Wi-Fi/Ethernet from route hijack; connect via F50 Pro Wi-Fi instead)."
+        )
     res = isolate_usb_rndis_adapter(
         static_ip=args.ip,
         mode=args.mode,
         target_iface=args.target_iface,
         snapshot_path=args.snapshot,
+        allow_host_route_hijack=bool(args.allow_host_route_hijack),
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0

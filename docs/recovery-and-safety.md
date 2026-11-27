@@ -54,23 +54,22 @@
 
 ### 场景 A：卡在槽位 `_b`，想切回槽位 `_a`
 - 方法 1：OpenWrt 正常运行时长按机身实体键 5 秒，或 SSH 执行 `/opt/mu300/bin/mu300-next-boot android && reboot`。
-- 方法 2：将设备切入 `SPRD4` 下载模式，写回本机原始 `misc` 引导块（构建目录下已预生成 `stage3\misc_rollback_a.bin`）：
+- 方法 2（推荐受控回退）：在同一个 `SPRD4` 会话内自动校验本机备份、GPT、设备身份、写前槽位状态与写后读回 SHA-256，校验通过才发送重启；务必将步骤 1 干跑输出的 `plan_sha256` 和 `rollback_sha256` 传入执行命令：
   ```powershell
-  .\build\runtime-tools\host-tools-win64\spd_dump_251\spd_dump.exe --wait 120 --kickto 2 `
-    wof misc 2048 build\my-device\build\stage3\misc_rollback_a.bin reset
+  # 1. 先离线干跑核对本机指纹、plan_sha256 与 rollback_sha256：
+  .\.venv\Scripts\python.exe scripts\kit.py rollback-a --plan build\my-device\build\flash_plan.json
+  # 2. 确认无误后绑定上述两项摘要执行受控回退：
+  .\.venv\Scripts\python.exe scripts\kit.py rollback-a `
+    --plan build\my-device\build\flash_plan.json `
+    --expected-plan-sha256 "<步骤1输出的plan_sha256>" `
+    --expected-rollback-sha256 "<步骤1输出的rollback_sha256>" `
+    --execute
   ```
 
-### 场景 B：完整还原到刷机前出厂状态
-从备份目录写回已修改过的系统槽分区（切勿覆盖 NV/射频/校准分区）：
-```powershell
-# 示例：还原 _a 与 _b 引导区与 misc（保持 prodnv/calinv/persist/NV 分区不动）
-spd_dump --wait 120 --kickto 2 `
-  w trustos_a backup\trustos_a `
-  w init_boot_a backup\init_boot_a `
-  w trustos_b backup\trustos_b `
-  w boot_b backup\boot_b `
-  w vendor_boot_b backup\vendor_boot_b `
-  w_force init_boot_b backup\init_boot_b `
-  wof misc 2048 build\my-device\build\stage3\misc_rollback_a.bin `
-  reset
-```
+### 场景 B：完整还原到刷机前出厂状态（必须以已执行计划派生清单并遵循受控门禁）
+**重要说明**：完整出厂还原必须**从本次刷机的 `flash_plan.json` 派生全部已修改分区清单**——除 `trustos_a`、`init_boot_a`、`trustos_b`、`boot_b`、`vendor_boot_b`、`init_boot_b`、`fulldumpdb` 与 `misc+2048` 外，**还包含 `BSP_SYNC_PAIRS_F50PRO` 同步过的全部 `_b` 槽 BSP 目标分区（`sml_b`、`teecfg_b`、`uboot_b`、`l_fixnv2` 等，详见 `flash_plan.json["operations"]`）**；同时严禁触碰 `FORBIDDEN_PARTITIONS` 中的 `splloader`/`prodnv`/`calinv`/`ztecfg`/`persist`/NV 校准分区。**切勿在未核验备份、GPT、本机身份（`ztecfg`/`persist` 哈希）、写前基线与逐分区读回 SHA-256 的情况下执行裸 `spd_dump w ... reset`！**
+
+安全执行顺序：
+1. **先切回并验证原厂安卓 `_a`**：优先使用受控命令 `kit.py rollback-a --plan ... --expected-plan-sha256 ... --expected-rollback-sha256 ... --execute`（在同一 `SPRD4` 会话内完成 GPT、本机身份、写前槽位状态与读回校验后重启，并确认原厂安卓 `19D2:0246` 与 `http://192.168.0.1:8080` 恢复在线）。
+2. **校验本地全量原厂备份完整性**：运行 `.\.venv\Scripts\python.exe scripts\kit.py backup --output-dir <你的备份目录> --verify-only`，确认 `checks_passed=true` 且 `backup_coverage.flashed_targets_and_boot_slots_covered=true`（所有修改目标分区、BSP 分区与 `fulldumpdb` 均在 `SHA256SUMS.txt` 中完好无损）。
+3. **仅在需要彻底清空 `_b` 槽 OpenWrt 与恢复原厂 BSP + `fulldumpdb` 时**：从 `flash_plan.json["operations"]` 读取实际改动过的所有目标分区清单；在同一 `SPRD4:AutoD` 交互会话内先核对 `partition_list` 与本机 `ztecfg` / `persist` 身份哈希（与 `device_identity.unit_identity_partitions` 一致），再按写前校验 -> 写回对应原厂备份（含全部 BSP `_b` 目标与 `fulldumpdb`）-> 逐分区读回比对 SHA-256 的顺序执行，全部字节一致后再执行 `reset`；任一分区读回不一致时立即中止，绝不盲目重启。

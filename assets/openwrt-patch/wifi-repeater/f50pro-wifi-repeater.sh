@@ -125,13 +125,14 @@ ap_client_count() {
 }
 
 build_hostapd_conf() {
-    local ch="$1" hwmode="$2" ap_sec="$3"
+    local ch="$1" hwmode="$2" ap_sec="$3" compat_mode="${4:-normal}" out_file="${5:-$HOSTAPD_OUT}"
     get_macs
 
-    if [ -f "$HOSTAPD_SRC" ] && grep -q '^interface=' "$HOSTAPD_SRC" 2>/dev/null; then
+    rm -f "${out_file}.tmp"
+    if [ "$compat_mode" != "conservative" ] && [ -f "$HOSTAPD_SRC" ] && grep -q '^interface=' "$HOSTAPD_SRC" 2>/dev/null; then
         # Derive repeater/fallback hostapd config from netifd-generated hostapd-phy0.conf.
-        # Keep Wi-Fi 6 (ieee80211ax) and HT LDPC/STBC/MAX-AMSDU capabilities intact so AP
-        # throughput is not degraded to bare 802.11n; strip only channel/width-tied oper fields.
+        # Strip channel/width-tied oper fields and cross-band VHT/HE options when switching to 2.4 GHz
+        # so 5 GHz capabilities never cause hostapd to reject 2.4 GHz AP startup on aicwf_sdio.
         if [ "$hwmode" = "a" ]; then
             sed -e '/^start_disabled=/d' \
                 -e '/^acs_/d' \
@@ -142,29 +143,33 @@ build_hostapd_conf() {
                 -e '/^supported_rates=/d' \
                 -e "s/^channel=.*/channel=$ch/" \
                 -e "s/^hw_mode=.*/hw_mode=a/" \
-                -e 's/^ht_capab=.*/ht_capab=[LDPC][SHORT-GI-20][TX-STBC][MAX-AMSDU-7935][RX-STBC1]/' \
+                -e 's/^ht_capab=.*/ht_capab=[SHORT-GI-20]/' \
                 -e "s/^bssid=.*/bssid=$AP_MAC/" \
-                "$HOSTAPD_SRC" > "$HOSTAPD_OUT"
+                "$HOSTAPD_SRC" > "${out_file}.tmp" || return 1
         else
             sed -e '/^start_disabled=/d' \
                 -e '/^acs_/d' \
                 -e '/^vht_oper_/d' \
                 -e '/^he_oper_/d' \
                 -e '/^op_class=/d' \
+                -e '/^ieee80211ac=/d' \
+                -e '/^vht_capab=/d' \
+                -e '/^ieee80211ax=/d' \
+                -e '/^he_/d' \
                 -e "s/^channel=.*/channel=$ch/" \
                 -e "s/^hw_mode=.*/hw_mode=g/" \
-                -e 's/^ht_capab=.*/ht_capab=[LDPC][SHORT-GI-20][TX-STBC][MAX-AMSDU-7935][RX-STBC1]/' \
+                -e 's/^ht_capab=.*/ht_capab=[SHORT-GI-20]/' \
                 -e "s/^bssid=.*/bssid=$AP_MAC/" \
-                "$HOSTAPD_SRC" > "$HOSTAPD_OUT"
+                "$HOSTAPD_SRC" > "${out_file}.tmp" || return 1
         fi
-        grep -q '^ieee80211ax=' "$HOSTAPD_OUT" 2>/dev/null || echo 'ieee80211ax=1' >> "$HOSTAPD_OUT"
-        chown root:network "$HOSTAPD_OUT" 2>/dev/null || true
-        chmod 640 "$HOSTAPD_OUT" 2>/dev/null || true
+        [ -s "${out_file}.tmp" ] || return 1
+        chown root:network "${out_file}.tmp" 2>/dev/null || true
+        chmod 640 "${out_file}.tmp" 2>/dev/null || true
+        mv -f "${out_file}.tmp" "$out_file" || return 1
         return 0
     fi
 
-    # Fallback generator directly from UCI if netifd did not emit hostapd-phy0.conf
-    rm -f "${HOSTAPD_OUT}.tmp"
+    # Conservative fallback generator directly from UCI (safe minimal HT20 config, never forces unverified HE/LDPC flags)
     ucode -e '
 import * as uci from "uci";
 import * as fs from "fs";
@@ -185,8 +190,7 @@ let lines = [
     "hw_mode=" + hw,
     "channel=" + ch,
     "ieee80211n=1",
-    "ht_capab=[LDPC][SHORT-GI-20][TX-STBC][MAX-AMSDU-7935][RX-STBC1]",
-    "ieee80211ax=1",
+    "ht_capab=[SHORT-GI-20]",
     "interface=phy0-ap0",
     "bssid=" + bssid,
     "ctrl_interface=/var/run/hostapd",
@@ -213,34 +217,77 @@ if (enc != "none") {
     }
 }
 if (!fs.writefile(out, join("\n", lines) + "\n")) exit(1);
-' "$ch" "$hwmode" "$ap_sec" "$AP_MAC" "${HOSTAPD_OUT}.tmp" 2>/dev/null || return 1
-    [ -s "${HOSTAPD_OUT}.tmp" ] || return 1
-    chown root:network "${HOSTAPD_OUT}.tmp" 2>/dev/null || true
-    chmod 640 "${HOSTAPD_OUT}.tmp" 2>/dev/null || true
-    mv -f "${HOSTAPD_OUT}.tmp" "$HOSTAPD_OUT"
+' "$ch" "$hwmode" "$ap_sec" "$AP_MAC" "${out_file}.tmp" 2>/dev/null || return 1
+    [ -s "${out_file}.tmp" ] || return 1
+    chown root:network "${out_file}.tmp" 2>/dev/null || true
+    chmod 640 "${out_file}.tmp" 2>/dev/null || true
+    mv -f "${out_file}.tmp" "$out_file" || return 1
     return 0
 }
 
-start_ap_on_channel() {
-    local ch="$1" hwmode="$2" ap_sec="$3"
-    build_hostapd_conf "$ch" "$hwmode" "$ap_sec" || return 1
-
+_apply_hostapd_conf() {
+    local ch="$1"
+    [ -s "$HOSTAPD_OUT" ] || return 1
     ubus call hostapd config_set '{"phy":"phy0","config":"","prev_config":""}' >/dev/null 2>&1 || true
     sleep 1
     if ! iw dev phy0-ap0 info >/dev/null 2>&1; then
         iw phy phy0 interface add phy0-ap0 type __ap >/dev/null 2>&1 || return 1
     fi
-    ubus call hostapd config_set "{\"phy\":\"phy0\",\"config\":\"$HOSTAPD_OUT\",\"prev_config\":\"\"}" >/dev/null 2>&1 || true
+    ubus call hostapd config_set "{\"phy\":\"phy0\",\"config\":\"$HOSTAPD_OUT\",\"prev_config\":\"\"}" >/dev/null 2>&1 || return 1
 
-    local w=0
+    local w=0 ap_dev="" cur_ch=""
     while [ "$w" -lt 8 ]; do
-        if [ -n "$(get_ap_iface_dev)" ]; then
-            [ -e /sys/class/net/br-lan/brif/phy0-ap0 ] || ip link set phy0-ap0 master br-lan 2>/dev/null || true
-            return 0
+        ap_dev="$(get_ap_iface_dev)"
+        if [ -n "$ap_dev" ]; then
+            cur_ch="$(ap_channel "$ap_dev")"
+            if [ -z "$ch" ] || { [ -n "$cur_ch" ] && [ "$cur_ch" = "$ch" ]; }; then
+                if [ ! -e "/sys/class/net/br-lan/brif/$ap_dev" ]; then
+                    if ! ip link set "$ap_dev" master br-lan 2>/dev/null; then
+                        log_msg "WARN: failed adding $ap_dev to br-lan"
+                    fi
+                fi
+                [ -e "/sys/class/net/br-lan/brif/$ap_dev" ] && return 0
+            fi
         fi
         w=$((w + 1))
         sleep 1
     done
+    return 1
+}
+
+start_ap_on_channel() {
+    local ch="$1" hwmode="$2" ap_sec="$3"
+    local had_prev=0
+    if [ -s "${HOSTAPD_OUT}.prev" ]; then
+        had_prev=1
+    elif [ -s "$HOSTAPD_OUT" ]; then
+        cp -f "$HOSTAPD_OUT" "${HOSTAPD_OUT}.prev" 2>/dev/null && had_prev=1
+    elif [ -s "$HOSTAPD_SRC" ]; then
+        cp -f "$HOSTAPD_SRC" "${HOSTAPD_OUT}.prev" 2>/dev/null && had_prev=1
+    fi
+
+    if build_hostapd_conf "$ch" "$hwmode" "$ap_sec" "normal" "${HOSTAPD_OUT}.cand" && mv -f "${HOSTAPD_OUT}.cand" "$HOSTAPD_OUT" && _apply_hostapd_conf "$ch"; then
+        rm -f "${HOSTAPD_OUT}.prev" "${HOSTAPD_OUT}.cand"
+        return 0
+    fi
+    rm -f "${HOSTAPD_OUT}.cand"
+
+    log_msg "Primary AP config failed on ch=$ch ($hwmode); retrying with conservative HT20 fallback"
+    if build_hostapd_conf "$ch" "$hwmode" "$ap_sec" "conservative" "${HOSTAPD_OUT}.cand" && mv -f "${HOSTAPD_OUT}.cand" "$HOSTAPD_OUT" && _apply_hostapd_conf "$ch"; then
+        rm -f "${HOSTAPD_OUT}.prev" "${HOSTAPD_OUT}.cand"
+        return 0
+    fi
+    rm -f "${HOSTAPD_OUT}.cand"
+
+    if [ "$had_prev" = "1" ] && [ -s "${HOSTAPD_OUT}.prev" ]; then
+        if mv -f "${HOSTAPD_OUT}.prev" "$HOSTAPD_OUT" 2>/dev/null && _apply_hostapd_conf ""; then
+            log_msg "Restored previous AP config after failed channel switch"
+        else
+            log_msg "ERROR: failed to restore previous AP config after channel switch failure"
+        fi
+    else
+        rm -f "${HOSTAPD_OUT}.prev"
+    fi
     return 1
 }
 
@@ -277,23 +324,29 @@ cmd_ensure_ap() {
     cur_ap="$(get_ap_iface_dev)"
     if [ -n "$cur_ap" ]; then
         cur_ch="$(ap_channel "$cur_ap")"
-        if [ "$cur_ch" = "$ch" ]; then
-            [ -e "/sys/class/net/br-lan/brif/$cur_ap" ] || ip link set "$cur_ap" master br-lan 2>/dev/null || true
-            write_state "repeater" "ok" "$sta_ssid" "$ch"
-            release_lock
-            return 0
+        if [ -n "$cur_ch" ] && [ "$cur_ch" = "$ch" ]; then
+            if [ ! -e "/sys/class/net/br-lan/brif/$cur_ap" ]; then
+                ip link set "$cur_ap" master br-lan 2>/dev/null || true
+            fi
+            if [ -e "/sys/class/net/br-lan/brif/$cur_ap" ]; then
+                write_state "repeater" "ok" "$sta_ssid" "$ch"
+                release_lock
+                return 0
+            fi
+            log_msg "WARN: active AP $cur_ap not attached to br-lan; recreating AP"
         fi
     fi
 
-    log_msg "Starting concurrent AP phy0-ap0 on ch=$ch (hw_mode=$hwmode) alongside $sta_dev ($sta_ssid)"
+    log_msg "Starting concurrent AP phy0-ap0 on ch=$ch (hw_mode=$hwmode) alongside $sta_dev"
     if start_ap_on_channel "$ch" "$hwmode" "$ap_sec"; then
         write_state "repeater" "ok" "$sta_ssid" "$ch"
         log_msg "Concurrent AP phy0-ap0 active on ch=$ch"
-    else
-        log_msg "Failed to start concurrent AP phy0-ap0 on ch=$ch"
+        release_lock
+        return 0
     fi
+    log_msg "Failed to start concurrent AP phy0-ap0 on ch=$ch"
     release_lock
-    return 0
+    return 1
 }
 
 cmd_fallback_ap() {
@@ -310,7 +363,32 @@ cmd_fallback_ap() {
     sta_ssid=""
     [ -n "$sta_sec" ] && sta_ssid="$(uci -q get "wireless.$sta_sec.ssid")"
 
-    log_msg "Entering Fail-Safe AP mode (reason=$reason, saved_sta=$sta_ssid)"
+    log_msg "Entering Fail-Safe AP mode (reason=$reason)"
+
+    # Snapshot last active AP config BEFORE generating candidate or tearing down hostapd.
+    rm -f "${HOSTAPD_OUT}.prev" "${HOSTAPD_OUT}.cand"
+    if [ -s "$HOSTAPD_OUT" ]; then
+        cp -f "$HOSTAPD_OUT" "${HOSTAPD_OUT}.prev" 2>/dev/null || true
+    elif [ -s "$HOSTAPD_SRC" ]; then
+        cp -f "$HOSTAPD_SRC" "${HOSTAPD_OUT}.prev" 2>/dev/null || true
+    fi
+
+    # Pick concrete non-DFS channel & pre-validate candidate into separate file BEFORE tearing down active hostapd.
+    band="$(uci -q get wireless.radio0.band)"
+    if [ "$band" = "5g" ]; then
+        ch="36"
+        hwmode="a"
+    else
+        ch="11"
+        hwmode="g"
+    fi
+    if ! build_hostapd_conf "$ch" "$hwmode" "$ap_sec" "normal" "${HOSTAPD_OUT}.cand" && ! build_hostapd_conf "11" "g" "$ap_sec" "conservative" "${HOSTAPD_OUT}.cand"; then
+        rm -f "${HOSTAPD_OUT}.prev" "${HOSTAPD_OUT}.cand"
+        log_msg "ERROR: Refusing Fail-Safe AP teardown because no valid candidate hostapd config could be generated"
+        release_lock
+        return 1
+    fi
+    rm -f "${HOSTAPD_OUT}.cand"
 
     # Stop wpa_supplicant and remove any phy0-sta0 (even if renamed to type AP by aicwf_sdio) at runtime only (UCI preserved!)
     ubus call wpa_supplicant config_set '{"phy":"phy0","config":[]}' >/dev/null 2>&1 || true
@@ -326,30 +404,22 @@ cmd_fallback_ap() {
     fi
     sleep 1
 
-    # Always pick a clean, non-DFS concrete channel so phones & PCs can connect immediately
-    band="$(uci -q get wireless.radio0.band)"
-    if [ "$band" = "5g" ]; then
-        ch="36"
-        hwmode="a"
-    else
-        ch="11"
-        hwmode="g"
-    fi
-
     if start_ap_on_channel "$ch" "$hwmode" "$ap_sec"; then
         write_state "fallback_ap" "$reason" "$sta_ssid" "$ch"
         log_msg "Fail-Safe AP phy0-ap0 active on ch=$ch ($hwmode)"
-    else
-        # Last-resort retry on 2.4 GHz ch 11
-        if [ "$hwmode" != "g" ] && start_ap_on_channel "11" "g" "$ap_sec"; then
-            write_state "fallback_ap" "$reason" "$sta_ssid" "11"
-            log_msg "Fail-Safe AP phy0-ap0 active on 2.4GHz ch=11 fallback"
-        else
-            log_msg "ERROR: Fail-Safe AP failed to start"
-        fi
+        release_lock
+        return 0
     fi
+    # Last-resort retry on 2.4 GHz ch 11
+    if [ "$hwmode" != "g" ] && start_ap_on_channel "11" "g" "$ap_sec"; then
+        write_state "fallback_ap" "$reason" "$sta_ssid" "11"
+        log_msg "Fail-Safe AP phy0-ap0 active on 2.4GHz ch=11 fallback"
+        release_lock
+        return 0
+    fi
+    log_msg "ERROR: Fail-Safe AP failed to start"
     release_lock
-    return 0
+    return 1
 }
 
 ssid_visible_on_air() {
@@ -366,7 +436,7 @@ function unesc(s) {
     return replace(s, /\\x([0-9a-fA-F]{2})/g, (m, h) => chr(hex(h)));
 }
 for (let line in split(out, "\n")) {
-    let m = match(line, /^\s*SSID:\s*(.*)$/);
+    let m = match(line, /^\s*SSID: (.*)$/);
     if (m) {
         if (m[1] == target || unesc(m[1]) == target) exit(0);
     }
@@ -422,7 +492,7 @@ cmd_watchdog() {
                     ap_missing_secs=$((ap_missing_secs + 5))
                     if [ "$ap_missing_secs" -ge 15 ]; then
                         ap_missing_secs=0
-                        cmd_fallback_ap "ap_only_heal"
+                        cmd_fallback_ap "ap_only_heal" || true
                     fi
                 fi
             fi
@@ -442,10 +512,9 @@ cmd_watchdog() {
                 st_ch="$(sta_channel "$sta_dev")"
                 ap_ch=""
                 [ -n "$ap_dev" ] && ap_ch="$(ap_channel "$ap_dev")"
-                if [ -z "$ap_dev" ] || [ "$ap_ch" != "$st_ch" ]; then
-                    cmd_ensure_ap
+                if [ -z "$ap_dev" ] || [ -z "$ap_ch" ] || [ "$ap_ch" != "$st_ch" ] || [ ! -e "/sys/class/net/br-lan/brif/$ap_dev" ]; then
+                    cmd_ensure_ap || true
                 else
-                    [ -e "/sys/class/net/br-lan/brif/$ap_dev" ] || ip link set "$ap_dev" master br-lan 2>/dev/null || true
                     write_state "repeater" "ok" "$sta_ssid" "$st_ch"
                 fi
             else
@@ -467,7 +536,7 @@ cmd_watchdog() {
                 if [ "$fallback_secs" -ge "$retry_backoff" ]; then
                     fallback_secs=0
                     if ssid_visible_on_air "$sta_ssid"; then
-                        log_msg "Saved SSID '$sta_ssid' detected while 0 clients connected; retrying repeater"
+                        log_msg "Configured upstream Wi-Fi detected while 0 clients connected; retrying repeater"
                         retry_backoff=$((retry_backoff * 2))
                         [ "$retry_backoff" -gt 300 ] && retry_backoff=300
                         cmd_trigger_reload
@@ -486,7 +555,7 @@ cmd_watchdog() {
             fail_secs=0
             fallback_secs=0
             if [ -n "$ap_sec" ]; then
-                cmd_fallback_ap "sta_timeout"
+                cmd_fallback_ap "sta_timeout" || true
             fi
         fi
     done

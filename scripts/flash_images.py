@@ -248,6 +248,7 @@ def execute_flash(
     board_id: str | None = None,
     usb_topology: dict[str, Any] | None = None,
     active_session: SpdSession | None = None,
+    expected_plan_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Execute or dry-run a verified flash_plan.json with full readback verification and safe failure handling."""
     if execute:
@@ -256,6 +257,10 @@ def execute_flash(
         (plan_path.parent / "flash-run" / "flash_result.json").unlink(missing_ok=True)
     plan_raw = plan_path.read_bytes()
     plan_sha256 = sha256_bytes(plan_raw)
+    if expected_plan_sha256 and plan_sha256 != expected_plan_sha256:
+        raise ValueError(
+            f"Approved flash_plan.json SHA-256 mismatch inside execute_flash: {plan_sha256} != {expected_plan_sha256}"
+        )
     plan = json.loads(plan_raw.decode("utf-8"))
     if not execute:
         validate_plan_safety(plan)
@@ -287,11 +292,19 @@ def execute_flash(
     expected_sums_sha = plan.get("backup_sha256sums_sha256")
     from brom_backup import verify_backup_dir
 
-    verify_backup_dir(
+    bak_rep = verify_backup_dir(
         backup_dir,
         require_complete_table=True,
         require_existing_manifest=True,
     )
+    cov = bak_rep.get("backup_coverage") or {}
+    if not cov.get("flashed_targets_and_boot_slots_covered", False):
+        raise ValueError(f"Backup missing required boot/target partition coverage: {cov}")
+    verified_parts = set(bak_rep.get("verified_partitions") or [])
+    for op in plan.get("operations") or []:
+        part_name = op.get("partition")
+        if part_name and part_name not in verified_parts:
+            raise ValueError(f"Backup missing verified pre-flash dump for target partition {part_name!r}")
     if not expected_sums_sha:
         raise ValueError(
             "Flash plan missing backup_sha256sums_sha256; rebuild flash_plan.json from the verified backup before live flashing."
@@ -412,15 +425,25 @@ def execute_flash(
                         f"(live={live_before_sha} != backup={exp_before}); take a fresh backup or pass allow_dirty_target=True."
                     )
 
+            failed_stage = f"stage_verified:{part}"
+            # Stage verified bytes into run_dir immediately before native write so spd_dump consumes the verified copy
+            stage_dir = run_dir / "verified-stage"
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            staged_img = stage_dir / f"{part}.verified.img"
+            raw_img = fpath.read_bytes()
+            if len(raw_img) != sz or sha256_bytes(raw_img) != exp_sha:
+                raise RuntimeError(f"Artifact changed before staging on {part}: expected {exp_sha}")
+            staged_img.write_bytes(raw_img)
+
             failed_stage = f"write:{part}"
             if op["op"] == "w_force":
-                sess.cmd(["w_force", part, str(fpath)], f"Force Write {part} Done", timeout=300)
+                sess.cmd(["w_force", part, str(staged_img)], f"Force Write {part} Done", timeout=300)
                 failed_stage = f"gpt_recheck_after_force:{part}"
                 if sess.table("after_force.xml") != before_tbl:
                     raise RuntimeError("Partition table altered after w_force")
             else:
                 sess.cmd(
-                    ["w", part, str(fpath)],
+                    ["w", part, str(staged_img)],
                     f"Write Part Done: {part},",
                     errs=("BSL_REP_", "incompatible", "failed", "Failed"),
                     timeout=300,
@@ -553,6 +576,216 @@ def execute_flash(
         summary["close_warning"] = close_warning
     write_json(run_dir / "flash_state.json", summary)
     write_json(run_dir / "flash_result.json", summary)
+    return summary
+
+
+def execute_rollback_a(
+    plan_path: Path,
+    *,
+    tools_dir: Path = DEFAULT_TOOLS_DIR,
+    webui_password: str | None = None,
+    webui_host: str = "http://192.168.0.1:8080",
+    openwrt_host: str = "192.168.77.1",
+    auth_context: AuthContext | None = None,
+    adb_serial: str | None = None,
+    execute: bool = False,
+    spd_mode: str = "auto",
+    usb_dev: str | None = None,
+    confirm_weak_identity: bool = False,
+    allow_unexpected_misc: bool = False,
+    expected_plan_sha256: str | None = None,
+    expected_rollback_sha256: str | None = None,
+    active_session: SpdSession | None = None,
+) -> dict[str, Any]:
+    """Controlled, identity- and readback-verified rollback of misc+2048 BCAB back to stock Android slot _a."""
+    plan_raw = plan_path.read_bytes()
+    plan_sha256 = sha256_bytes(plan_raw)
+    if expected_plan_sha256 and plan_sha256 != expected_plan_sha256:
+        raise ValueError(
+            f"Approved rollback flash_plan.json SHA-256 mismatch: {plan_sha256} != {expected_plan_sha256}"
+        )
+    plan = json.loads(plan_raw.decode("utf-8"))
+
+    backup_dir_raw = plan.get("backup_dir")
+    out_dir_raw = plan.get("out_dir")
+    if not backup_dir_raw or not out_dir_raw:
+        raise ValueError("Flash plan missing backup_dir or out_dir")
+    backup_dir = Path(backup_dir_raw)
+    out_dir = Path(out_dir_raw)
+    sums_path = backup_dir / "SHA256SUMS.txt"
+    expected_sums_sha = plan.get("backup_sha256sums_sha256")
+    if not expected_sums_sha:
+        raise ValueError("Flash plan missing backup_sha256sums_sha256; cannot authorize controlled rollback.")
+
+    from brom_backup import verify_backup_dir
+
+    bak_rep = verify_backup_dir(backup_dir, require_complete_table=True, require_existing_manifest=True)
+    cov = bak_rep.get("backup_coverage") or {}
+    if not cov.get("flashed_targets_and_boot_slots_covered", False):
+        raise ValueError(f"Backup missing required boot/target partition coverage before rollback: {cov}")
+    verified_parts = set(bak_rep.get("verified_partitions") or [])
+    for req_p in ("misc", "splloader", "trustos_a", "boot_a", "vendor_boot_a", "init_boot_a"):
+        if req_p not in verified_parts:
+            raise ValueError(f"Backup missing verified {req_p!r}; refusing controlled rollback.")
+    if sha256_file(sums_path) != expected_sums_sha:
+        raise ValueError("Backup SHA256SUMS.txt digest changed after flash_plan.json was built")
+
+    rollback_bin = out_dir / "stage3" / "misc_rollback_a.bin"
+    if not rollback_bin.is_file():
+        raise FileNotFoundError(f"Missing verified rollback block: {rollback_bin}")
+    rb_data = rollback_bin.read_bytes()
+    if len(rb_data) != 32:
+        raise ValueError(f"Invalid misc_rollback_a.bin length: {len(rb_data)} != 32")
+
+    stock_misc = (backup_dir / "misc").read_bytes()
+    if len(stock_misc) < 2080:
+        raise ValueError(f"Backup misc partition too small: {len(stock_misc)} B")
+    stock_bcab = stock_misc[2048:2080]
+    if rb_data != stock_bcab:
+        raise ValueError("misc_rollback_a.bin does not match verified stock backup misc[2048:2080]")
+    bcab_info = parse_boot_control(b"\x00" * 2048 + rb_data)
+    if bcab_info.get("suffix") != "_a":
+        raise ValueError(f"Refusing rollback block whose BCAB target suffix is {bcab_info.get('suffix')!r}, not '_a'")
+    rb_sha = sha256_bytes(rb_data)
+    if expected_rollback_sha256 and rb_sha != expected_rollback_sha256:
+        raise ValueError(
+            f"Approved rollback BCAB SHA-256 mismatch: {rb_sha} != {expected_rollback_sha256}"
+        )
+
+    if not execute:
+        return {
+            "dry_run": True,
+            "device_mutated": False,
+            "device_rebooted": False,
+            "plan_sha256": plan_sha256,
+            "unit_identity_sha256": (plan.get("device_identity") or plan.get("target_identity") or {}).get("unit_identity_sha256"),
+            "target_partition": "misc",
+            "offset": 2048,
+            "size_bytes": 32,
+            "rollback_sha256": rb_sha,
+            "target_slot": "_a",
+        }
+
+    run_dir = out_dir / "rollback-run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    expected_xml = parse_partition_xml(backup_dir / "partition_list.xml")
+
+    sess: Any = active_session
+    if sess is not None:
+        if getattr(sess, "work_dir", None) != run_dir and hasattr(sess, "switch_dir"):
+            sess.switch_dir(run_dir)
+    else:
+        prefer_var = "termux-usb" if spd_mode == "termux-usb" else ("su" if spd_mode == "su" else None)
+        spd_dump = resolve_tool("spd_dump", tools_dir, prefer_variant=prefer_var)
+        sess, _ = open_sprd4_session(
+            spd_dump,
+            run_dir,
+            wait_sec=90,
+            tools_dir=tools_dir,
+            spd_mode=spd_mode,
+            usb_dev=usb_dev,
+            webui_password=webui_password,
+            webui_host=webui_host,
+            openwrt_host=openwrt_host,
+            auth_context=auth_context,
+            adb_serial=adb_serial,
+            webui_timeout_sec=90.0,
+            session_cls=_SpdSession,
+            webui_trigger_fn=trigger_zte_webui_reboot,
+        )
+
+    failed_stage = "precheck_gpt"
+    try:
+        before_tbl = sess.table("before.xml")
+        if dict(before_tbl) != expected_xml:
+            raise RuntimeError("Live GPT partition table differs from verified backup; aborting rollback.")
+
+        failed_stage = "precheck_identity"
+        identity_check = _verify_live_target_identity(
+            sess,
+            plan,
+            confirm_weak_identity=confirm_weak_identity,
+        )
+
+        failed_stage = "pre_read:misc"
+        before_full = sess.read_part("misc", len(stock_misc), "misc_before.bin")
+        live_bcab = parse_boot_control(before_full)
+        live_slice = before_full[2048:2080]
+        if live_slice == rb_data:
+            method = "already_slot_a"
+        else:
+            # Strict write-before baseline check (Android bootloader_control layout):
+            #   blk[0:4]   = slot_suffix (must be b"_b\x00\x00")
+            #   blk[4:12]  = BCAB magic + version + nb_slot + recovery_tries/reserved (must match stock rb_data[4:12])
+            #   blk[12:14] = slot_a metadata (verity byte blk[13] must match stock rb_data[13])
+            #   blk[14:16] = slot_b metadata (tries/successful transitions permitted; priority >= slot_a)
+            #   blk[16:28] = reserved tail (must match stock rb_data[16:28])
+            #   blk[28:32] = CRC32 (already verified by parse_boot_control)
+            # No unbound local disk files are consulted.
+            slots = live_bcab.get("slots") or {}
+            compatible_slot_b = (
+                live_slice[:4] == b"_b\x00\x00"
+                and live_bcab.get("suffix") == "_b"
+                and live_slice[4:12] == rb_data[4:12]
+                and live_slice[13] == rb_data[13]
+                and live_slice[16:28] == rb_data[16:28]
+                and int((slots.get("b") or {}).get("priority", 0)) >= int((slots.get("a") or {}).get("priority", 0))
+            )
+            if not allow_unexpected_misc and not compatible_slot_b:
+                raise RuntimeError(
+                    f"Unexpected live misc+2048 BCAB state before rollback (suffix={live_bcab.get('suffix')!r}, "
+                    f"sha256={sha256_bytes(live_slice)[:16]}...); refusing to overwrite unexpected boot control "
+                    "without explicit --allow-unexpected-misc."
+                )
+            staged = run_dir / "misc_2048_rollback_verified.bin"
+            staged.write_bytes(rb_data)
+            failed_stage = "offset_write:misc+2048"
+            sess.cmd(["wof", "misc", 2048, str(staged)], "w_mem_to_part_offset: wrote to", timeout=60)
+            failed_stage = "offset_readback:misc+2048"
+            after_full = sess.read_part("misc", len(before_full), "misc_after.bin")
+            if after_full != before_full[:2048] + rb_data + before_full[2080:]:
+                raise RuntimeError("Rollback readback safety check failed on misc+2048; aborting without reboot.")
+            method = "wof_verified"
+        failed_stage = "completed"
+    except Exception as exc:
+        diag = _probe_failure_diag(sess, exc)
+        try:
+            sess.close(reboot=False)
+        except Exception as close_exc:
+            diag["close_error"] = str(close_exc)
+        fail_state = {
+            "status": "ROLLBACK_FAILED",
+            "failed_stage": failed_stage,
+            "error": str(exc),
+            "reset_sent": False,
+            "diagnostic_channel": diag,
+        }
+        write_json(run_dir / "rollback_state.json", fail_state)
+        write_json(run_dir / "rollback_failure_report.json", fail_state)
+        raise
+
+    summary: dict[str, Any] = {
+        "status": "ROLLBACK_A_VERIFIED",
+        "plan_sha256": plan_sha256,
+        "rollback_sha256": rb_sha,
+        "method": method,
+        "device_identity_verified": identity_check,
+        "reset_sent": False,
+    }
+    write_json(run_dir / "rollback_state.json", summary)
+    close_warning: str | None = None
+    try:
+        sess.close(reboot=True)
+    except Exception as close_exc:
+        close_warning = str(close_exc)
+    raw_reset = getattr(sess, "_reset_written", None)
+    summary["reset_sent"] = raw_reset if isinstance(raw_reset, bool) else (close_warning is None)
+    if close_warning is not None:
+        summary["close_warning"] = close_warning
+    if not summary["reset_sent"]:
+        summary["status"] = "ROLLBACK_WRITTEN_RESET_UNCONFIRMED"
+        write_json(run_dir / "rollback_failure_report.json", summary)
+    write_json(run_dir / "rollback_state.json", summary)
     return summary
 
 

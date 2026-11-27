@@ -31,12 +31,15 @@ from fetch_assets import (
     interactive_select,
     list_available_packs,
 )
-from flash_images import execute_flash
+from flash_images import execute_flash, execute_rollback_a
 from host_network import audit_default_routes
 from inspect_backup import inspect_backup_dir
 from provision_android import provision_android
 from provision_openwrt import VALID_USB_NET_MODES, provision_openwrt
 from verify_e2e import verify_environment
+
+# Worker protocol version checked by the Windows GUI updater before activating a downloaded kit.
+KIT_PROTOCOL_VERSION = 2
 
 
 def _rel(p: Path) -> Path:
@@ -247,10 +250,25 @@ def run_offline_plan(args: argparse.Namespace) -> dict[str, Any]:
         adb_pubkey_path=getattr(args, "adb_pubkey", None),
         usb_mode=getattr(args, "usb_mode", None),
     )
+    from common import sha256_file as _sha256_plan_file
+
+    plan_file = out_dir / "flash_plan.json"
+    a_stage = plan.get("android_a_stage") or {}
     report["build"] = {
+        "kit_protocol_version": KIT_PROTOCOL_VERSION,
         "profile": plan["profile"],
         "total_brom_write_bytes": plan["total_brom_write_bytes"],
-        "flash_plan": str(out_dir / "flash_plan.json"),
+        "flash_plan": str(plan_file),
+        "plan_sha256": _sha256_plan_file(plan_file),
+        "unit_identity_sha256": (plan.get("device_identity") or plan.get("target_identity") or {}).get("unit_identity_sha256"),
+        "board_id": (plan.get("device_identity") or {}).get("board_id"),
+        "android_a_stage": {
+            "apply_from_openwrt": bool(a_stage.get("apply_from_openwrt")),
+            "trustos_a_bytes": int((a_stage.get("trustos_a") or {}).get("size_bytes") or 0),
+            "init_boot_a_bytes": int((a_stage.get("init_boot_a") or {}).get("size_bytes") or 0),
+        }
+        if a_stage
+        else None,
     }
     report["flash"] = execute_flash(
         out_dir / "flash_plan.json",
@@ -314,6 +332,10 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
     tools_dir = _rel(args.tools_dir)
     cache_dir = _rel(args.cache_dir)
 
+    if getattr(args, "expected_plan_sha256", None) and not args.reuse_backup:
+        raise ValueError(
+            "--expected-plan-sha256 requires --reuse-backup so execution binds to the approved offline dry-run plan."
+        )
     if args.reuse_backup:
         if not (backup_dir / "partition_list.xml").is_file() or not (backup_dir / "SHA256SUMS.txt").is_file():
             raise FileNotFoundError(
@@ -328,6 +350,7 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
         cache_dir=cache_dir,
         tools_dir=tools_dir,
         local_release_dir=_rel(args.local_release_dir) if getattr(args, "local_release_dir", None) else None,
+        offline_only=bool(getattr(args, "offline_only", False)),
     )
     # Run strict preflight AFTER fetch_and_extract so fresh checkouts can download spd_dump/adb first.
     assert_preflight_ready(
@@ -358,6 +381,36 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
         steps["brom_session_mode"] = "reused_backup"
         steps["backup"] = verify_backup_dir(backup_dir, require_complete_table=True, require_existing_manifest=True)
         steps["inspect"] = inspect_backup_dir(backup_dir, out_dir / "hardware_facts.json")
+        plan_path = out_dir / "flash_plan.json"
+        expected_plan_sha = getattr(args, "expected_plan_sha256", None)
+        approved_rollback_token: str | None = None
+        if expected_plan_sha:
+            from common import sha256_file as _sha256_plan_pre
+
+            if not plan_path.is_file():
+                raise ValueError(
+                    f"Approved dry-run flash_plan.json missing ({plan_path}); re-run offline plan preview before executing."
+                )
+            pre_plan_sha = _sha256_plan_pre(plan_path)
+            if pre_plan_sha != expected_plan_sha:
+                raise ValueError(
+                    f"Approved dry-run flash_plan.json SHA-256 mismatch: {pre_plan_sha} != {expected_plan_sha}. "
+                    "Re-run offline plan preview before executing."
+                )
+            try:
+                prev_approved = read_json(plan_path)
+                prev_stage = prev_approved.get("android_a_stage") if isinstance(prev_approved, dict) else None
+                cand_tok = str(prev_stage.get("rollback_token") or "") if isinstance(prev_stage, dict) else ""
+                disarmed_p = out_dir / ".rollback_token_disarmed"
+                disarmed_set = (
+                    {ln.strip() for ln in disarmed_p.read_text(encoding="utf-8").splitlines() if ln.strip()}
+                    if disarmed_p.is_file()
+                    else set()
+                )
+                if cand_tok and cand_tok not in disarmed_set:
+                    approved_rollback_token = cand_tok
+            except Exception:
+                approved_rollback_token = None
         plan = build_profile(
             backup_dir=backup_dir,
             profile_id=args.profile,
@@ -365,8 +418,17 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
             tools_dir=tools_dir,
             adb_pubkey_path=args.adb_pubkey,
             usb_mode=args.usb_mode,
+            rollback_token=approved_rollback_token,
         )
-        plan_path = out_dir / "flash_plan.json"
+        if expected_plan_sha:
+            from common import sha256_file as _sha256_plan
+
+            actual_plan_sha = _sha256_plan(plan_path)
+            if actual_plan_sha != expected_plan_sha:
+                raise ValueError(
+                    f"Approved dry-run flash_plan.json SHA-256 mismatch: {actual_plan_sha} != {expected_plan_sha}. "
+                    "Re-run offline plan preview before executing."
+                )
         steps["build"] = {
             "profile": plan["profile"],
             "total_brom_write_bytes": plan["total_brom_write_bytes"],
@@ -416,6 +478,7 @@ def run_auto(args: argparse.Namespace) -> dict[str, Any]:
                 spd_mode=args.spd_mode,
                 usb_dev=args.usb_dev,
                 allow_dirty_target=bool(getattr(args, "allow_dirty_target", False)),
+                expected_plan_sha256=expected_plan_sha,
             )
     else:
         steps["brom_session_mode"] = "single_session_no_mid_reboot"
@@ -584,6 +647,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bak.add_argument("--adb-serial")
     p_bak.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     p_bak.add_argument("--usb-dev")
+    p_bak.add_argument("--secrets-stdin", action="store_true", help="Read JSON credentials from stdin instead of argv")
 
     p_pl = sub.add_parser("plan", help="Offline build and dry-run plan (zero device/network mutations)")
     p_pl.add_argument("--profile", required=True, choices=list(PROFILES))
@@ -608,6 +672,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pr.add_argument("--backup-dir", type=Path)
     p_pr.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_pr.add_argument("--out", type=Path)
+    p_pr.add_argument("--secrets-stdin", action="store_true", help="Read JSON credentials from stdin instead of argv")
 
     p_ins = sub.add_parser("inspect", help="Inspect verified BROM backup and detect board_id / trustos offset")
     p_ins.add_argument("--backup-dir", type=Path, required=True)
@@ -631,7 +696,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_fl.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
     p_fl.add_argument("--usb-dev")
     p_fl.add_argument("--allow-dirty-target", action="store_true", help="Allow flashing over partitions that differ from backup baseline")
+    p_fl.add_argument("--expected-plan-sha256", help="Require flash_plan.json SHA-256 to match an approved dry-run digest")
+    p_fl.add_argument("--secrets-stdin", action="store_true", help="Read JSON credentials from stdin instead of argv")
     p_fl.add_argument("--execute", action="store_true")
+
+    p_rb = sub.add_parser("rollback-a", help="Controlled, identity- & readback-verified rollback of misc+2048 to slot _a")
+    p_rb.add_argument("--plan", type=Path, required=True)
+    p_rb.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
+    p_rb.add_argument("--webui-password")
+    p_rb.add_argument("--webui-host", default="http://192.168.0.1:8080")
+    p_rb.add_argument("--openwrt-host", default="192.168.77.1")
+    p_rb.add_argument("--adb-serial")
+    p_rb.add_argument("--spd-mode", default="auto", choices=["auto", "direct", "sudo", "su", "termux-usb"])
+    p_rb.add_argument("--usb-dev")
+    p_rb.add_argument("--expected-plan-sha256", help="Require flash_plan.json SHA-256 to match preview digest")
+    p_rb.add_argument("--expected-rollback-sha256", help="Require misc_rollback_a.bin SHA-256 to match preview digest")
+    p_rb.add_argument("--allow-unexpected-misc", action="store_true", help="Explicit override if live misc+2048 is not expected slot _b layout")
+    p_rb.add_argument("--secrets-stdin", action="store_true", help="Read JSON credentials from stdin instead of argv")
+    p_rb.add_argument("--execute", action="store_true")
 
     p_ow = sub.add_parser("provision-openwrt", help="Provision OpenWrt _b after flashing")
     p_ow.add_argument("--profile", required=True, choices=[k for k, v in PROFILES.items() if v["openwrt"]])
@@ -653,6 +735,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ow.add_argument("--target-iface")
     p_ow.add_argument("--zonename", default="Asia/Shanghai")
     p_ow.add_argument("--timezone", default="CST-8")
+    p_ow.add_argument("--secrets-stdin", action="store_true", help="Read JSON credentials from stdin instead of argv")
 
     p_an = sub.add_parser("provision-android", help="Provision Magisk + UFI-TOOLS on Android _a")
     p_an.add_argument("--plan", type=Path, required=True)
@@ -663,6 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_an.add_argument("--no-host-isolate", action="store_true")
     p_an.add_argument("--stay-android", action="store_true")
     p_an.add_argument("--adb-serial")
+    p_an.add_argument("--secrets-stdin", action="store_true", help="Read JSON credentials from stdin instead of argv")
 
     p_vf = sub.add_parser("verify", help="Verify host route isolation and live device services")
     p_vf.add_argument("--openwrt-host", default="192.168.77.1")
@@ -674,6 +758,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_vf.add_argument("--adb-serial")
     p_vf.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_vf.add_argument("--out", type=Path)
+    p_vf.add_argument("--secrets-stdin", action="store_true", help="Read JSON credentials from stdin instead of argv")
 
     p_au = sub.add_parser("auto", help="Full turnkey workflow (safe dry-run unless --execute is passed)")
     p_au.add_argument("--profile", required=True, choices=list(PROFILES))
@@ -705,15 +790,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_au.add_argument("--timezone", default="CST-8")
     p_au.add_argument("--authorize-device-reboot", action="store_true")
     p_au.add_argument("--local-release-dir", type=Path)
+    p_au.add_argument("--offline-only", action="store_true", help="Forbid network downloads when fetching release packs")
+    p_au.add_argument("--expected-plan-sha256", help="Require flash_plan.json SHA-256 to match an approved dry-run digest")
+    p_au.add_argument("--secrets-stdin", action="store_true", help="Read JSON credentials from stdin instead of argv")
     p_au.add_argument("--execute", action="store_true")
     p_au.add_argument("--tools-dir", type=Path, default=DEFAULT_TOOLS_DIR)
     p_au.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     return parser
 
 
+def _merge_stdin_secrets(args: argparse.Namespace) -> None:
+    """Load credentials from stdin JSON without exposing secrets in OS process argv."""
+    if not getattr(args, "secrets_stdin", False):
+        return
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("--secrets-stdin expects a JSON object")
+    for key in ("webui_password", "wifi_password", "root_password"):
+        val = payload.get(key)
+        if val is not None and hasattr(args, key):
+            setattr(args, key, str(val))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _merge_stdin_secrets(args)
     cmd = args.command
     exit_code = 0
     if hasattr(args, "tools_dir") and args.tools_dir is not None:
@@ -757,7 +862,7 @@ def main(argv: list[str] | None = None) -> int:
     elif cmd == "backup":
         odir = _rel(args.output_dir)
         if args.verify_only:
-            out = verify_backup_dir(odir)
+            out = verify_backup_dir(odir, require_complete_table=True, require_existing_manifest=True)
         else:
             assert_preflight_ready(operation="backup", tools_dir=args.tools_dir)
             out = run_brom_backup(
@@ -790,10 +895,19 @@ def main(argv: list[str] | None = None) -> int:
             usb_mode=args.usb_mode,
         )
     elif cmd == "flash":
+        plan_p = _rel(args.plan)
+        if args.expected_plan_sha256:
+            from common import sha256_file as _sha256_plan
+
+            actual_sha = _sha256_plan(plan_p)
+            if actual_sha != args.expected_plan_sha256:
+                raise ValueError(
+                    f"Approved flash_plan.json SHA-256 mismatch: {actual_sha} != {args.expected_plan_sha256}"
+                )
         if args.execute:
             assert_preflight_ready(operation="flash", tools_dir=args.tools_dir)
         out = execute_flash(
-            _rel(args.plan),
+            plan_p,
             tools_dir=args.tools_dir,
             webui_password=args.webui_password,
             webui_host=args.webui_host,
@@ -803,7 +917,27 @@ def main(argv: list[str] | None = None) -> int:
             spd_mode=args.spd_mode,
             usb_dev=args.usb_dev,
             allow_dirty_target=bool(getattr(args, "allow_dirty_target", False)),
+            expected_plan_sha256=args.expected_plan_sha256,
         )
+    elif cmd == "rollback-a":
+        if args.execute:
+            assert_preflight_ready(operation="flash", tools_dir=args.tools_dir)
+        out = execute_rollback_a(
+            _rel(args.plan),
+            tools_dir=args.tools_dir,
+            webui_password=args.webui_password,
+            webui_host=args.webui_host,
+            openwrt_host=args.openwrt_host,
+            adb_serial=args.adb_serial,
+            execute=args.execute,
+            spd_mode=args.spd_mode,
+            usb_dev=args.usb_dev,
+            allow_unexpected_misc=bool(getattr(args, "allow_unexpected_misc", False)),
+            expected_plan_sha256=getattr(args, "expected_plan_sha256", None),
+            expected_rollback_sha256=getattr(args, "expected_rollback_sha256", None),
+        )
+        if args.execute and (out.get("status") != "ROLLBACK_A_VERIFIED" or out.get("reset_sent") is not True):
+            exit_code = 1
     elif cmd == "provision-openwrt":
         assert_preflight_ready(operation="provision-openwrt", tools_dir=args.tools_dir, profile=args.profile)
         out = provision_openwrt(

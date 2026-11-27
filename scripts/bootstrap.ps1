@@ -73,9 +73,8 @@ if (-not (Test-Path $AdbPub)) {
 }
 
 if ($InstallWinUsbHint) {
-    Write-Host "If Unisoc autodloader/BROM (1782:4D00 / 1782:4D03) lacks a WinUSB driver, run (as Administrator):"
+    Write-Host "Recommended (runs --force --all AND verifies 1782:4D00 & 1782:4D03 in Windows Driver Store + live binding, run as Administrator):"
     Write-Host "  .\scripts\install_unisoc_drivers.bat"
-    Write-Host "Or manually:"
-    Write-Host "  .\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force --all .\build\runtime-tools\host-tools-win64\qmk_driver_installer\unisoc_drivers.txt"
+    Write-Host "Note: running qmk_driver_installer.exe --force --all unisoc_drivers.txt directly only invokes the raw installer; always verify Driver Store registration and live WinUSB binding (use Zadig if a serial driver claims 1782:4D00)."
 }
-Write-Host "Bootstrap completed. Next: run .\scripts\install_unisoc_drivers.bat (Admin, first time), then .\.venv\Scripts\python.exe scripts\kit.py preflight"
+Write-Host "Bootstrap completed (host dependencies & SHA-256 verified packs staged; physical USB communication is not yet tested). Next: run .\scripts\install_unisoc_drivers.bat (Admin, first time), then .\.venv\Scripts\python.exe scripts\kit.py preflight"

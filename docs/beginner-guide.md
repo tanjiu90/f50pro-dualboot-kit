@@ -1,18 +1,18 @@
 # 中兴 F50 Pro (MU3356) 双系统工具包 · 零基础小白保姆级使用教程
 
-> **适用工具版本**：`f50pro-dualboot-kit v1.1.3`
+> **适用工具版本**：`f50pro-dualboot-kit v1.1.4`
 >
 > **适用机型**：**中兴 F50 Pro（型号 `MU3356` / 展锐 `UMS9632` / 出厂 Android 15）**
 >
 > 涵盖 **插卡版（`board_id=6` / `B28`）** 与 **内置双 eSIM 版（`board_id=1` / `B15`）**。
 
-> ### 🌟 Windows 零基础最简方式（推荐：绿色图形一键刷机助手，免装 Python / Git！）
+> ### 🌟 Windows 零基础最简方式（绿色图形一键刷机助手，免装 Python / Git）
 >
-> 如果你不想敲任何命令行、也不想折腾 Python 和 Git：
+> 如果你不想敲命令行、也不想手动安装 Python 和 Git：
 > 1. 打开 GitHub Releases 最新页面：`https://github.com/tanjiu90/f50pro-dualboot-kit/releases/latest`
 > 2. 下载 **`F50Pro-Flasher-win64.zip`**（约 17 MB 绿色免安装包）。
-> 3. **右键完整解压**到普通目录（如 `D:\F50Pro-Flasher`，**不要在压缩软件里直接双击**），双击运行 **`F50Pro-Flasher.exe`**（弹出管理员权限提示点「是」）。
-> 4. 软件内置 **自动拉取 GitHub 最新版（支持国内镜像加速 + SHA-256 严格校验）**、**实时 USB 雷达（自动拦截非 MU3356 机型）**、**自动以 `--force --all` 预装展锐驱动**、**原厂密码提前验证** 与 **报错自动排查一键修复**，按界面 ① -> ② -> ③ 顺序点击即可完成刷机！
+> 3. **右键完整解压**到纯英文简短路径（如 `D:\F50Pro-Flasher`，**不要在压缩软件里直接双击**），双击运行 **`F50Pro-Flasher.exe`**（弹出管理员权限提示点「是」）。
+> 4. 软件支持**官方 GitHub 摘要信任校验**（固件大包支持国内 HTTPS 镜像加速与本地离线兜底，摘要绝不信任第三方镜像）、**实时 USB 雷达与驱动库复核**、**原厂密码提前只读验证**、**强制先备份 -> 干跑审批绑定计划哈希 -> 正式刷入**及**脱敏诊断报告导出**。*(注：图形助手已通过多平台自动化测试、脱敏检查与零 Python 路径打包冒烟；不同 Windows 10/11 实机驱动弹窗与硬件环境仍建议按界面向导逐步确认。)*
 >
 > *(如果你偏好命令行手动操作，或使用 macOS / Linux / 安卓 Termux，请继续阅读下方完整步骤。)*
 
@@ -75,16 +75,16 @@
 ### 第 1 步：打开 PowerShell 并下载代码
 
 1. 按键盘 `Win + S`，搜索 **`PowerShell`**，右键选择 **“以管理员身份运行”**（因为第 3 步装 USB 驱动需要管理员权限）。
-2. 依次复制执行以下命令（新建工作目录并下载官方 `v1.1.3` 稳定版代码）：
+2. 依次复制执行以下命令（新建工作目录并拉取固定发布标签 `v1.1.4`，勿直接拉取可变 `main` 分支）：
 
 ```powershell
 mkdir D:\f50pro-kit -Force
 cd D:\f50pro-kit
-git clone --branch v1.1.3 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
+git clone --branch v1.1.4 --depth 1 https://github.com/tanjiu90/f50pro-dualboot-kit.git
 cd f50pro-dualboot-kit
 ```
 
-*(提示：如果之前没装 Git，也可以用浏览器打开 `https://github.com/tanjiu90/f50pro-dualboot-kit/releases/tag/v1.1.3` 下载 `f50pro-dualboot-kit-v1.1.3-src.tar.gz` 解压到 `D:\f50pro-kit\f50pro-dualboot-kit`，再 `cd` 进去。)*
+*(提示：如果之前没装 Git，也可以用浏览器打开 `https://github.com/tanjiu90/f50pro-dualboot-kit/releases/tag/v1.1.4` 下载 `f50pro-dualboot-kit-v1.1.4-src.tar.gz` 解压到 `D:\f50pro-kit\f50pro-dualboot-kit`，再 `cd` 进去。)*
 
 ### 第 2 步：运行一键引导脚本（创建 Python 环境 + 按需下载资源包）
 
@@ -121,14 +121,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\scripts\install_unisoc_drivers.bat
 ```
 
-如果弹窗询问是否安装驱动，点 **安装 / 是**；看到 `Unisoc BROM` 和 `Unisoc Boot Diag` 两项都提示 **`Success`** 即安装完成（此时**不需要**先插设备，也不需要设备进入刷机模式）。
+如果弹窗询问是否安装驱动，点 **安装 / 是**。注意：`qmk_driver_installer.exe` 单纯输出 `Success` 并不足以说明已生效，`.\scripts\install_unisoc_drivers.bat` 会进一步自动扫描 Windows 驱动库（`pnputil /enum-drivers` + UTF-8/UTF-16 INF 解析）并校验若当前已连接下载口则无串口驱动冲突，看到 **`[OK] Verified both 1782:4D00 and 1782:4D03 WinUSB drivers in Windows Driver Store`** 且退出码为 `0` 才算完成预装（此时不需要先插设备，实际设备进入 BROM 后如仍被旧串口驱动抢占，请按排障说明用 Zadig 替换为 WinUSB）。
 
 > **重要避坑（如果你遇到 `No matching device found`）**：
 > - `qmk_driver_installer.exe` 不加 `--all` 参数时只会扫描**此刻已进入下载模式**的设备；而正常开机的 F50 Pro USB ID 是 `19D2:0246`（不是 `1782:4D00`），所以旧版 `v1.1.1` 漏掉 `--all` 时会提示 `No matching device found`。
-> - `v1.1.2` 已将 `.\scripts\install_unisoc_drivers.bat` 与解压后的 `install_unisoc_drivers.bat` 全部修复为 `--force --all` 离线预装；如果你手里还是旧目录，可直接手动执行：
->   ```powershell
->   .\build\runtime-tools\host-tools-win64\qmk_driver_installer\qmk_driver_installer.exe --force --all .\build\runtime-tools\host-tools-win64\qmk_driver_installer\unisoc_drivers.txt
->   ```
+> - 请始终通过受认证的 **`.\scripts\install_unisoc_drivers.bat`**（先对照 `assets\release-manifest.json` 核对驱动安装包 SHA-256，再执行 `--force --all` 离线预装并复核 Windows 驱动库中 `1782:4D00` 与 `1782:4D03` 均已入库且无实机冲突）安装驱动，切勿跳过校验直接运行未核验的可执行文件。
 
 ### 第 4 步：执行电脑环境预检（不连接设备也能测）
 
@@ -138,7 +135,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 *(如果你选的是方案 1 或方案 2，把上面 `3-dual-full` 换成 `1-android-ufi` 或 `2-dual-stock-openwrt`。)*
 
-看到输出的 JSON 里包含 **`"ready": true`** 且没有报错，说明电脑端环境已经 100% 就绪！
+看到输出的 JSON 里包含 **`"ready": true`** 且没有报错，说明电脑端本地工具与预检项已通过（注意：实际 USB 通信与实机驱动绑定仍需连接 F50 Pro 后在线验证）。
 
 ---
 
@@ -255,7 +252,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
    里面的 `"password"` 就是你的 OpenWrt 管理员（`root`）密码和 SSH 密码。
    *(提示：如果你刷机时既没加 `--generate-password` 也没加 `--root-password`，默认可能为空密码或 `root`，建议进后台后立刻改密码！)*
 2. **打开管理网页**：
-   - USB 插在电脑上，或手机/电脑连上设备 Wi-Fi **`F50Pro-OpenWrt`**（若刷机时未指定 `--wifi-password`，OpenWrt 底包初始默认 Wi-Fi 密码为 **`openwrt1234`**，请尽快进后台修改！）。
+   - USB 插在电脑上，或手机/电脑连上设备 Wi-Fi **`F50Pro-OpenWrt`**（使用 Windows 图形助手默认会自动生成本机唯一的 16 位随机 Wi-Fi 密码并保存在 `openwrt-credentials.json`；使用命令行刷机时务必通过 `--wifi-password` 指定至少 8 位个人密码，勿留空沿用公共初始密码！）。
    - 浏览器打开 **`http://192.168.77.1`**，用户名 `root`，密码填上面查到的密码，即可进入中文 LuCI 管理页面。
 
 ### 2. 配置 OpenClash（如果刷机时带了 `--openclash`）
@@ -293,17 +290,15 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
   - 电脑端也可以在 USB 直连时通过 `adb shell` 调试（已自动内置免弹窗 RSA 公钥）。
 - **在方案 1 下**：默认保持 `rndis,serial_smd,diag,adb`，插 USB 即可直接访问 `http://192.168.0.1:2333` 和 `:1146`（初始网页终端随机口令同样保存在 `android-ttyd-credentials.json`）。
 
-### 6. 电脑端上网与管理口模式切换（防断网隔离）
-- 平时插在电脑上只想当管理口、**不抢电脑原本 Wi-Fi/宽带网络**，工具默认就是 `management` 隔离模式（电脑保持原网络，通过 `192.168.77.1` 管理路由器）。
-- 如果需要手动重新隔离管理口或审计路由是否泄露，可运行：
+### 6. 电脑端防断网隔离与安全恢复快照
+- 平时把 F50 Pro 通过 USB 插在电脑上管理路由器时，工具会强制维持 **`management` 防断网隔离模式**（固定 `192.168.77.12/24`、无默认网关、无 DNS、关闭 IPv6），**防止抢走电脑原本的宽带/Wi-Fi 路由导致整机断网**。
+- 如果需要手动重新隔离管理口或审计默认路由是否泄露，可运行：
   ```powershell
   .\.venv\Scripts\python.exe scripts\host_network.py isolate
   .\.venv\Scripts\python.exe scripts\host_network.py audit
   ```
-- 如果确实希望电脑**通过 USB 借用 F50 Pro 的 5G 流量上网**，可切换为 `internet-exit` 出口模式（用完随时再运行 `isolate` 改回隔离模式）：
-  ```powershell
-  .\.venv\Scripts\python.exe scripts\host_network.py isolate --mode internet-exit
-  ```
+- **需要用 F50 Pro 的 5G 流量上网时**：建议让手机或电脑直接连接 F50 Pro 的 **Wi-Fi 热点**（避免在 Windows 上解除 USB 路由隔离导致宿主机断网）。
+- **需要恢复隔离前的原网卡快照时**：请务必**先物理拔掉 F50 Pro USB 数据线**，再执行 `host_network.py restore --snapshot ...`（`host_network.py` 与图形助手均内置安全拦截：检测到 F50 Pro USB 仍在线时拒绝恢复 DHCP/网关/IPv6）。
 
 ---
 
@@ -347,7 +342,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ### Q2：装驱动报 `No matching device found`，或 F50 Pro 插电脑完全识别不到 / 卡在 `Waiting for boot_diag`？
 1. **运行驱动脚本提示 `No matching device found`**：
    - 这是缺少 `--all` 参数导致的（正常开机的 F50 Pro 是 `19D2:0246`，不会在安装驱动时显示 `1782:4D00`）。
-   - 请在**管理员 PowerShell** 中运行 `.\scripts\install_unisoc_drivers.bat`（或手动加 `--force --all` 参数执行 `qmk_driver_installer.exe --force --all ...\unisoc_drivers.txt`），直到两项都显示 `Success`。
+   - 请在**管理员 PowerShell** 中运行 `.\scripts\install_unisoc_drivers.bat`（它会先按 `assets\release-manifest.json` 认证驱动安装器哈希，再以 `--force --all` 预装，并在装完后复核 Windows 驱动库中同时存在 `1782:4D00` 与 `1782:4D03` WinUSB INF 且无实机冲突绑定；**切勿仅凭安装器打印 `Success` 就判定生效**）。
 2. **正常开机插电脑就识别不到（打不开 `http://192.168.0.1:8080`，设备管理器没反应）**：
    - **优先换数据线和 USB 口**：很多纯充电线或双头 Type-C 线不支持高速数据；换一根确认能给手机传数据的 **USB-A 转 Type-C 线**，直插台式机**主板后置 USB 口**（不要走扩展坞/前置面板）。
    - **检查设备管理器 RNDIS 驱动**：正常开机插上电脑应出现 `VID_19D2&PID_0246`（Remote NDIS 网卡）。若出现带黄色感叹号的未知设备/RNDIS，右键 **更新驱动程序 -> 浏览我的电脑 -> 让我从计算机上的可用驱动程序列表中选取 -> 网络适配器 -> Microsoft -> 基于远程 NDIS 的 Internet 共享设备**。
@@ -362,24 +357,17 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ### Q4：怎么还原回纯原厂状态？
 - **情况一：卡在 OpenWrt `_b`，只想切回原厂安卓 `_a`**
   - 若能通过 USB/Wi-Fi 连上 OpenWrt：直接长按按键 5 秒，或在 SSH 里执行 `/opt/mu300/bin/mu300-next-boot android && reboot`。
-  - 若进不去系统但能进 `SPRD4` 下载模式，把构建目录生成的 `misc_rollback_a.bin` 写回 `misc` 偏移 `2048` 处即可切回 `_a`：
+  - 若进不去系统但能进 `SPRD4` 下载模式，请使用带设备指纹、GPT、写前槽位状态与读回 SHA-256 校验的受控回退命令切回 `_a`（务必传入步骤 1 干跑输出的 `plan_sha256` 与 `rollback_sha256`）：
     ```powershell
-    .\build\runtime-tools\host-tools-win64\spd_dump_251\spd_dump.exe --wait 120 --kickto 2 `
-      wof misc 2048 build\my-f50pro\build\stage3\misc_rollback_a.bin reset
+    .\.venv\Scripts\python.exe scripts\kit.py rollback-a --plan build\my-f50pro\build\flash_plan.json
+    .\.venv\Scripts\python.exe scripts\kit.py rollback-a `
+      --plan build\my-f50pro\build\flash_plan.json `
+      --expected-plan-sha256 "<步骤1输出的plan_sha256>" `
+      --expected-rollback-sha256 "<步骤1输出的rollback_sha256>" `
+      --execute
     ```
-- **情况二：彻底还原已修改过的系统分区回出厂状态**
-  - 使用你最初备份的 `build\my-f50pro\backup\` 目录，只写回被修改过的引导区与 `misc`（**切勿覆盖 `prodnv`/`calinv`/`ztecfg`/`persist`/NV 分区**；若当初只刷了方案 1 `1-android-ufi`，只需写回 `trustos_a` 与 `init_boot_a`；若当初刷了方案 2 `2-dual-stock-openwrt`，`trustos_a` 与 `init_boot_a` 本就未改动，无需写回这两项）：
-    ```powershell
-    .\build\runtime-tools\host-tools-win64\spd_dump_251\spd_dump.exe --wait 120 --kickto 2 `
-      w trustos_a build\my-f50pro\backup\trustos_a `
-      w init_boot_a build\my-f50pro\backup\init_boot_a `
-      w trustos_b build\my-f50pro\backup\trustos_b `
-      w boot_b build\my-f50pro\backup\boot_b `
-      w vendor_boot_b build\my-f50pro\backup\vendor_boot_b `
-      w_force init_boot_b build\my-f50pro\backup\init_boot_b `
-      wof misc 2048 build\my-f50pro\build\stage3\misc_rollback_a.bin `
-      reset
-    ```
+- **情况二：彻底还原已修改过的系统与 BSP 分区回出厂状态**
+  - **切勿执行未经 GPT / 本机身份 / 读回核验的裸 `spd_dump w ... reset` 命令！**完整还原必须从 `flash_plan.json["operations"]` 派生实际修改过的全部目标分区（含 `_a`/`_b` 引导区、全部同步过的 `_b` 槽 BSP 分区与 `fulldumpdb`），并严格遵循 [docs/recovery-and-safety.md](recovery-and-safety.md) 场景 B 的受控核验与逐分区读回流程。
 
 ### Q5：运行 `kit.py probe` 进行一键只读体检
 任何时候想检查设备当前双系统、按键配置、OpenClash 和宿主机网络路由是否健康，都可以运行只读巡检（不重启、不改设备）：

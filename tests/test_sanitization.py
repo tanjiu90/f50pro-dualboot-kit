@@ -1,4 +1,4 @@
-"""Sanitization and release-manifest integrity audits."""
+"""Sanitization, raw-backup filename gate, and release-manifest integrity audits."""
 from __future__ import annotations
 
 import json
@@ -44,6 +44,20 @@ FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+FORBIDDEN_TRACKED_FILENAMES: frozenset[str] = frozenset(
+    {
+        "prodnv",
+        "calinv",
+        "miscdata",
+        "persist",
+        "partition_list.xml",
+        "openwrt-credentials.json",
+        "android-ttyd-credentials.json",
+        "adbkey",
+        "adbkey.pub",
+    }
+)
+
 
 def _load_extra_local_patterns() -> list[tuple[str, re.Pattern[str]]]:
     """Load optional untracked local regex rules (never committed to Git)."""
@@ -64,40 +78,45 @@ def _load_extra_local_patterns() -> list[tuple[str, re.Pattern[str]]]:
     return out
 
 
-def _iter_repo_text_files() -> list[Path]:
+def _iter_repo_tracked_files() -> list[tuple[str, bytes]]:
+    """Enumerate Git-tracked paths via NUL-delimited `git ls-files -z` and scan BOTH staged index blobs and worktree bytes."""
     res = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "ls-files"],
+        ["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         check=True,
     )
-    tracked = [REPO_ROOT / line for line in res.stdout.splitlines() if line.strip()]
-    if tracked:
-        return tracked
-    out: list[Path] = []
-    for p in REPO_ROOT.rglob("*"):
-        if not p.is_file():
+    items: list[tuple[str, bytes]] = []
+    for raw_rel in res.stdout.split(b"\x00"):
+        if not raw_rel:
             continue
-        if any(part in {".git", ".venv", "bundle-cache", "dist", "build", "__pycache__"} for part in p.parts):
-            continue
-        out.append(p)
-    return out
+        rel = raw_rel.decode("utf-8")
+        idx_res = subprocess.run(["git", "-C", str(REPO_ROOT), "show", f":{rel}"], capture_output=True)
+        idx_bytes = idx_res.stdout if idx_res.returncode == 0 else None
+        p = REPO_ROOT / rel
+        wt_bytes = p.read_bytes() if p.is_file() else None
+        if idx_bytes is not None:
+            items.append((f"index:{rel}", idx_bytes))
+        if wt_bytes is not None and wt_bytes != idx_bytes:
+            items.append((rel, wt_bytes))
+    return items
 
 
 def test_no_secrets_or_device_pii_in_repo_files() -> None:
-    """Ensure every tracked/staged repo file is strictly free of personal data or credentials."""
+    """Ensure every tracked/staged repo file (UTF-8 and non-UTF-8) is strictly free of PII, secrets, or raw backups."""
     patterns = [*FORBIDDEN_PATTERNS, *_load_extra_local_patterns()]
     violations: list[str] = []
-    for p in _iter_repo_text_files():
-        try:
-            text = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+    for rel, raw in _iter_repo_tracked_files():
+        fname = Path(rel).name.lower()
+        if fname in FORBIDDEN_TRACKED_FILENAMES or fname.endswith((".pem", ".key")):
+            violations.append(f"{rel}: forbidden tracked raw-backup or secret filename")
             continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1", errors="ignore")
         for label, pat in patterns:
             if pat.search(text):
-                violations.append(f"{p.relative_to(REPO_ROOT)}: matched {label}")
+                violations.append(f"{rel}: matched {label}")
     assert not violations, f"Sanitization violations detected: {violations}"
 
 
@@ -110,7 +129,7 @@ def test_openclash_template_is_clean() -> None:
 
 
 def test_release_manifest_matches_local_dist_when_present() -> None:
-    """Verify release-manifest.json sizes and SHA-256 digests match dist/release-v1.0.0 if built locally."""
+    """Verify release-manifest.json sizes and SHA-256 digests match dist/release-v1.1.0 if built locally."""
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     dist_dir = REPO_ROOT / "dist" / f"release-{manifest['release_tag']}"
     if not dist_dir.is_dir():
